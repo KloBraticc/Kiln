@@ -6,6 +6,7 @@ pub const RBP: u8 = 5;
 pub const R8: u8 = 8;
 pub const R9: u8 = 9;
 pub const R10: u8 = 10;
+pub const R11: u8 = 11;
 
 pub const ARGUMENT_REGISTERS: [u8; 4] = [RCX, RDX, R8, R9];
 
@@ -72,6 +73,11 @@ pub struct Absolute {
 pub enum AbsoluteTarget {
     Method(usize),
     Address(u64),
+    Type(crate::objects::RuntimeType),
+    Static(usize, u32, bool),
+    InitFlag(crate::loader::TypeHandle),
+    Literal(usize, u32),
+    Rva(usize, u32),
 }
 
 #[derive(Default)]
@@ -243,6 +249,57 @@ impl Assembler {
 
     pub fn sign_extend_dword(&mut self, destination: u8, source: u8) {
         self.op_direct(None, true, &[0x63], destination, source);
+    }
+
+    pub fn load_byte(&mut self, signed: bool, reg: u8, base: u8, displacement: i32) {
+        self.op_memory(
+            None,
+            false,
+            &[0x0F, if signed { 0xBE } else { 0xB6 }],
+            reg,
+            base,
+            displacement,
+        );
+    }
+
+    pub fn load_word(&mut self, signed: bool, reg: u8, base: u8, displacement: i32) {
+        self.op_memory(
+            None,
+            false,
+            &[0x0F, if signed { 0xBF } else { 0xB7 }],
+            reg,
+            base,
+            displacement,
+        );
+    }
+
+    pub fn store_byte(&mut self, base: u8, displacement: i32, reg: u8) {
+        self.rex(false, reg, base, reg >= 4);
+        self.byte(0x88);
+        self.memory(reg, base, displacement);
+    }
+
+    pub fn store_word(&mut self, base: u8, displacement: i32, reg: u8) {
+        self.op_memory(Some(0x66), false, &[0x89], reg, base, displacement);
+    }
+
+    pub fn load_address(&mut self, reg: u8, base: u8, displacement: i32) {
+        self.op_memory(None, true, &[0x8D], reg, base, displacement);
+    }
+
+    pub fn shift_immediate(&mut self, operation: Shift, wide: bool, reg: u8, amount: u8) {
+        self.op_direct(None, wide, &[0xC1], operation as u8, reg);
+        self.byte(amount);
+    }
+
+    pub fn compare_byte_zero(&mut self, base: u8) {
+        self.op_memory(None, false, &[0x80], 7, base, 0);
+        self.byte(0);
+    }
+
+    pub fn set_byte_one(&mut self, base: u8) {
+        self.op_memory(None, false, &[0xC6], 0, base, 0);
+        self.byte(1);
     }
 
     pub fn jump(&mut self, label: Label) {

@@ -203,12 +203,20 @@ impl Module {
     }
 
     pub fn method_owner(&self, method: u32) -> Result<Option<u32>> {
+        self.list_owner(method, 5)
+    }
+
+    pub fn field_owner(&self, field: u32) -> Result<Option<u32>> {
+        self.list_owner(field, 4)
+    }
+
+    fn list_owner(&self, method: u32, column: usize) -> Result<Option<u32>> {
         let types = self.metadata.rows(TableId::TypeDef);
         let (mut low, mut high) = (1u32, types);
         let mut found = None;
         while low <= high {
             let middle = low + (high - low) / 2;
-            if self.metadata.cell(TableId::TypeDef, middle, 5)? <= method {
+            if self.metadata.cell(TableId::TypeDef, middle, column)? <= method {
                 found = Some(middle);
                 low = middle + 1;
             } else {
@@ -266,6 +274,18 @@ impl AssemblySet {
         self.by_name.insert(key, index);
         self.modules.push(module);
         Ok(Some(index))
+    }
+
+    pub fn find_type_by_name(
+        &self,
+        module: usize,
+        namespace: &str,
+        name: &str,
+    ) -> Option<TypeHandle> {
+        self.modules[module]
+            .top_level
+            .get(&(namespace, name))
+            .map(|&row| TypeHandle { module, row })
     }
 
     pub fn find_assembly(&self, name: &str) -> Option<usize> {

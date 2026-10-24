@@ -7,8 +7,10 @@ pub mod layout;
 pub mod loader;
 pub mod members;
 pub mod metadata;
+pub mod objects;
 pub mod pe;
 pub mod reader;
+pub mod runtime;
 pub mod signature;
 
 pub use error::{Error, Result};

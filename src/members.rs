@@ -193,7 +193,13 @@ impl AssemblySet {
         Ok(None)
     }
 
-    fn methods_equal(&self, ma: usize, a: &MethodSig, mb: usize, b: &MethodSig) -> Outcome<bool> {
+    pub fn methods_equal(
+        &self,
+        ma: usize,
+        a: &MethodSig,
+        mb: usize,
+        b: &MethodSig,
+    ) -> Outcome<bool> {
         let fixed = a.vararg_start.unwrap_or(a.parameters.len());
         if a.convention != b.convention
             || a.has_this != b.has_this

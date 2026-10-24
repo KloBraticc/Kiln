@@ -79,6 +79,9 @@ pub fn helpers() -> Helpers {
         uint64_to_double: uint64_to_double as *const () as u64,
         remainder32: remainder32 as *const () as u64,
         remainder64: remainder64 as *const () as u64,
+        allocate: crate::runtime::allocate as *const () as u64,
+        is_instance: crate::runtime::is_instance as *const () as u64,
+        initialize_array: crate::runtime::initialize_array as *const () as u64,
     }
 }
 
@@ -110,7 +113,12 @@ pub struct Image {
 type Thunk = unsafe extern "win64" fn(*const u64, *mut [u64; 2]);
 
 impl Image {
-    pub fn link(methods: &HashMap<MethodKey, CompiledMethod>) -> Result<Image, String> {
+    pub fn link(
+        methods: &HashMap<MethodKey, CompiledMethod>,
+        model: &crate::objects::ObjectModel<'_>,
+    ) -> Result<Image, String> {
+        let state = crate::runtime::install();
+        let set = model.set;
         let mut keys: Vec<&MethodKey> = methods.keys().collect();
         keys.sort_by_key(|k| (k.module, k.row));
         let mut code = Vec::new();
@@ -130,6 +138,12 @@ impl Image {
             code.extend_from_slice(&thunk.0);
         }
 
+        code.resize(code.len().next_multiple_of(16), 0xCC);
+        let trap_offset = code.len();
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28, 0x48, 0xB8]);
+        code.extend_from_slice(&(crate::runtime::trap as *const () as u64).to_le_bytes());
+        code.extend_from_slice(&[0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
+
         let mut relocations: Vec<(usize, Relocation)> = Vec::new();
         for key in &keys {
             let method = &methods[*key];
@@ -141,6 +155,21 @@ impl Image {
                         let callee = &method.callees[index];
                         Relocation::Offset(*offsets.get(callee).ok_or("a callee was not compiled")?)
                     }
+                    AbsoluteTarget::Type(kind) => {
+                        Relocation::Address(state.type_record(model, kind)?)
+                    }
+                    AbsoluteTarget::Static(module, row, reference) => {
+                        Relocation::Address(state.static_slot(model, module, row, reference))
+                    }
+                    AbsoluteTarget::InitFlag(handle) => {
+                        Relocation::Address(state.init_flag(handle))
+                    }
+                    AbsoluteTarget::Literal(module, offset) => {
+                        Relocation::Address(state.string_literal(set, model, module, offset)?)
+                    }
+                    AbsoluteTarget::Rva(module, row) => {
+                        Relocation::Address(crate::runtime::rva_data(set, module, row)?)
+                    }
                 };
                 relocations.push((start + absolute.at, relocation));
             }
@@ -150,6 +179,21 @@ impl Image {
         }
 
         let memory = ExecutableMemory::new_at_any(&code, &relocations)?;
+        let trap = memory.address(trap_offset);
+        for (kind, record) in state.types.iter_mut() {
+            let crate::objects::RuntimeType::Class(handle) = kind else {
+                continue;
+            };
+            let info = model.class(*handle)?;
+            for (slot, method) in info.vtable.iter().enumerate() {
+                let address = method
+                    .as_ref()
+                    .and_then(|key| offsets.get(key))
+                    .map(|offset| memory.address(*offset))
+                    .unwrap_or(trap);
+                record.words[7 + slot] = address;
+            }
+        }
         Ok(Image {
             memory,
             thunks: thunk_offsets,
@@ -245,6 +289,7 @@ pub enum ValueKind {
     U64,
     F32,
     F64,
+    String,
 }
 
 impl ValueKind {
@@ -262,6 +307,7 @@ impl ValueKind {
             T::U8 | T::UIntPtr => ValueKind::U64,
             T::R4 => ValueKind::F32,
             T::R8 => ValueKind::F64,
+            T::String => ValueKind::String,
             T::Modified { inner, .. } => return ValueKind::from_sig(inner),
             _ => return None,
         })
@@ -280,7 +326,26 @@ impl ValueKind {
             ValueKind::U64 => "u64",
             ValueKind::F32 => "f32",
             ValueKind::F64 => "f64",
+            ValueKind::String => "string",
         }
+    }
+
+    pub fn parse(name: &str) -> Option<ValueKind> {
+        Some(match name {
+            "bool" => ValueKind::Boolean,
+            "i8" => ValueKind::I8,
+            "u8" => ValueKind::U8,
+            "i16" => ValueKind::I16,
+            "u16" => ValueKind::U16,
+            "i32" => ValueKind::I32,
+            "u32" => ValueKind::U32,
+            "i64" => ValueKind::I64,
+            "u64" => ValueKind::U64,
+            "f32" => ValueKind::F32,
+            "f64" => ValueKind::F64,
+            "string" => ValueKind::String,
+            _ => return None,
+        })
     }
 
     pub fn normalize_integer(self, raw: i64) -> u64 {
@@ -292,7 +357,7 @@ impl ValueKind {
             ValueKind::U16 => raw as u16 as u64,
             ValueKind::I32 => raw as i32 as i64 as u64,
             ValueKind::U32 => raw as u32 as u64,
-            ValueKind::I64 | ValueKind::U64 => raw as u64,
+            ValueKind::I64 | ValueKind::U64 | ValueKind::String => raw as u64,
             ValueKind::F32 => {
                 let value = f32::from_bits(raw as u32);
                 if value.is_nan() {
@@ -404,4 +469,76 @@ pub fn generate_argument(kind: ValueKind, seed: u64) -> u64 {
             kind.normalize_integer(raw)
         }
     }
+}
+
+const STRING_POOL: [&str; 16] = [
+    "",
+    "a",
+    "Hello",
+    "hello world",
+    "  padded  ",
+    "123",
+    "-45",
+    "MixedCase",
+    "\u{c4}\u{d6}\u{dc}\u{df}",
+    "\u{65e5}\u{672c}\u{8a9e}",
+    "a,b,,c",
+    "C:\\Windows\\System32\\file.txt",
+    "https://example.com/path?x=1&y=2",
+    "tab\tnew\nline",
+    "0x1F",
+    "voidstrap",
+];
+
+pub fn encode_units(units: Option<&[u16]>) -> String {
+    match units {
+        None => "z".into(),
+        Some(units) => {
+            let mut text = String::with_capacity(1 + units.len() * 4);
+            text.push('s');
+            for unit in units {
+                text.push_str(&format!("{unit:04x}"));
+            }
+            text
+        }
+    }
+}
+
+pub fn decode_units(text: &str) -> Option<Vec<u16>> {
+    let body = text.strip_prefix('s')?;
+    (0..body.len() / 4)
+        .map(|i| u16::from_str_radix(&body[i * 4..i * 4 + 4], 16).ok())
+        .collect()
+}
+
+pub fn generate_text(kind: ValueKind, seed: u64) -> String {
+    if kind == ValueKind::String {
+        let pick = generate_argument(ValueKind::U64, seed);
+        if pick % 17 == 16 {
+            return encode_units(None);
+        }
+        let units: Vec<u16> = STRING_POOL[(pick % STRING_POOL.len() as u64) as usize]
+            .encode_utf16()
+            .collect();
+        return encode_units(Some(&units));
+    }
+    format!("{:x}", generate_argument(kind, seed))
+}
+
+pub fn result_text(kind: ValueKind, raw: [u64; 2]) -> String {
+    if kind == ValueKind::String {
+        if raw[0] == 0 {
+            return encode_units(None);
+        }
+        let units = unsafe {
+            let length = *((raw[0] + 8) as *const u32) as usize;
+            std::slice::from_raw_parts(
+                (raw[0] + u64::from(crate::objects::STRING_DATA)) as *const u16,
+                length,
+            )
+            .to_vec()
+        };
+        return encode_units(Some(&units));
+    }
+    format!("{:x}", kind.normalize_result(raw))
 }

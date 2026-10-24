@@ -3,14 +3,17 @@ pub mod asm;
 use std::collections::HashMap;
 
 use asm::{
-    ARGUMENT_REGISTERS, Absolute, AbsoluteTarget, Alu, Assembler, Cond, Label, RAX, RBP, RCX, RDX,
-    RSP, Shift, Sse, Unary,
+    ARGUMENT_REGISTERS, Absolute, AbsoluteTarget, Alu, Assembler, Cond, Label, R8, RAX, RBP, RCX,
+    RDX, RSP, Shift, Sse, Unary,
 };
 
+use crate::runtime::TYPE_VTABLE;
+
 use crate::ir::{IrArgument, IrInstruction, IrMethod, TranslateError, Translator, ValueId};
-use crate::loader::AssemblySet;
+use crate::loader::{AssemblySet, TypeHandle};
 use crate::members::Member;
 use crate::metadata::{TableId, Token};
+use crate::objects::{ARRAY_DATA, ElementKind, ObjectModel, RuntimeType};
 use crate::signature::{CallingConvention, MethodSig, Signature, TypeSig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,6 +26,8 @@ pub enum VarType {
     I64,
     F32,
     F64,
+    Ref,
+    Pointer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +51,7 @@ impl Width {
 impl VarType {
     fn width(self) -> Width {
         match self {
-            VarType::I64 => Width::Int64,
+            VarType::I64 | VarType::Ref | VarType::Pointer => Width::Int64,
             VarType::F32 => Width::Float32,
             VarType::F64 => Width::Float64,
             _ => Width::Int32,
@@ -64,6 +69,12 @@ impl VarType {
             T::I8 | T::U8 | T::IntPtr | T::UIntPtr => VarType::I64,
             T::R4 => VarType::F32,
             T::R8 => VarType::F64,
+            T::Pointer(_) | T::FunctionPointer(_) => VarType::I64,
+            T::String | T::Object | T::Class(_) | T::SzArray(_) | T::Array(_) => VarType::Ref,
+            T::GenericInst {
+                value_type: false, ..
+            } => VarType::Ref,
+            T::ByRef(_) => VarType::Pointer,
             T::Modified { inner, .. } => return VarType::from_sig(inner),
             _ => return None,
         })
@@ -83,6 +94,7 @@ pub struct CompiledMethod {
     pub callees: Vec<MethodKey>,
     pub parameters: Vec<VarType>,
     pub returns: Option<VarType>,
+    pub uses_objects: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +124,86 @@ pub struct Helpers {
     pub uint64_to_double: u64,
     pub remainder32: u64,
     pub remainder64: u64,
+    pub allocate: u64,
+    pub is_instance: u64,
+    pub initialize_array: u64,
+}
+
+#[derive(Debug, Clone)]
+enum Resolved {
+    Direct(usize),
+    Virtual {
+        slot: usize,
+        types: (Vec<VarType>, Option<VarType>),
+    },
+    InitializeArray,
+    NewObject {
+        record: RuntimeType,
+        constructor: usize,
+    },
+    InstanceField {
+        offset: u32,
+        var: VarType,
+    },
+    StaticField {
+        target: AbsoluteTarget,
+        var: VarType,
+        init: Option<(TypeHandle, usize)>,
+    },
+    NewArray(ElementKind),
+    Element(ElementKind),
+    Literal(u32),
+    Cast(RuntimeType),
+    FieldData(usize, u32),
+}
+
+pub fn method_types_full(
+    model: &ObjectModel<'_>,
+    key: &MethodKey,
+) -> Result<(Vec<VarType>, Option<VarType>), CompileError> {
+    let set = model.set;
+    let metadata = &set.modules[key.module].metadata;
+    let Signature::Method(sig) =
+        Signature::parse(metadata.blob(metadata.cell(TableId::MethodDef, key.row, 4)?)?)?
+    else {
+        return unsupported("signature is not a method");
+    };
+    if sig.generic_parameters != 0 {
+        return unsupported("generic methods");
+    }
+    if sig.convention != CallingConvention::Default {
+        return unsupported("non default calling convention");
+    }
+    let mut parameters = Vec::new();
+    if sig.has_this {
+        let owner = model.method_owner(key).map_err(CompileError::Unsupported)?;
+        let info = model.class(owner).map_err(CompileError::Unsupported)?;
+        if info.is_value_type {
+            return unsupported("value type instance methods");
+        }
+        parameters.push(VarType::Ref);
+    }
+    for parameter in &sig.parameters {
+        parameters.push(
+            model
+                .var_type(key.module, parameter)
+                .map_err(CompileError::Unsupported)?
+                .ok_or_else(|| {
+                    CompileError::Unsupported(format!("parameter type {parameter:?}"))
+                })?,
+        );
+    }
+    let returns = match &sig.return_type {
+        TypeSig::Void => None,
+        TypeSig::Modified { inner, .. } if **inner == TypeSig::Void => None,
+        other => Some(
+            model
+                .var_type(key.module, other)
+                .map_err(CompileError::Unsupported)?
+                .ok_or_else(|| CompileError::Unsupported(format!("return type {other:?}")))?,
+        ),
+    };
+    Ok((parameters, returns))
 }
 
 pub fn method_types(
@@ -191,6 +283,7 @@ pub struct Compiler<'s> {
     translator: Translator<'s>,
     helpers: &'s Helpers,
     intrinsics: std::cell::RefCell<HashMap<usize, IntrinsicRows>>,
+    pub model: ObjectModel<'s>,
 }
 
 struct Lowering<'a> {
@@ -202,6 +295,8 @@ struct Lowering<'a> {
     returns: Option<VarType>,
     callee_types: Vec<(Vec<VarType>, Option<VarType>)>,
     helpers: &'a Helpers,
+    resolved: HashMap<u32, Resolved>,
+    module: usize,
 }
 
 impl<'s> Compiler<'s> {
@@ -211,6 +306,7 @@ impl<'s> Compiler<'s> {
             translator: Translator::new(set),
             helpers,
             intrinsics: std::cell::RefCell::new(HashMap::new()),
+            model: ObjectModel::new(set),
         }
     }
 
@@ -263,9 +359,32 @@ impl<'s> Compiler<'s> {
         false
     }
 
+    fn is_initialize_array(&self, key: &MethodKey) -> bool {
+        let metadata = &self.set.modules[key.module].metadata;
+        if metadata.string_cell(TableId::MethodDef, key.row, 3).ok() != Some("InitializeArray") {
+            return false;
+        }
+        self.model
+            .method_owner(key)
+            .ok()
+            .and_then(|owner| self.set.full_type_name(owner).ok())
+            .is_some_and(|name| name == "System.Runtime.CompilerServices.RuntimeHelpers")
+    }
+
+    fn derives_from(&self, handle: TypeHandle, name: &str) -> bool {
+        let mut current = Some(handle);
+        while let Some(handle) = current {
+            if self.set.full_type_name(handle).ok().as_deref() == Some(name) {
+                return true;
+            }
+            current = self.set.base_type(handle).ok().flatten();
+        }
+        false
+    }
+
     pub fn compile(&self, key: &MethodKey) -> Result<CompiledMethod, CompileError> {
         let metadata = &self.set.modules[key.module].metadata;
-        let (parameters, returns) = method_types(self.set, key)?;
+        let (parameters, returns) = method_types_full(&self.model, key)?;
         let Some(ir) = self.translator.translate(key.module, key.row)? else {
             return unsupported("method has no IL body");
         };
@@ -286,38 +405,220 @@ impl<'s> Compiler<'s> {
             )?)?;
             if let Signature::Locals(types) = Signature::parse(blob)? {
                 for local in &types {
-                    locals.push(VarType::from_sig(local).ok_or_else(|| {
-                        CompileError::Unsupported(format!("local type {local:?}"))
-                    })?);
+                    locals.push(
+                        self.model
+                            .var_type(key.module, local)
+                            .map_err(CompileError::Unsupported)?
+                            .ok_or_else(|| {
+                                CompileError::Unsupported(format!("local type {local:?}"))
+                            })?,
+                    );
                 }
             }
         }
 
-        let mut callees = Vec::new();
+        let mut callees: Vec<MethodKey> = Vec::new();
         let mut callee_types = Vec::new();
         let mut call_index: HashMap<Token, usize> = HashMap::new();
+        let mut resolved: HashMap<u32, Resolved> = HashMap::new();
+        let own_cctor = self
+            .model
+            .method_owner(key)
+            .ok()
+            .and_then(|owner| self.model.class(owner).ok())
+            .and_then(|info| info.cctor.clone())
+            .is_some_and(|cctor| cctor == *key);
+        let add_callee = |callee: MethodKey,
+                          types: (Vec<VarType>, Option<VarType>),
+                          callees: &mut Vec<MethodKey>,
+                          callee_types: &mut Vec<(Vec<VarType>, Option<VarType>)>|
+         -> usize {
+            if let Some(index) = callees.iter().position(|c| *c == callee) {
+                return index;
+            }
+            callees.push(callee);
+            callee_types.push(types);
+            callees.len() - 1
+        };
         for block in &ir.blocks {
             for instruction in &block.instructions {
-                if instruction.opcode == 0x28 {
-                    let IrArgument::Token(token) = instruction.argument else {
-                        continue;
-                    };
-                    if call_index.contains_key(&token) {
-                        continue;
+                let token = match instruction.argument {
+                    IrArgument::Token(token) => token,
+                    _ => Token(0),
+                };
+                let entry = match instruction.opcode {
+                    0x28 | 0x6F => {
+                        let callee = self.resolve_call(key.module, token)?;
+                        if callee == *key && self.is_intrinsic(key) {
+                            return unsupported("JIT intrinsic");
+                        }
+                        if self.is_initialize_array(&callee) {
+                            Resolved::InitializeArray
+                        } else {
+                            let types = method_types_full(&self.model, &callee)?;
+                            let flags = self
+                                .model
+                                .method_flags(&callee)
+                                .map_err(CompileError::Unsupported)?;
+                            let owner = self
+                                .model
+                                .method_owner(&callee)
+                                .map_err(CompileError::Unsupported)?;
+                            let owner_info =
+                                self.model.class(owner).map_err(CompileError::Unsupported)?;
+                            if owner_info.is_interface {
+                                return unsupported("interface calls");
+                            }
+                            let is_virtual = flags & 0x40 != 0 && flags & 0x20 == 0;
+                            if instruction.opcode == 0x6F && is_virtual {
+                                let slot = self
+                                    .model
+                                    .virtual_slot(&callee)
+                                    .map_err(CompileError::Unsupported)?;
+                                Resolved::Virtual { slot, types }
+                            } else {
+                                if flags & 0x400 != 0 {
+                                    return unsupported("call to an abstract method");
+                                }
+                                let index = add_callee(
+                                    callee.clone(),
+                                    types,
+                                    &mut callees,
+                                    &mut callee_types,
+                                );
+                                call_index.insert(token, index);
+                                Resolved::Direct(index)
+                            }
+                        }
                     }
-                    let callee = self.resolve_call(key.module, token)?;
-                    if callee == *key && self.is_intrinsic(key) {
-                        return unsupported("JIT intrinsic");
+                    0x73 => {
+                        let constructor = self.resolve_call(key.module, token)?;
+                        let owner = self
+                            .model
+                            .method_owner(&constructor)
+                            .map_err(CompileError::Unsupported)?;
+                        let info = self.model.class(owner).map_err(CompileError::Unsupported)?;
+                        if info.is_value_type || info.is_abstract || info.is_interface {
+                            return unsupported("value type or abstract construction");
+                        }
+                        let name = self
+                            .set
+                            .full_type_name(owner)
+                            .map_err(|e| CompileError::Unsupported(format!("{e:?}")))?;
+                        if name == "System.String" || self.derives_from(owner, "System.Delegate") {
+                            return unsupported("string and delegate construction");
+                        }
+                        let types = method_types_full(&self.model, &constructor)?;
+                        let index = add_callee(constructor, types, &mut callees, &mut callee_types);
+                        Resolved::NewObject {
+                            record: RuntimeType::Class(owner),
+                            constructor: index,
+                        }
                     }
-                    let types = method_types(self.set, &callee)?;
-                    call_index.insert(token, callees.len());
-                    callees.push(callee);
-                    callee_types.push(types);
-                }
+                    0x7B..=0x80 => {
+                        let field = self
+                            .model
+                            .field(key.module, token)
+                            .map_err(CompileError::Unsupported)?;
+                        let static_access = matches!(instruction.opcode, 0x7E..=0x80);
+                        if field.is_static != static_access {
+                            return unsupported("field access does not match the field");
+                        }
+                        if static_access {
+                            let owner_info = self
+                                .model
+                                .class(field.owner)
+                                .map_err(CompileError::Unsupported)?;
+                            let init = match &owner_info.cctor {
+                                Some(cctor) if !(own_cctor && cctor == key) => {
+                                    let types = method_types_full(&self.model, cctor)?;
+                                    Some((
+                                        field.owner,
+                                        add_callee(
+                                            cctor.clone(),
+                                            types,
+                                            &mut callees,
+                                            &mut callee_types,
+                                        ),
+                                    ))
+                                }
+                                _ => None,
+                            };
+                            let target = if field.has_rva {
+                                AbsoluteTarget::Rva(field.module, field.row)
+                            } else {
+                                AbsoluteTarget::Static(
+                                    field.module,
+                                    field.row,
+                                    field.var == VarType::Ref,
+                                )
+                            };
+                            Resolved::StaticField {
+                                target,
+                                var: field.var,
+                                init,
+                            }
+                        } else {
+                            let offset = self
+                                .model
+                                .instance_offset(&field)
+                                .map_err(CompileError::Unsupported)?;
+                            Resolved::InstanceField {
+                                offset,
+                                var: field.var,
+                            }
+                        }
+                    }
+                    0x8D => Resolved::NewArray(
+                        self.model
+                            .element_kind(key.module, token)
+                            .map_err(CompileError::Unsupported)?,
+                    ),
+                    0x8F | 0xA3 | 0xA4 => Resolved::Element(
+                        self.model
+                            .element_kind(key.module, token)
+                            .map_err(CompileError::Unsupported)?,
+                    ),
+                    0x72 => Resolved::Literal(token.row()),
+                    0x74 | 0x75 => {
+                        let handle = self
+                            .set
+                            .resolve_type_token(key.module, token)
+                            .map_err(|e| CompileError::Unsupported(format!("{e:?}")))?;
+                        let info = self
+                            .model
+                            .class(handle)
+                            .map_err(CompileError::Unsupported)?;
+                        if info.is_interface || info.is_value_type {
+                            return unsupported("casts to interfaces or value types");
+                        }
+                        let name = self
+                            .set
+                            .full_type_name(handle)
+                            .map_err(|e| CompileError::Unsupported(format!("{e:?}")))?;
+                        if name == "System.String" {
+                            Resolved::Cast(RuntimeType::String)
+                        } else {
+                            Resolved::Cast(RuntimeType::Class(handle))
+                        }
+                    }
+                    0xD0 => {
+                        let field = self
+                            .model
+                            .field(key.module, token)
+                            .map_err(CompileError::Unsupported)?;
+                        if !field.has_rva {
+                            return unsupported("type and method tokens");
+                        }
+                        Resolved::FieldData(field.module, field.row)
+                    }
+                    _ => continue,
+                };
+                resolved.insert(instruction.offset, entry);
             }
         }
 
-        let widths = infer_widths(&ir, &parameters, &locals, &call_index, &callee_types)?;
+        let widths = infer_widths(&ir, &parameters, &locals, &resolved, &callee_types)?;
         let max_parameters = ir
             .blocks
             .iter()
@@ -326,7 +627,12 @@ impl<'s> Compiler<'s> {
             .unwrap_or(0);
         let max_outgoing = callee_types
             .iter()
-            .map(|(p, _)| p.len().saturating_sub(4))
+            .map(|(p, _)| p.len())
+            .chain(resolved.values().filter_map(|r| match r {
+                Resolved::Virtual { types, .. } => Some(types.0.len()),
+                _ => None,
+            }))
+            .map(|count| count.saturating_sub(4))
             .max()
             .unwrap_or(0);
         let frame = Frame {
@@ -337,6 +643,12 @@ impl<'s> Compiler<'s> {
         let slots = frame.values + frame.arguments + frame.locals + max_parameters;
         let frame_size = (8 * slots as u32 + 32 + 8 * max_outgoing as u32).next_multiple_of(16);
 
+        let uses_objects = resolved.values().any(|r| !matches!(r, Resolved::Direct(_)))
+            || ir
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(i.opcode, 0x14 | 0x46..=0x57 | 0x8E..=0xA2 | 0xDF));
         let mut lowering = Lowering {
             asm: Assembler::default(),
             frame,
@@ -346,8 +658,11 @@ impl<'s> Compiler<'s> {
             returns,
             callee_types,
             helpers: self.helpers,
+            resolved,
+            module: key.module,
         };
-        lowering.emit(&ir, frame_size, &call_index)?;
+        let _ = &call_index;
+        lowering.emit(&ir, frame_size)?;
         let (code, absolutes) = lowering.asm.finish().map_err(CompileError::Unsupported)?;
         Ok(CompiledMethod {
             code,
@@ -355,6 +670,7 @@ impl<'s> Compiler<'s> {
             callees,
             parameters,
             returns,
+            uses_objects,
         })
     }
 }
@@ -364,7 +680,7 @@ fn output_width(
     inputs: &[Width],
     parameters: &[VarType],
     locals: &[VarType],
-    call_index: &HashMap<Token, usize>,
+    resolved: &HashMap<u32, Resolved>,
     callee_types: &[(Vec<VarType>, Option<VarType>)],
 ) -> Result<Option<Width>, CompileError> {
     let variable = match instruction.argument {
@@ -433,15 +749,33 @@ fn output_width(
         0x6B => Width::Float32,
         0x6C | 0x76 => Width::Float64,
         0xFE01..=0xFE05 => Width::Int32,
-        0x28 => {
-            let IrArgument::Token(token) = instruction.argument else {
-                return unsupported("call without token");
+        0x28 | 0x6F => {
+            let returned = match resolved.get(&instruction.offset) {
+                Some(Resolved::Direct(index)) => callee_types[*index].1,
+                Some(Resolved::Virtual { types, .. }) => types.1,
+                _ => None,
             };
-            match callee_types[call_index[&token]].1 {
+            match returned {
                 Some(returned) => returned.width(),
                 None => return Ok(None),
             }
         }
+        0x14 | 0x72 | 0x73 | 0x74 | 0x75 | 0x8D | 0x8E | 0x8F | 0x7C | 0x7F | 0xD0 | 0x4D
+        | 0x50 | 0x97 | 0x9A => Width::Int64,
+        0x46..=0x4B | 0x90..=0x95 => Width::Int32,
+        0x4C | 0x96 => Width::Int64,
+        0x4E | 0x98 => Width::Float32,
+        0x4F | 0x99 => Width::Float64,
+        0x7B | 0x7E => match resolved.get(&instruction.offset) {
+            Some(Resolved::InstanceField { var, .. }) | Some(Resolved::StaticField { var, .. }) => {
+                var.width()
+            }
+            _ => return unsupported("unresolved field"),
+        },
+        0xA3 => match resolved.get(&instruction.offset) {
+            Some(Resolved::Element(kind)) => kind.var().width(),
+            _ => return unsupported("unresolved element"),
+        },
         _ => return Ok(None),
     }))
 }
@@ -450,7 +784,7 @@ fn infer_widths(
     ir: &IrMethod,
     parameters: &[VarType],
     locals: &[VarType],
-    call_index: &HashMap<Token, usize>,
+    resolved: &HashMap<u32, Resolved>,
     callee_types: &[(Vec<VarType>, Option<VarType>)],
 ) -> Result<Vec<Option<Width>>, CompileError> {
     let mut widths: Vec<Option<Width>> = vec![None; ir.values as usize];
@@ -480,7 +814,7 @@ fn infer_widths(
                         &inputs,
                         parameters,
                         locals,
-                        call_index,
+                        resolved,
                         callee_types,
                     )?
                 {
@@ -574,7 +908,7 @@ impl<'a> Lowering<'a> {
                 self.asm.sse_load(var == VarType::F64, 0, RBP, slot);
                 self.store_result(output, 0)
             }
-            VarType::I64 => {
+            VarType::I64 | VarType::Ref | VarType::Pointer => {
                 self.asm.load(true, RAX, RBP, slot);
                 self.store_result(output, RAX)
             }
@@ -594,7 +928,9 @@ impl<'a> Lowering<'a> {
     ) -> Result<(), CompileError> {
         match var {
             VarType::F32 | VarType::F64 => self.load_float(reg_or_xmm, value, var == VarType::F64),
-            VarType::I64 => self.load_int(reg_or_xmm, value, true),
+            VarType::I64 | VarType::Ref | VarType::Pointer => {
+                self.load_int(reg_or_xmm, value, true)
+            }
             _ => {
                 self.load_int(reg_or_xmm, value, false)?;
                 self.normalize(reg_or_xmm, var);
@@ -612,7 +948,7 @@ impl<'a> Lowering<'a> {
         self.convert_into_register(value, var, 0)?;
         match var {
             VarType::F32 | VarType::F64 => self.asm.sse_store(var == VarType::F64, RBP, slot, 0),
-            VarType::I64 => self.asm.store(true, RBP, slot, RAX),
+            VarType::I64 | VarType::Ref | VarType::Pointer => self.asm.store(true, RBP, slot, RAX),
             _ => self.asm.store(false, RBP, slot, RAX),
         }
         Ok(())
@@ -656,12 +992,7 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    fn emit(
-        &mut self,
-        ir: &IrMethod,
-        frame_size: u32,
-        call_index: &HashMap<Token, usize>,
-    ) -> Result<(), CompileError> {
+    fn emit(&mut self, ir: &IrMethod, frame_size: u32) -> Result<(), CompileError> {
         self.asm.prologue(frame_size);
         let parameters = self.parameters.clone();
         for (index, var) in parameters.iter().enumerate() {
@@ -702,7 +1033,7 @@ impl<'a> Lowering<'a> {
             self.asm.bind(labels[index]);
             let mut terminated = false;
             for instruction in &block.instructions {
-                terminated = self.instruction(ir, index, instruction, &labels, call_index)?;
+                terminated = self.instruction(ir, index, instruction, &labels)?;
             }
             if !terminated {
                 if index + 1 >= ir.blocks.len() {
@@ -740,7 +1071,6 @@ impl<'a> Lowering<'a> {
         block: usize,
         instruction: &IrInstruction,
         labels: &[Label],
-        call_index: &HashMap<Token, usize>,
     ) -> Result<bool, CompileError> {
         let inputs = &instruction.inputs;
         let output = instruction.output.map(|o| o.0);
@@ -1042,43 +1372,343 @@ impl<'a> Lowering<'a> {
                 self.asm.epilogue();
                 return Ok(true);
             }
-            0x28 => {
-                let IrArgument::Token(token) = instruction.argument else {
-                    return unsupported("call without token");
+            0x28 | 0x6F => match self.resolved.get(&instruction.offset).cloned() {
+                Some(Resolved::InitializeArray) => {
+                    self.load_int(RCX, inputs[0], true)?;
+                    self.load_int(RDX, inputs[1], true)?;
+                    self.call_address(AbsoluteTarget::Address(self.helpers.initialize_array));
+                }
+                Some(Resolved::Direct(index)) => {
+                    let (parameters, returns) = self.callee_types[index].clone();
+                    self.pass_arguments(inputs, &parameters)?;
+                    self.call_address(AbsoluteTarget::Method(index));
+                    self.store_return(returns, output)?;
+                }
+                Some(Resolved::Virtual { slot, types }) => {
+                    self.pass_arguments(inputs, &types.0)?;
+                    self.asm.load(true, RAX, RCX, 0);
+                    self.asm.load(true, RAX, RAX, TYPE_VTABLE + 8 * slot as i32);
+                    self.asm.call_register(RAX);
+                    self.store_return(types.1, output)?;
+                }
+                _ => return unsupported("unresolved call"),
+            },
+            0x73 => {
+                let Some(Resolved::NewObject {
+                    record,
+                    constructor,
+                }) = self.resolved.get(&instruction.offset).cloned()
+                else {
+                    return unsupported("unresolved construction");
                 };
-                let index = call_index[&token];
-                let (parameters, returns) = self.callee_types[index].clone();
-                for (position, (value, var)) in inputs.iter().zip(&parameters).enumerate().skip(4) {
-                    let is_float = matches!(var, VarType::F32 | VarType::F64);
-                    self.convert_into_register(*value, *var, 0)?;
-                    let displacement = 32 + 8 * (position as i32 - 4);
-                    if is_float {
-                        self.asm
-                            .sse_store(*var == VarType::F64, RSP, displacement, 0);
-                    } else {
-                        self.asm.store(true, RSP, displacement, RAX);
+                let output = out()?;
+                self.allocate(AbsoluteTarget::Type(record), None)?;
+                self.store_result(output, RAX)?;
+                let (parameters, _) = self.callee_types[constructor].clone();
+                let mut values = vec![output];
+                values.extend_from_slice(inputs);
+                self.pass_arguments(&values, &parameters)?;
+                self.call_address(AbsoluteTarget::Method(constructor));
+            }
+            0x14 => {
+                self.asm.alu(Alu::Xor, false, RAX, RAX);
+                self.store_result(out()?, RAX)?;
+            }
+            0x72 => {
+                let Some(Resolved::Literal(offset)) =
+                    self.resolved.get(&instruction.offset).cloned()
+                else {
+                    return unsupported("unresolved string");
+                };
+                self.asm
+                    .move_absolute(RAX, AbsoluteTarget::Literal(self.module, offset));
+                self.store_result(out()?, RAX)?;
+            }
+            0x7B..=0x7D => {
+                let Some(Resolved::InstanceField { offset, var }) =
+                    self.resolved.get(&instruction.offset).cloned()
+                else {
+                    return unsupported("unresolved field");
+                };
+                self.load_int(RCX, inputs[0], true)?;
+                match instruction.opcode {
+                    0x7B => {
+                        let register = self.load_memory(var, RCX, offset as i32);
+                        self.store_result(out()?, register)?;
+                    }
+                    0x7C => {
+                        self.asm.load_address(RAX, RCX, offset as i32);
+                        self.store_result(out()?, RAX)?;
+                    }
+                    _ => {
+                        self.convert_into_register(inputs[1], var, 0)?;
+                        self.store_memory(var, RCX, offset as i32);
                     }
                 }
-                for (position, (value, var)) in inputs.iter().zip(&parameters).enumerate().take(4) {
-                    if matches!(var, VarType::F32 | VarType::F64) {
-                        self.convert_into_register(*value, *var, position as u8)?;
-                    } else {
-                        self.convert_into_register(*value, *var, ARGUMENT_REGISTERS[position])?;
+            }
+            0x7E..=0x80 => {
+                let Some(Resolved::StaticField { target, var, init }) =
+                    self.resolved.get(&instruction.offset).cloned()
+                else {
+                    return unsupported("unresolved static field");
+                };
+                self.ensure_initialized(init);
+                match instruction.opcode {
+                    0x7E => {
+                        self.asm.move_absolute(RCX, target);
+                        let register = self.load_memory(var, RCX, 0);
+                        self.store_result(out()?, register)?;
+                    }
+                    0x7F => {
+                        self.asm.move_absolute(RAX, target);
+                        self.store_result(out()?, RAX)?;
+                    }
+                    _ => {
+                        self.convert_into_register(inputs[0], var, 0)?;
+                        self.asm.move_absolute(RCX, target);
+                        self.store_memory(var, RCX, 0);
                     }
                 }
-                self.call_address(AbsoluteTarget::Method(index));
-                if let (Some(returned), Some(output)) = (returns, output) {
-                    let register = if matches!(returned, VarType::F32 | VarType::F64) {
-                        0
-                    } else {
-                        RAX
-                    };
-                    self.store_result(output, register)?;
+            }
+            0x46..=0x50 => {
+                let var = match instruction.opcode {
+                    0x46 => VarType::I8,
+                    0x47 => VarType::U8,
+                    0x48 => VarType::I16,
+                    0x49 => VarType::U16,
+                    0x4A | 0x4B => VarType::I32,
+                    0x4C | 0x4D => VarType::I64,
+                    0x4E => VarType::F32,
+                    0x4F => VarType::F64,
+                    _ => VarType::Ref,
+                };
+                self.load_int(RCX, inputs[0], true)?;
+                let register = self.load_memory(var, RCX, 0);
+                self.store_result(out()?, register)?;
+            }
+            0x51..=0x57 | 0xDF => {
+                let var = match instruction.opcode {
+                    0x51 => VarType::Ref,
+                    0x52 => VarType::I8,
+                    0x53 => VarType::I16,
+                    0x54 => VarType::I32,
+                    0x55 | 0xDF => VarType::I64,
+                    0x56 => VarType::F32,
+                    _ => VarType::F64,
+                };
+                self.load_int(RCX, inputs[0], true)?;
+                self.convert_into_register(inputs[1], var, 0)?;
+                self.store_memory(var, RCX, 0);
+            }
+            0x8D => {
+                let Some(Resolved::NewArray(kind)) =
+                    self.resolved.get(&instruction.offset).cloned()
+                else {
+                    return unsupported("unresolved array");
+                };
+                self.allocate(
+                    AbsoluteTarget::Type(RuntimeType::Array(kind)),
+                    Some(inputs[0]),
+                )?;
+                self.store_result(out()?, RAX)?;
+            }
+            0x8E => {
+                self.load_int(RCX, inputs[0], true)?;
+                self.asm.load(false, RAX, RCX, 8);
+                self.store_result(out()?, RAX)?;
+            }
+            0x8F | 0x90..=0x9A | 0xA3 => {
+                let kind = match instruction.opcode {
+                    0x90 => ElementKind::I8,
+                    0x91 => ElementKind::U8,
+                    0x92 => ElementKind::I16,
+                    0x93 => ElementKind::U16,
+                    0x94 | 0x95 => ElementKind::I32,
+                    0x96 | 0x97 => ElementKind::I64,
+                    0x98 => ElementKind::F32,
+                    0x99 => ElementKind::F64,
+                    0x9A => ElementKind::Reference,
+                    _ => match self.resolved.get(&instruction.offset).cloned() {
+                        Some(Resolved::Element(kind)) => kind,
+                        _ => return unsupported("unresolved element"),
+                    },
+                };
+                self.element_address(inputs[0], inputs[1], kind)?;
+                if instruction.opcode == 0x8F {
+                    self.asm.load_address(RAX, RCX, ARRAY_DATA as i32);
+                    self.store_result(out()?, RAX)?;
+                } else {
+                    let register = self.load_memory(kind.var(), RCX, ARRAY_DATA as i32);
+                    self.store_result(out()?, register)?;
                 }
+            }
+            0x9B..=0xA2 | 0xA4 => {
+                let kind = match instruction.opcode {
+                    0x9B | 0x9F => ElementKind::I64,
+                    0x9C => ElementKind::I8,
+                    0x9D => ElementKind::I16,
+                    0x9E => ElementKind::I32,
+                    0xA0 => ElementKind::F32,
+                    0xA1 => ElementKind::F64,
+                    0xA2 => ElementKind::Reference,
+                    _ => match self.resolved.get(&instruction.offset).cloned() {
+                        Some(Resolved::Element(kind)) => kind,
+                        _ => return unsupported("unresolved element"),
+                    },
+                };
+                self.element_address(inputs[0], inputs[1], kind)?;
+                self.convert_into_register(inputs[2], kind.var(), 0)?;
+                self.store_memory(kind.var(), RCX, ARRAY_DATA as i32);
+            }
+            0x74 | 0x75 => {
+                let Some(Resolved::Cast(record)) = self.resolved.get(&instruction.offset).cloned()
+                else {
+                    return unsupported("unresolved cast");
+                };
+                self.load_int(RCX, inputs[0], true)?;
+                if instruction.opcode == 0x75 {
+                    self.asm.move_absolute(RDX, AbsoluteTarget::Type(record));
+                    self.call_address(AbsoluteTarget::Address(self.helpers.is_instance));
+                    self.store_result(out()?, RAX)?;
+                } else {
+                    self.store_result(out()?, RCX)?;
+                }
+            }
+            0xD0 => {
+                let Some(Resolved::FieldData(module, row)) =
+                    self.resolved.get(&instruction.offset).cloned()
+                else {
+                    return unsupported("unresolved token");
+                };
+                self.asm
+                    .move_absolute(RAX, AbsoluteTarget::Rva(module, row));
+                self.store_result(out()?, RAX)?;
             }
             other => return unsupported(format!("opcode {other:#06x}")),
         }
         Ok(false)
+    }
+
+    fn pass_arguments(
+        &mut self,
+        inputs: &[ValueId],
+        parameters: &[VarType],
+    ) -> Result<(), CompileError> {
+        if inputs.len() != parameters.len() {
+            return unsupported("argument count mismatch");
+        }
+        for (position, (value, var)) in inputs.iter().zip(parameters).enumerate().skip(4) {
+            let is_float = matches!(var, VarType::F32 | VarType::F64);
+            self.convert_into_register(*value, *var, 0)?;
+            let displacement = 32 + 8 * (position as i32 - 4);
+            if is_float {
+                self.asm
+                    .sse_store(*var == VarType::F64, RSP, displacement, 0);
+            } else {
+                self.asm.store(true, RSP, displacement, RAX);
+            }
+        }
+        for (position, (value, var)) in inputs.iter().zip(parameters).enumerate().take(4) {
+            if matches!(var, VarType::F32 | VarType::F64) {
+                self.convert_into_register(*value, *var, position as u8)?;
+            } else {
+                self.convert_into_register(*value, *var, ARGUMENT_REGISTERS[position])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn store_return(
+        &mut self,
+        returns: Option<VarType>,
+        output: Option<ValueId>,
+    ) -> Result<(), CompileError> {
+        if let (Some(returned), Some(output)) = (returns, output) {
+            let register = if matches!(returned, VarType::F32 | VarType::F64) {
+                0
+            } else {
+                RAX
+            };
+            self.store_result(output, register)?;
+        }
+        Ok(())
+    }
+
+    fn allocate(
+        &mut self,
+        record: AbsoluteTarget,
+        count: Option<ValueId>,
+    ) -> Result<(), CompileError> {
+        match count {
+            Some(count) => self.load_int(RDX, count, true)?,
+            None => self.asm.alu(Alu::Xor, false, RDX, RDX),
+        }
+        self.asm.move_absolute(RCX, record);
+        self.asm.move_register(true, R8, RBP);
+        self.call_address(AbsoluteTarget::Address(self.helpers.allocate));
+        Ok(())
+    }
+
+    fn ensure_initialized(&mut self, init: Option<(TypeHandle, usize)>) {
+        let Some((handle, index)) = init else { return };
+        let done = self.asm.label();
+        self.asm
+            .move_absolute(RAX, AbsoluteTarget::InitFlag(handle));
+        self.asm.compare_byte_zero(RAX);
+        self.asm.jump_if(Cond::NotEqual, done);
+        self.asm.set_byte_one(RAX);
+        self.call_address(AbsoluteTarget::Method(index));
+        self.asm.bind(done);
+    }
+
+    fn element_address(
+        &mut self,
+        array: ValueId,
+        index: ValueId,
+        kind: ElementKind,
+    ) -> Result<(), CompileError> {
+        self.load_int(RCX, array, true)?;
+        self.load_int(RDX, index, true)?;
+        let shift = kind.size().trailing_zeros() as u8;
+        if shift > 0 {
+            self.asm.shift_immediate(Shift::Left, true, RDX, shift);
+        }
+        self.asm.alu(Alu::Add, true, RCX, RDX);
+        Ok(())
+    }
+
+    fn load_memory(&mut self, var: VarType, base: u8, displacement: i32) -> u8 {
+        match var {
+            VarType::I8 => self.asm.load_byte(true, RAX, base, displacement),
+            VarType::U8 => self.asm.load_byte(false, RAX, base, displacement),
+            VarType::I16 => self.asm.load_word(true, RAX, base, displacement),
+            VarType::U16 => self.asm.load_word(false, RAX, base, displacement),
+            VarType::I32 => self.asm.load(false, RAX, base, displacement),
+            VarType::I64 | VarType::Ref | VarType::Pointer => {
+                self.asm.load(true, RAX, base, displacement)
+            }
+            VarType::F32 | VarType::F64 => {
+                self.asm
+                    .sse_load(var == VarType::F64, 0, base, displacement);
+                return 0;
+            }
+        }
+        RAX
+    }
+
+    fn store_memory(&mut self, var: VarType, base: u8, displacement: i32) {
+        match var {
+            VarType::I8 | VarType::U8 => self.asm.store_byte(base, displacement, RAX),
+            VarType::I16 | VarType::U16 => self.asm.store_word(base, displacement, RAX),
+            VarType::I32 => self.asm.store(false, base, displacement, RAX),
+            VarType::I64 | VarType::Ref | VarType::Pointer => {
+                self.asm.store(true, base, displacement, RAX)
+            }
+            VarType::F32 | VarType::F64 => {
+                self.asm
+                    .sse_store(var == VarType::F64, base, displacement, 0)
+            }
+        }
     }
 
     fn arithmetic(

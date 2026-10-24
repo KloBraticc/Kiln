@@ -577,7 +577,10 @@ fn jit_cases(arguments: &[String]) -> ExitCode {
         let Some(parameters) = sig
             .parameters
             .iter()
-            .map(kiln::jit::ValueKind::from_sig)
+            .map(|p| match p {
+                kiln::signature::TypeSig::IntPtr | kiln::signature::TypeSig::UIntPtr => None,
+                other => kiln::jit::ValueKind::from_sig(other),
+            })
             .collect::<Option<Vec<_>>>()
         else {
             continue;
@@ -593,7 +596,7 @@ fn jit_cases(arguments: &[String]) -> ExitCode {
                         ^ (case << 8)
                         ^ position as u64
                         ^ (key.module as u64) << 48;
-                    format!("{:x}", kiln::jit::generate_argument(*kind, seed))
+                    kiln::jit::generate_text(*kind, seed)
                 })
                 .collect();
             lines.push(format!(
@@ -637,7 +640,13 @@ fn jit_check(arguments: &[String]) -> ExitCode {
     let set = load_set(folders);
     let helpers = kiln::jit::helpers();
     let eligible = compile_eligible(&set, &helpers);
-    let image = match kiln::jit::Image::link(&eligible.methods) {
+    let model = kiln::objects::ObjectModel::new(&set);
+    let state = kiln::runtime::install();
+    if let Ok(record) = state.type_record(&model, kiln::objects::RuntimeType::String) {
+        state.string_type = record;
+    }
+    state.empty_string(&model);
+    let image = match kiln::jit::Image::link(&eligible.methods, &model) {
         Ok(image) => image,
         Err(error) => {
             eprintln!("linking failed: {error}");
@@ -656,11 +665,13 @@ fn jit_check(arguments: &[String]) -> ExitCode {
         eprintln!("could not read {results}");
         return ExitCode::from(1);
     };
-    let (mut compared, mut matched, mut skipped) = (0u64, 0u64, 0u64);
+    let (mut compared, mut matched, mut skipped, mut trapped) = (0u64, 0u64, 0u64, 0u64);
     let trace = std::env::var_os("KILN_TRACE").is_some();
     let mut mismatched_methods: std::collections::BTreeMap<String, u64> = Default::default();
     let mut examples = Vec::new();
     let mut methods_seen = std::collections::HashSet::new();
+    let mut object_methods = std::collections::HashSet::new();
+    let mut object_cases = 0u64;
     for line in text.lines() {
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 7 {
@@ -669,10 +680,10 @@ fn jit_check(arguments: &[String]) -> ExitCode {
         let (path, token, case, values, returns, result) = (
             fields[0], fields[1], fields[2], fields[3], fields[5], fields[6],
         );
-        let Ok(result) = u64::from_str_radix(result, 16) else {
+        if result.starts_with("throw") || result.starts_with("skip") {
             skipped += 1;
             continue;
-        };
+        }
         let (Some(&module), Ok(token)) = (modules.get(path), u32::from_str_radix(token, 16)) else {
             skipped += 1;
             continue;
@@ -686,35 +697,38 @@ fn jit_check(arguments: &[String]) -> ExitCode {
         } else {
             values
                 .split(',')
-                .map(|v| u64::from_str_radix(v, 16).unwrap_or(0))
+                .map(|v| match v {
+                    "z" => 0,
+                    text if text.starts_with('s') => kiln::runtime::new_string(
+                        &kiln::jit::decode_units(text).unwrap_or_default(),
+                    ),
+                    hex => u64::from_str_radix(hex, 16).unwrap_or(0),
+                })
                 .collect()
         };
-        let kind = match returns {
-            "bool" => kiln::jit::ValueKind::Boolean,
-            "i8" => kiln::jit::ValueKind::I8,
-            "u8" => kiln::jit::ValueKind::U8,
-            "i16" => kiln::jit::ValueKind::I16,
-            "u16" => kiln::jit::ValueKind::U16,
-            "i32" => kiln::jit::ValueKind::I32,
-            "u32" => kiln::jit::ValueKind::U32,
-            "i64" => kiln::jit::ValueKind::I64,
-            "u64" => kiln::jit::ValueKind::U64,
-            "f32" => kiln::jit::ValueKind::F32,
-            _ => kiln::jit::ValueKind::F64,
-        };
+        let kind = kiln::jit::ValueKind::parse(returns).unwrap_or(kiln::jit::ValueKind::F64);
         if trace {
             eprintln!(
                 "run {} row {} case {case} args [{values}]",
                 set.modules[module].name, key.row
             );
         }
+        let trapped_before = kiln::runtime::TRAPPED.load(std::sync::atomic::Ordering::Relaxed);
         let Some(raw) = image.call(&key, &arguments) else {
             skipped += 1;
             continue;
         };
+        if kiln::runtime::TRAPPED.load(std::sync::atomic::Ordering::Relaxed) != trapped_before {
+            trapped += 1;
+            continue;
+        }
         compared += 1;
         methods_seen.insert(key.clone());
-        let actual = kind.normalize_result(raw);
+        if eligible.methods.get(&key).is_some_and(|m| m.uses_objects) {
+            object_methods.insert(key.clone());
+            object_cases += 1;
+        }
+        let actual = kiln::jit::result_text(kind, raw);
         if actual == result {
             matched += 1;
         } else {
@@ -726,7 +740,7 @@ fn jit_check(arguments: &[String]) -> ExitCode {
             *mismatched_methods.entry(label.clone()).or_default() += 1;
             if examples.len() < 25 {
                 examples.push(format!(
-                    "{label} case {case} args [{values}] expected {result:x} got {actual:x}"
+                    "{label} case {case} args [{values}] expected {result} got {actual}"
                 ));
             }
         }
@@ -735,7 +749,11 @@ fn jit_check(arguments: &[String]) -> ExitCode {
         println!("  MISMATCH {example}");
     }
     println!(
-        "{} methods compiled into {compiled_bytes} bytes of x64 and linked in {linked:.2?}, {} methods executed, {compared} cases compared, {matched} identical to .NET, {} mismatched in {} methods, {skipped} cases skipped (.NET threw or the case was not runnable), total {:.2?}",
+        "{} executed methods allocate objects or use fields, statics, arrays or strings, covering {object_cases} compared cases",
+        object_methods.len()
+    );
+    println!(
+        "{} methods compiled into {compiled_bytes} bytes of x64 and linked in {linked:.2?}, {} methods executed, {compared} cases compared, {matched} identical to .NET, {} mismatched in {} methods, {skipped} cases skipped (.NET threw or the case was not runnable), {trapped} cases reached a method that is not compiled yet, total {:.2?}",
         eligible.methods.len(),
         methods_seen.len(),
         compared - matched,
