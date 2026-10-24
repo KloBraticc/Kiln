@@ -181,6 +181,8 @@ pub struct RuntimeState {
     pub flags: HashMap<TypeHandle, Box<u8>>,
     pub strings: HashMap<(usize, u32), u64>,
     pub reference_statics: Vec<usize>,
+    handle_blocks: Vec<Box<[u64]>>,
+    free_handles: Vec<usize>,
     struct_statics: HashMap<(usize, u32), Box<[u64]>>,
     exact_statics: HashMap<(u32, usize, u32), Box<[u64]>>,
     pub kinds: HashMap<u64, RuntimeType>,
@@ -217,6 +219,8 @@ pub fn install() -> &'static mut RuntimeState {
         flags: HashMap::new(),
         strings: HashMap::new(),
         reference_statics: Vec::new(),
+        handle_blocks: Vec::new(),
+        free_handles: Vec::new(),
         struct_statics: HashMap::new(),
         exact_statics: HashMap::new(),
         kinds: HashMap::new(),
@@ -381,6 +385,38 @@ impl RuntimeState {
         self.types.insert(kind, TypeRecord { words, offsets });
         self.kinds.insert(address, kind);
         address
+    }
+
+    pub fn allocate_handle(&mut self, object: u64) -> u64 {
+        if self.free_handles.is_empty() {
+            let block = vec![0u64; 256].into_boxed_slice();
+            let base = block.as_ptr() as usize;
+            for index in (0..256).rev() {
+                self.reference_statics.push(base + index * 8);
+                self.free_handles.push(base + index * 8);
+            }
+            self.handle_blocks.push(block);
+        }
+        let slot = self.free_handles.pop().unwrap_or(0);
+        unsafe { *(slot as *mut u64) = object };
+        slot as u64
+    }
+
+    pub fn allocate_pair(&mut self, first: u64, second: u64) -> u64 {
+        let block = vec![first, second].into_boxed_slice();
+        let base = block.as_ptr() as usize;
+        self.reference_statics.push(base);
+        self.reference_statics.push(base + 8);
+        self.handle_blocks.push(block);
+        base as u64
+    }
+
+    pub fn free_handle(&mut self, handle: u64) {
+        let slot = (handle & !1) as usize;
+        if slot != 0 {
+            unsafe { *(slot as *mut u64) = 0 };
+            self.free_handles.push(slot);
+        }
     }
 
     pub fn record_offsets(&self, record: u64) -> Vec<u32> {

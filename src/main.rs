@@ -19,6 +19,14 @@ fn main() -> ExitCode {
         Some("baml") if arguments.len() > 1 => reach(&arguments[1..], Listing::Baml),
         Some("fallback-report") if arguments.len() > 1 => reach(&arguments[1..], Listing::Fallback),
         Some("disasm") => disasm(&arguments[1..]),
+        Some("run") if arguments.len() > 1 => {
+            let rest = arguments[1..].to_vec();
+            std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn(move || run_application(&rest))
+                .map(|worker| worker.join().unwrap_or(ExitCode::from(101)))
+                .unwrap_or(ExitCode::from(101))
+        }
         Some("jit-cases") if arguments.len() > 2 => jit_cases(&arguments[1..]),
         Some("interp-cases") if arguments.len() > 2 => interp_cases(&arguments[1..]),
         Some("interp-check") if arguments.len() > 2 => {
@@ -47,7 +55,8 @@ fn main() -> ExitCode {
        kiln resolve <assembly or folder>...
        kiln reach <application> <folder>...
        kiln reach-methods <application> <folder>...
-       kiln baml <application> <folder>..."
+       kiln baml <application> <folder>...
+       kiln run <application> <folder>... [-- arguments]"
             );
             ExitCode::from(2)
         }
@@ -1256,4 +1265,54 @@ fn jit_check(arguments: &[String]) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+fn run_application(arguments: &[String]) -> ExitCode {
+    let split = arguments.iter().position(|a| a == "--").unwrap_or(arguments.len());
+    let (inputs, forwarded) = (&arguments[..split], arguments.get(split + 1..).unwrap_or(&[]));
+    let set = load_set(inputs);
+    let application = Path::new(&inputs[0])
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| set.find_assembly(stem));
+    let Some(application) = application else {
+        eprintln!("{} is not a managed assembly", inputs[0]);
+        return ExitCode::from(2);
+    };
+    let Some(entry) = kiln::host::entry_point(&set, application) else {
+        eprintln!("{} has no entry point", inputs[0]);
+        return ExitCode::from(2);
+    };
+    let helpers = kiln::jit::helpers();
+    let model = kiln::objects::ObjectModel::new(&set);
+    kiln::host::start(&model);
+    let interpreter = kiln::interpreter::Interpreter::new(&model, None);
+    interpreter.install_bridge();
+    let wanted = kiln::host::reachable(&set, application);
+    let methods = kiln::host::compile(&set, &helpers, &interpreter, &wanted);
+    let image = match kiln::jit::Image::link_with_fallback(
+        &methods,
+        &model,
+        &|key| interpreter.stub_for(key),
+        &|module, token| interpreter.array_record_for(module, token),
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("linking failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    interpreter.attach(&image);
+    let application_path = Path::new(&inputs[0]);
+    let directory = application_path.parent().unwrap_or(Path::new("."));
+    let mut properties = kiln::host::default_properties(&format!("{}\\", directory.display()));
+    if let Ok(text) = std::fs::read_to_string(application_path.with_extension("runtimeconfig.json")) {
+        properties.extend(kiln::host::config_properties(&text));
+    }
+    if let Err(error) = kiln::host::configure(&interpreter, &properties) {
+        eprintln!("Kiln could not configure the application: {error}");
+        return ExitCode::from(134);
+    }
+    let code = kiln::host::run_main(&interpreter, &entry, forwarded);
+    ExitCode::from(code as u8)
 }

@@ -47,7 +47,7 @@ impl V {
         }
     }
 
-    fn int(self) -> i64 {
+    pub fn int(self) -> i64 {
         match self {
             V::I4(v) => i64::from(v),
             V::I8(v) => v,
@@ -192,6 +192,19 @@ enum Intrinsic {
     SetLastError,
     ClearMemory,
     LockTaken,
+    DependentFree,
+    DependentClear,
+    DependentSetSecond,
+    DependentBoth,
+    DependentSecond,
+    DependentTarget,
+    DependentAlloc,
+    IdentityHash,
+    HandleAlloc,
+    HandleFree,
+    HandleGet,
+    HandleSet,
+    HandleExchange,
     DelegatePointer,
     Fence,
     Nothing,
@@ -1365,6 +1378,25 @@ impl<'s> Interpreter<'s> {
             }
             ("System.Threading.Monitor", "Exit" | "Enter") if parameters.len() == 1 => Intrinsic::Nothing,
             ("System.Threading.Monitor", "IsEnteredNative") => Intrinsic::True,
+            ("System.Runtime.DependentHandle", "InternalFree") if parameters.len() == 1 => Intrinsic::DependentFree,
+            ("System.Runtime.DependentHandle", "InternalSetTargetToNull") if parameters.len() == 1 => Intrinsic::DependentClear,
+            ("System.Runtime.DependentHandle", "InternalSetDependent") if parameters.len() == 2 => Intrinsic::DependentSetSecond,
+            ("System.Runtime.DependentHandle", "InternalGetTargetAndDependent") if parameters.len() == 2 => Intrinsic::DependentBoth,
+            ("System.Runtime.DependentHandle", "InternalGetDependent") if parameters.len() == 1 => Intrinsic::DependentSecond,
+            ("System.Runtime.DependentHandle", "InternalGetTarget") if parameters.len() == 1 => Intrinsic::DependentTarget,
+            ("System.Runtime.DependentHandle", "InternalAlloc") if parameters.len() == 2 => Intrinsic::DependentAlloc,
+            ("System.Runtime.CompilerServices.RuntimeHelpers", "GetHashCode" | "TryGetHashCode" | "InternalGetHashCode") if parameters.len() == 1 => Intrinsic::IdentityHash,
+            ("System.Runtime.InteropServices.GCHandle", "_InternalAlloc" | "InternalAlloc") if parameters.len() == 2 => {
+                Intrinsic::HandleAlloc
+            }
+            ("System.Runtime.InteropServices.GCHandle", "_InternalFree" | "InternalFree") if parameters.len() == 1 => {
+                Intrinsic::HandleFree
+            }
+            ("System.Runtime.InteropServices.GCHandle", "InternalGet") if parameters.len() == 1 => Intrinsic::HandleGet,
+            ("System.Runtime.InteropServices.GCHandle", "InternalSet") if parameters.len() == 2 => Intrinsic::HandleSet,
+            ("System.Runtime.InteropServices.GCHandle", "InternalCompareExchange") if parameters.len() == 3 => {
+                Intrinsic::HandleExchange
+            }
             ("System.GC", "_SuppressFinalize" | "_ReRegisterForFinalize") if parameters.len() == 1 => {
                 Intrinsic::Nothing
             }
@@ -2246,6 +2278,32 @@ impl<'s> Interpreter<'s> {
                 return Ok(None);
             }
             Intrinsic::Nothing => return Ok(None),
+            Intrinsic::DependentFree => { unsafe { *(a[0].bits() as *mut [u64; 2]) = [0, 0] }; return Ok(None) },
+            Intrinsic::DependentClear => { unsafe { *(a[0].bits() as *mut u64) = 0 }; return Ok(None) },
+            Intrinsic::DependentSetSecond => { unsafe { *((a[0].bits() + 8) as *mut u64) = a[1].address() }; return Ok(None) },
+            Intrinsic::DependentBoth => { let target = unsafe { *(a[0].bits() as *const u64) }; unsafe { *(a[1].address() as *mut u64) = if target == 0 { 0 } else { *((a[0].bits() + 8) as *const u64) } }; V::O(target) },
+            Intrinsic::DependentSecond => V::O(unsafe { *((a[0].bits() + 8) as *const u64) }),
+            Intrinsic::DependentTarget => V::O(unsafe { *(a[0].bits() as *const u64) }),
+            Intrinsic::DependentAlloc => V::P(runtime::state().allocate_pair(a[0].address(), a[1].address())),
+            Intrinsic::IdentityHash => V::I4(identity_hash(a[0].address())),
+            Intrinsic::HandleAlloc => V::P(runtime::state().allocate_handle(a[0].address())),
+            Intrinsic::HandleFree => {
+                runtime::state().free_handle(a[0].bits());
+                return Ok(None);
+            }
+            Intrinsic::HandleGet => V::O(unsafe { *((a[0].bits() & !1) as *const u64) }),
+            Intrinsic::HandleSet => {
+                unsafe { *((a[0].bits() & !1) as *mut u64) = a[1].address() };
+                return Ok(None);
+            }
+            Intrinsic::HandleExchange => {
+                let slot = (a[0].bits() & !1) as *mut u64;
+                let previous = unsafe { *slot };
+                if previous == a[2].address() {
+                    unsafe { *slot = a[1].address() };
+                }
+                V::O(previous)
+            }
             Intrinsic::DelegatePointer => V::P(self.delegate_stub(self.non_null(a[0])?)?),
             Intrinsic::Fence => {
                 std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -4470,6 +4528,49 @@ impl<'s> Interpreter<'s> {
         Ok(array + u64::from(ARRAY_DATA) + index as u64 * u64::from(size))
     }
 
+    pub fn find_method(&self, namespace: &str, type_name: &str, name: &str, parameters: usize) -> Option<MethodKey> {
+        let owner = self.corelib_type(namespace, type_name).ok()?;
+        let metadata = &self.model.set.modules[owner.module].metadata;
+        metadata.method_range(owner.row).ok()?.find_map(|row| {
+            let key = MethodKey { module: owner.module, row };
+            (metadata.string_cell(TableId::MethodDef, row, 3).ok() == Some(name)
+                && self.model.method_sig(&key).is_ok_and(|sig| sig.parameters.len() == parameters))
+            .then_some(key)
+        })
+    }
+
+    pub fn parameter_count(&self, key: &MethodKey) -> Option<usize> {
+        self.load(key).ok().map(|loaded| loaded.parameters.len())
+    }
+
+    pub fn string_array(&self, items: &[String]) -> Run<u64> {
+        let string = map(self.types.core("String"))?;
+        let record = self.array_record(&string)?;
+        let array = runtime::allocate_managed(record, items.len() as u64);
+        if array == 0 {
+            return self.throw("OutOfMemoryException");
+        }
+        let _pin = Pin::new(&[V::O(array)]);
+        for (index, item) in items.iter().enumerate() {
+            let units: Vec<u16> = item.encode_utf16().collect();
+            let text = runtime::new_string(&units);
+            unsafe { *((array + u64::from(ARRAY_DATA) + 8 * index as u64) as *mut u64) = text };
+        }
+        Ok(array)
+    }
+
+    pub fn exception_message(&self, object: u64) -> Option<String> {
+        let handle = self.corelib_type("System", "Exception").ok()?;
+        let (_, placements) = self.model.set.class_fields(handle).ok()?;
+        let metadata = &self.model.set.modules[handle.module].metadata;
+        let offset = placements
+            .iter()
+            .find(|p| metadata.string_cell(TableId::Field, p.field, 1).ok() == Some("_message"))?
+            .offset;
+        let message = unsafe { *((object + 8 + u64::from(offset)) as *const u64) };
+        (message != 0).then(|| String::from_utf16_lossy(string_units(message)))
+    }
+
     pub fn has_native(&self, key: &MethodKey) -> bool {
         self.load(key).is_ok_and(|loaded| loaded.native.is_some())
     }
@@ -4997,6 +5098,14 @@ fn element_core_name(kind: ElementKind) -> &'static str {
         ElementKind::F64 => "Double",
         ElementKind::Reference => "Object",
     }
+}
+
+fn identity_hash(object: u64) -> i32 {
+    if object == 0 {
+        return 0;
+    }
+    let mixed = (object >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    ((mixed >> 33) as i32) & 0x3FFF_FFFF
 }
 
 fn processor_count() -> i32 {
