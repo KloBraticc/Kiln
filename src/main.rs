@@ -11,6 +11,7 @@ fn main() -> ExitCode {
     match arguments.first().map(String::as_str) {
         Some("inspect") if arguments.len() > 1 => inspect(&arguments[1..]),
         Some("resolve") if arguments.len() > 1 => resolve(&arguments[1..]),
+        Some("layout") if arguments.len() > 1 => layout(&arguments[1..]),
         Some("--version") => {
             println!("kiln {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -197,4 +198,63 @@ fn resolve(arguments: &[String]) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+fn load_set(arguments: &[String]) -> kiln::loader::AssemblySet {
+    let mut set = kiln::loader::AssemblySet::default();
+    for argument in arguments {
+        let mut found = Vec::new();
+        collect(Path::new(argument), &mut found);
+        found.sort();
+        for file in found {
+            if let Err(error) = set.add(&file) {
+                eprintln!("{}  ERROR {error}", file.display());
+            }
+        }
+    }
+    set
+}
+
+fn layout(arguments: &[String]) -> ExitCode {
+    let set = load_set(arguments);
+    let mut lines = Vec::new();
+    let mut failures = 0u64;
+    for (index, module) in set.modules.iter().enumerate() {
+        let (Ok(byref_like), Ok(generic)) = (
+            set.types_with_attribute(
+                index,
+                "System.Runtime.CompilerServices",
+                "IsByRefLikeAttribute",
+            ),
+            set.generic_definitions(index),
+        ) else {
+            failures += 1;
+            continue;
+        };
+        for row in 1..=module.metadata.rows(kiln::metadata::TableId::TypeDef) {
+            if byref_like.contains(&row) || generic.contains(&row) {
+                continue;
+            }
+            let handle = kiln::loader::TypeHandle { module: index, row };
+            match set.is_value_type(handle) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => continue,
+            }
+            let name = set.full_type_name(handle).unwrap_or_default();
+            match set.value_type_layout(handle) {
+                Ok(layout) => lines.push(format!("{}|{name}|{}", module.name, layout.size)),
+                Err(error) => {
+                    failures += 1;
+                    eprintln!("  FAIL {}|{name}: {error:?}", module.name);
+                }
+            }
+        }
+    }
+    lines.sort();
+    for line in &lines {
+        println!("{line}");
+    }
+    eprintln!("{} value types laid out, {failures} failures", lines.len());
+    ExitCode::SUCCESS
 }

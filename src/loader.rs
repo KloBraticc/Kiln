@@ -14,6 +14,10 @@ pub struct Module {
     top_level: HashMap<(&'static str, &'static str), u32>,
     nested: HashMap<(u32, &'static str), u32>,
     exported: HashMap<(&'static str, &'static str), u32>,
+    enclosing: HashMap<u32, u32>,
+    class_layout: HashMap<u32, u32>,
+    field_layout: HashMap<u32, u32>,
+    inline_arrays: std::sync::OnceLock<HashMap<u32, u32>>,
 }
 
 impl Module {
@@ -31,6 +35,7 @@ impl Module {
         };
 
         let mut nested = HashMap::new();
+        let mut enclosing = HashMap::new();
         let mut is_nested = vec![false; metadata.rows(TableId::TypeDef) as usize + 1];
         for row in 1..=metadata.rows(TableId::NestedClass) {
             let inner = metadata.cell(TableId::NestedClass, row, 0)?;
@@ -38,6 +43,7 @@ impl Module {
             if let Some(slot) = is_nested.get_mut(inner as usize) {
                 *slot = true;
             }
+            enclosing.insert(inner, outer);
             nested.insert(
                 (outer, metadata.string_cell(TableId::TypeDef, inner, 1)?),
                 inner,
@@ -67,6 +73,18 @@ impl Module {
             }
         }
 
+        let mut class_layout = HashMap::new();
+        for row in 1..=metadata.rows(TableId::ClassLayout) {
+            class_layout.insert(metadata.cell(TableId::ClassLayout, row, 2)?, row);
+        }
+        let mut field_layout = HashMap::new();
+        for row in 1..=metadata.rows(TableId::FieldLayout) {
+            field_layout.insert(
+                metadata.cell(TableId::FieldLayout, row, 1)?,
+                metadata.cell(TableId::FieldLayout, row, 0)?,
+            );
+        }
+
         Ok(Self {
             path: path.to_path_buf(),
             name,
@@ -74,6 +92,10 @@ impl Module {
             top_level,
             nested,
             exported,
+            enclosing,
+            class_layout,
+            field_layout,
+            inline_arrays: std::sync::OnceLock::new(),
         })
     }
 }
@@ -88,6 +110,110 @@ impl Module {
             *slot = self.metadata.cell(TableId::Assembly, 1, column)?;
         }
         Ok(version)
+    }
+}
+
+impl Module {
+    pub fn enclosing_type(&self, row: u32) -> Option<u32> {
+        self.enclosing.get(&row).copied()
+    }
+
+    pub fn class_layout(&self, row: u32) -> Result<Option<(u32, u32)>> {
+        match self.class_layout.get(&row) {
+            Some(&layout) => Ok(Some((
+                self.metadata.cell(TableId::ClassLayout, layout, 0)?,
+                self.metadata.cell(TableId::ClassLayout, layout, 1)?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn inline_array_length(&self, row: u32) -> Option<u32> {
+        self.inline_arrays
+            .get_or_init(|| self.scan_inline_arrays().unwrap_or_default())
+            .get(&row)
+            .copied()
+    }
+
+    fn scan_inline_arrays(&self) -> Result<HashMap<u32, u32>> {
+        let metadata = &self.metadata;
+        let mut found = HashMap::new();
+        for row in 1..=metadata.rows(TableId::CustomAttribute) {
+            let Some(parent) = metadata.coded(TableId::CustomAttribute, row, 0)? else {
+                continue;
+            };
+            if parent.table() != Some(TableId::TypeDef) {
+                continue;
+            }
+            let Some(constructor) = metadata.coded(TableId::CustomAttribute, row, 1)? else {
+                continue;
+            };
+            let owner = match constructor.table() {
+                Some(TableId::MethodDef) => self
+                    .method_owner(constructor.row())?
+                    .map(|row| Token::new(TableId::TypeDef, row)),
+                Some(TableId::MemberRef) => {
+                    metadata.coded(TableId::MemberRef, constructor.row(), 0)?
+                }
+                _ => None,
+            };
+            let Some(owner) = owner else { continue };
+            let table = match owner.table() {
+                Some(table @ (TableId::TypeDef | TableId::TypeRef)) => table,
+                _ => continue,
+            };
+            if metadata.string_cell(table, owner.row(), 1)? != "InlineArrayAttribute"
+                || metadata.string_cell(table, owner.row(), 2)? != "System.Runtime.CompilerServices"
+            {
+                continue;
+            }
+            let value = metadata.blob(metadata.cell(TableId::CustomAttribute, row, 2)?)?;
+            if value.len() >= 6 && value[0] == 1 && value[1] == 0 {
+                found.insert(
+                    parent.row(),
+                    u32::from_le_bytes([value[2], value[3], value[4], value[5]]),
+                );
+            }
+        }
+        Ok(found)
+    }
+
+    pub fn field_offset(&self, field: u32) -> Option<u32> {
+        self.field_layout.get(&field).copied()
+    }
+
+    pub fn full_name(&self, row: u32) -> Result<String> {
+        let name = self.metadata.string_cell(TableId::TypeDef, row, 1)?;
+        match self.enclosing_type(row) {
+            Some(outer) => Ok(format!("{}+{name}", self.full_name(outer)?)),
+            None => {
+                let namespace = self.metadata.string_cell(TableId::TypeDef, row, 2)?;
+                Ok(if namespace.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{namespace}.{name}")
+                })
+            }
+        }
+    }
+
+    pub fn method_owner(&self, method: u32) -> Result<Option<u32>> {
+        let types = self.metadata.rows(TableId::TypeDef);
+        let (mut low, mut high) = (1u32, types);
+        let mut found = None;
+        while low <= high {
+            let middle = low + (high - low) / 2;
+            if self.metadata.cell(TableId::TypeDef, middle, 5)? <= method {
+                found = Some(middle);
+                low = middle + 1;
+            } else {
+                if middle == 0 {
+                    break;
+                }
+                high = middle - 1;
+            }
+        }
+        Ok(found)
     }
 }
 
