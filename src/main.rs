@@ -1384,13 +1384,69 @@ fn publish(arguments: &[String]) -> ExitCode {
         eprintln!("{output}: {error}");
         return ExitCode::from(1);
     }
+    let natives = copy_natives(&set, Path::new(&inputs[0]), Path::new(output));
     println!(
-        "{output}: {} assemblies, {} of {} reachable methods compiled to x64, {} MB, {:.2?}",
+        "{output}: {} assemblies, {} of {} reachable methods compiled to x64, {} native libraries, {} MB, {:.2?}",
         payload.modules.len(),
         compiled,
         wanted.len(),
+        natives,
         executable.len() / (1024 * 1024),
         started.elapsed()
     );
     ExitCode::SUCCESS
+}
+
+fn copy_natives(set: &kiln::loader::AssemblySet, application: &Path, output: &Path) -> usize {
+    let (Some(source), Some(target)) = (application.parent(), output.parent()) else {
+        return 0;
+    };
+    let same = match (source.canonicalize(), target.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if same {
+        return 0;
+    }
+    let imported: std::collections::HashSet<String> = set
+        .modules
+        .iter()
+        .flat_map(|module| {
+            let metadata = &module.metadata;
+            (1..=metadata.rows(kiln::metadata::TableId::ModuleRef))
+                .filter_map(|row| metadata.string_cell(kiln::metadata::TableId::ModuleRef, row, 0).ok())
+                .map(|name| {
+                    let name = name.to_ascii_lowercase();
+                    name.strip_suffix(".dll").map(str::to_owned).unwrap_or(name)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let Ok(entries) = std::fs::read_dir(source) else {
+        return 0;
+    };
+    let mut copied = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !imported.contains(&stem) || matches!(stem.as_str(), "hostpolicy" | "hostfxr" | "coreclr" | "clrjit") {
+            continue;
+        }
+        let mut probe = kiln::loader::AssemblySet::default();
+        if !matches!(probe.add(&path), Ok(None)) {
+            continue;
+        }
+        if let Some(name) = path.file_name()
+            && std::fs::copy(&path, target.join(name)).is_ok()
+        {
+            copied += 1;
+        }
+    }
+    copied
 }

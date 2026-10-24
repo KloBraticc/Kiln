@@ -1,0 +1,15 @@
+<Project>
+  <Target Name="KilnPublish" AfterTargets="Publish" Condition="'$(PublishKiln)' == 'true'">
+    <PropertyGroup>
+      <KilnExecutable Condition="'$(KilnExecutable)' == ''">$(MSBuildThisFileDirectory)..\target\release\kiln.exe</KilnExecutable>
+      <KilnPublishDir Condition="'$(KilnPublishDir)' == ''">$(PublishDir)native\</KilnPublishDir>
+      <KilnSourceDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\$(PublishDir)'))</KilnSourceDir>
+      <KilnOutputDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\$(KilnPublishDir)'))</KilnOutputDir>
+    </PropertyGroup>
+    <Error Condition="'$(RuntimeIdentifier)' != 'win-x64'" Text="Kiln builds win-x64 executables. Publish with RuntimeIdentifier win-x64." />
+    <Error Condition="'$(SelfContained)' != 'true'" Text="Kiln needs a self contained publish so the framework assemblies are in the publish folder." />
+    <Error Condition="!Exists('$(KilnExecutable)')" Text="Kiln was not found at $(KilnExecutable). Build it with cargo build --release or set KilnExecutable." />
+    <MakeDir Directories="$(KilnOutputDir)" />
+    <Exec Command="&quot;$(KilnExecutable)&quot; publish &quot;$(KilnSourceDir)$(TargetFileName)&quot; &quot;$(KilnSourceDir).&quot; -o &quot;$(KilnOutputDir)$(AssemblyName).exe&quot;" />
+  </Target>
+</Project>
