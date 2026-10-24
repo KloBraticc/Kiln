@@ -71,7 +71,8 @@ fn inspect(arguments: &[String]) -> ExitCode {
     results.sort_by(|a, b| a.0.cmp(&b.0));
 
     let (mut managed, mut native, mut broken) = (0usize, 0usize, 0usize);
-    let (mut types, mut bodies, mut instructions, mut failures) = (0u64, 0u64, 0u64, 0u64);
+    let (mut types, mut bodies, mut instructions, mut failures, mut signatures) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     for (path, outcome) in &results {
         match outcome {
             Ok(report) => {
@@ -79,6 +80,7 @@ fn inspect(arguments: &[String]) -> ExitCode {
                 types += u64::from(report.types);
                 bodies += u64::from(report.bodies);
                 instructions += report.stats.instructions;
+                signatures += report.signatures;
                 failures += report.failures.len() as u64;
                 if arguments.len() == 1 && results.len() == 1 || !report.failures.is_empty() {
                     println!(
@@ -110,7 +112,7 @@ fn inspect(arguments: &[String]) -> ExitCode {
     }
 
     println!(
-        "{managed} managed assemblies, {native} native images skipped, {broken} unreadable, {types} types, {bodies} method bodies, {instructions} instructions, {failures} failed bodies in {:.2?}",
+        "{managed} managed assemblies, {native} native images skipped, {broken} unreadable, {types} types, {bodies} method bodies, {instructions} instructions, {signatures} signatures, {failures} failures in {:.2?}",
         elapsed
     );
     if broken == 0 && failures == 0 {

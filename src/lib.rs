@@ -3,12 +3,14 @@ pub mod il;
 pub mod metadata;
 pub mod pe;
 pub mod reader;
+pub mod signature;
 
 pub use error::{Error, Result};
 
 use il::{MethodBody, VerifyStats};
 use metadata::{Metadata, TableId};
 use pe::PeImage;
+use signature::Signature;
 
 #[derive(Debug, Default, Clone)]
 pub struct AssemblyReport {
@@ -20,6 +22,7 @@ pub struct AssemblyReport {
     pub bodies: u32,
     pub native_bodies: u32,
     pub stats: VerifyStats,
+    pub signatures: u64,
     pub failures: Vec<String>,
 }
 
@@ -64,5 +67,48 @@ pub fn inspect(data: &[u8]) -> Result<AssemblyReport> {
             }
         }
     }
+    verify_signatures(&metadata, &mut report)?;
     Ok(report)
+}
+
+const SIGNATURE_COLUMNS: [(TableId, usize, bool); 7] = [
+    (TableId::MethodDef, 4, false),
+    (TableId::Field, 2, false),
+    (TableId::Property, 2, false),
+    (TableId::MemberRef, 2, false),
+    (TableId::StandAloneSig, 0, false),
+    (TableId::MethodSpec, 1, false),
+    (TableId::TypeSpec, 0, true),
+];
+
+fn verify_signatures(metadata: &Metadata<'_>, report: &mut AssemblyReport) -> Result<()> {
+    let mut tokens = Vec::new();
+    for (table, column, is_type) in SIGNATURE_COLUMNS {
+        for row in 1..=metadata.rows(table) {
+            let blob = metadata.blob(metadata.cell(table, row, column)?)?;
+            if table == TableId::StandAloneSig && blob.is_empty() {
+                continue;
+            }
+            tokens.clear();
+            let decoded = if is_type {
+                Signature::parse_type(blob).map(|sig| sig.tokens(&mut tokens))
+            } else {
+                Signature::parse(blob).map(|sig| sig.tokens(&mut tokens))
+            };
+            report.signatures += 1;
+            let failure = match decoded {
+                Err(error) => Some(error.to_string()),
+                Ok(()) => tokens
+                    .iter()
+                    .find(|&&token| !metadata.is_valid_token(token))
+                    .map(|token| format!("references missing token {:#010x}", token.0)),
+            };
+            if let Some(failure) = failure {
+                report
+                    .failures
+                    .push(format!("{} {row} signature: {failure}", table.name()));
+            }
+        }
+    }
+    Ok(())
 }
