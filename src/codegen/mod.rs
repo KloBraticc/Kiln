@@ -129,6 +129,7 @@ pub struct Helpers {
     pub is_instance: u64,
     pub initialize_array: u64,
     pub throw: u64,
+    pub initialize: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1716,8 +1717,12 @@ impl<'a> Lowering<'a> {
             .move_absolute(RAX, AbsoluteTarget::InitFlag(handle));
         self.asm.compare_byte_zero(RAX);
         self.asm.jump_if(Cond::NotEqual, done);
-        self.asm.set_byte_one(RAX);
-        self.call_address(AbsoluteTarget::Method(index));
+        self.asm
+            .move_immediate(RCX, ((handle.module as u64) << 32) | u64::from(handle.row));
+        self.asm.move_absolute(RDX, AbsoluteTarget::Method(index));
+        self.asm.move_register(true, R8, RBP);
+        self.asm.move_register(true, R9, RSP);
+        self.call_address(AbsoluteTarget::Address(self.helpers.initialize));
         self.asm.bind(done);
     }
 

@@ -10,6 +10,7 @@ pub const FLAG_ARRAY: u64 = 1;
 pub const FLAG_STRING: u64 = 2;
 pub const FLAG_REFERENCE_ELEMENTS: u64 = 4;
 pub const FLAG_OBJECT: u64 = 8;
+pub const FLAG_STRUCT_ELEMENTS: u64 = 16;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -180,6 +181,7 @@ pub struct RuntimeState {
     pub flags: HashMap<TypeHandle, Box<u8>>,
     pub strings: HashMap<(usize, u32), u64>,
     pub reference_statics: Vec<usize>,
+    struct_statics: HashMap<(usize, u32), Box<[u64]>>,
     pub string_type: u64,
     pub empty_string: u64,
     frozen: Vec<Box<[u64]>>,
@@ -213,6 +215,7 @@ pub fn install() -> &'static mut RuntimeState {
         flags: HashMap::new(),
         strings: HashMap::new(),
         reference_statics: Vec::new(),
+        struct_statics: HashMap::new(),
         string_type: 0,
         empty_string: 0,
         frozen: Vec::new(),
@@ -273,6 +276,17 @@ impl RuntimeState {
                     0,
                 )
             }
+            RuntimeType::ValueArray(handle) => {
+                let layout = model.struct_layout(handle)?;
+                (
+                    u64::from(ARRAY_DATA),
+                    u64::from(layout.size),
+                    FLAG_ARRAY | FLAG_STRUCT_ELEMENTS,
+                    0,
+                    layout.references.clone(),
+                    0,
+                )
+            }
             RuntimeType::String => (u64::from(STRING_DATA) + 2, 2, FLAG_STRING, 0, Vec::new(), 0),
         };
         let offsets: Box<[u32]> = offsets.into_boxed_slice();
@@ -330,6 +344,19 @@ impl RuntimeState {
         if reference && !self.reference_statics.contains(&(address as usize)) {
             self.reference_statics.push(address as usize);
         }
+        address
+    }
+
+    pub fn static_block(&mut self, module: usize, row: u32, size: u32, references: &[u32]) -> u64 {
+        if let Some(block) = self.struct_statics.get(&(module, row)) {
+            return block.as_ptr() as u64;
+        }
+        let block = vec![0u64; (size as usize).div_ceil(8).max(1)].into_boxed_slice();
+        let address = block.as_ptr() as u64;
+        for offset in references {
+            self.reference_statics.push(address as usize + *offset as usize);
+        }
+        self.struct_statics.insert((module, row), block);
         address
     }
 
@@ -464,6 +491,18 @@ impl RuntimeState {
                 for index in 0..count {
                     let element = object + ARRAY_DATA as usize + 8 * index;
                     self.mark(unsafe { *(element as *const u64) } as usize, &mut pending);
+                }
+            } else if flags & FLAG_STRUCT_ELEMENTS != 0 {
+                let count = unsafe { *((object + 8) as *const u32) } as usize;
+                let component = (unsafe { *record } >> 32) as usize;
+                let (offsets, references) =
+                    unsafe { (*record.add(3) as *const u32, *record.add(4) as usize) };
+                for index in 0..count {
+                    let element = object + ARRAY_DATA as usize + component * index;
+                    for position in 0..references {
+                        let slot = element + unsafe { *offsets.add(position) } as usize;
+                        self.mark(unsafe { *(slot as *const u64) } as usize, &mut pending);
+                    }
                 }
             } else if flags & (FLAG_ARRAY | FLAG_STRING) == 0 {
                 let (offsets, count) = unsafe { (*record.add(3) as *const u32, *record.add(4)) };

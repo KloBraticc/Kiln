@@ -83,6 +83,7 @@ pub fn helpers() -> Helpers {
         is_instance: crate::runtime::is_instance as *const () as u64,
         initialize_array: crate::runtime::initialize_array as *const () as u64,
         throw: crate::interpreter::compiled_throw as *const () as u64,
+        initialize: crate::interpreter::compiled_initialize as *const () as u64,
     }
 }
 

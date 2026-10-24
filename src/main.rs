@@ -114,7 +114,11 @@ fn reach(arguments: &[String], listing: Listing) -> ExitCode {
                 match interpreter.blocker(&key) {
                     None => runnable += 1,
                     Some(reason) => {
-                        let reason = if reason.starts_with("value of type") || reason.starts_with("field type") {
+                        let reason = if (reason.starts_with("value of type") || reason.starts_with("field type"))
+                            && reason.contains("GenericInst")
+                        {
+                            "values of generic struct types".to_owned()
+                        } else if reason.starts_with("value of type") || reason.starts_with("field type") {
                             "values of struct types".to_owned()
                         } else if reason.starts_with("internal call") {
                             reason
@@ -795,6 +799,7 @@ fn compile_with_fallback(
             methods.insert(key, method);
         }
     }
+    methods.retain(|key, _| !interpreter.has_native(key));
     loop {
         let missing: Vec<kiln::codegen::MethodKey> = methods
             .iter()

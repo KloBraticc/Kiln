@@ -8,7 +8,9 @@ use crate::jit::Image;
 use crate::loader::TypeHandle;
 use crate::members::Member;
 use crate::metadata::{TableId, Token};
-use crate::objects::{ARRAY_DATA, ElementKind, ObjectModel, RuntimeType, STRING_DATA};
+use crate::objects::{
+    ARRAY_DATA, ElementKind, FieldShape, ObjectModel, RuntimeType, STRING_DATA, StructLayout,
+};
 use crate::runtime;
 use crate::signature::{CallingConvention, Signature, TypeSig};
 
@@ -29,6 +31,7 @@ pub enum V {
     F8(f64),
     O(u64),
     P(u64),
+    S(u64),
 }
 
 impl V {
@@ -38,7 +41,7 @@ impl V {
             V::I8(v) => v as u64,
             V::F4(v) => u64::from(v.to_bits()),
             V::F8(v) => v.to_bits(),
-            V::O(v) | V::P(v) => v,
+            V::O(v) | V::P(v) | V::S(v) => v,
         }
     }
 
@@ -46,7 +49,7 @@ impl V {
         match self {
             V::I4(v) => i64::from(v),
             V::I8(v) => v,
-            V::O(v) | V::P(v) => v as i64,
+            V::O(v) | V::P(v) | V::S(v) => v as i64,
             V::F4(v) => v as i64,
             V::F8(v) => v as i64,
         }
@@ -66,7 +69,7 @@ impl V {
 
     fn address(self) -> u64 {
         match self {
-            V::O(v) | V::P(v) => v,
+            V::O(v) | V::P(v) | V::S(v) => v,
             V::I8(v) => v as u64,
             V::I4(v) => v as u32 as u64,
             _ => 0,
@@ -116,27 +119,78 @@ enum Intrinsic {
     Exchange(VarType),
     CompareExchange(VarType),
     ExchangeAdd(VarType),
+    Fused,
+    FusedF,
+    MultiplyAdd,
+    MultiplyAddF,
 }
 
+type IntrinsicRows = (HashSet<u32>, HashSet<u32>);
 type UnaryPair = (fn(f64) -> f64, fn(f32) -> f32);
 type BinaryPair = (fn(f64, f64) -> f64, fn(f32, f32) -> f32);
+
+#[derive(Clone)]
+enum Ty {
+    Prim(VarType),
+    Struct(Rc<StructLayout>),
+}
+
+impl Ty {
+    fn prim(&self) -> Option<VarType> {
+        match self {
+            Ty::Prim(var) => Some(*var),
+            Ty::Struct(_) => None,
+        }
+    }
+
+    fn words(&self) -> usize {
+        match self {
+            Ty::Prim(_) => 1,
+            Ty::Struct(layout) => (layout.size as usize).div_ceil(8).max(1),
+        }
+    }
+
+    fn size(&self) -> u32 {
+        match self {
+            Ty::Prim(var) => var_size(*var),
+            Ty::Struct(layout) => layout.size,
+        }
+    }
+}
+
+fn prims(types: &[Ty]) -> Option<Vec<VarType>> {
+    types.iter().map(Ty::prim).collect()
+}
+
+struct FieldRef {
+    owner: TypeHandle,
+    module: usize,
+    row: u32,
+    is_static: bool,
+    has_rva: bool,
+    owner_is_value: bool,
+    ty: Ty,
+    offset: u64,
+}
 
 struct Loaded {
     key: MethodKey,
     owner: TypeHandle,
     code: &'static [u8],
     clauses: Vec<ExceptionClause>,
-    parameters: Vec<VarType>,
-    returns: Option<VarType>,
-    locals: Vec<VarType>,
+    parameters: Vec<Ty>,
+    returns: Option<Ty>,
+    locals: Vec<Ty>,
     native: Option<Native>,
     is_static: bool,
     is_virtual: bool,
+    is_abstract: bool,
 }
 
 struct Frame {
-    slots: Box<[u64]>,
-    kinds: Vec<VarType>,
+    memory: Box<[u64]>,
+    offsets: Vec<usize>,
+    kinds: Vec<Ty>,
     stack: Vec<V>,
     caught: Vec<u64>,
     scratch: Vec<Box<[u8]>>,
@@ -158,12 +212,20 @@ fn scan_roots(out: &mut Vec<u64>) {
         for &frame in frames().iter() {
             let frame = unsafe { &*(frame as *const Frame) };
             for (index, kind) in frame.kinds.iter().enumerate() {
-                if *kind == VarType::Ref {
-                    out.push(frame.slots[index]);
+                let base = frame.offsets[index];
+                match kind {
+                    Ty::Prim(VarType::Ref) => out.push(frame.memory[base]),
+                    Ty::Struct(layout) => {
+                        let address = frame.memory.as_ptr() as u64 + 8 * base as u64;
+                        for offset in &layout.references {
+                            out.push(unsafe { *((address + u64::from(*offset)) as *const u64) });
+                        }
+                    }
+                    Ty::Prim(_) => {}
                 }
             }
             for value in &frame.stack {
-                if let V::O(object) = value {
+                if let V::O(object) | V::S(object) = value {
                     out.push(*object);
                 }
             }
@@ -180,7 +242,7 @@ impl Pin {
         let mut pinned = pinned();
         let mark = pinned.len();
         pinned.extend(values.iter().filter_map(|v| match v {
-            V::O(o) => Some(*o),
+            V::O(o) | V::S(o) => Some(*o),
             _ => None,
         }));
         Pin(mark)
@@ -208,6 +270,19 @@ impl Drop for Registered {
     }
 }
 
+impl Frame {
+    fn slot(&self, index: usize) -> Run<(u64, Ty)> {
+        let kind = self
+            .kinds
+            .get(index)
+            .ok_or_else(|| Fault::Unsupported("variable index".into()))?;
+        Ok((
+            self.memory.as_ptr() as u64 + 8 * self.offsets[index] as u64,
+            kind.clone(),
+        ))
+    }
+}
+
 enum Exit {
     Return(Option<V>),
     EndFinally,
@@ -224,6 +299,8 @@ pub struct Interpreter<'s> {
     names: RefCell<HashMap<TypeHandle, String>>,
     resources: RefCell<HashMap<usize, HashMap<String, String>>>,
     failed_types: RefCell<HashMap<TypeHandle, Option<String>>>,
+    fields: RefCell<HashMap<(usize, u32), Rc<FieldRef>>>,
+    intrinsic_rows: RefCell<HashMap<usize, IntrinsicRows>>,
     depth: Cell<usize>,
     pub interpreted: Cell<u64>,
     pub compiled_calls: Cell<u64>,
@@ -323,6 +400,31 @@ pub fn install_fault_report() {
     unsafe { AddVectoredExceptionHandler(0, report_fault) };
 }
 
+pub extern "win64" fn compiled_initialize(handle: u64, cctor: u64, frame: u64, stack: u64) {
+    let owner = TypeHandle {
+        module: (handle >> 32) as usize,
+        row: handle as u32,
+    };
+    let bridge = BRIDGE.load(std::sync::atomic::Ordering::Acquire);
+    if bridge.is_null() {
+        let flag = runtime::state().init_flag(owner) as *mut u8;
+        if unsafe { *flag } != 0 {
+            return;
+        }
+        unsafe { *flag = 1 };
+        let function: extern "win64" fn() = unsafe { std::mem::transmute(cctor as usize) };
+        function();
+        return;
+    }
+    let interpreter = unsafe { &*(*bridge).interpreter };
+    runtime::state().transitions.push((frame, stack));
+    let outcome = interpreter.ensure_initialized(owner);
+    runtime::state().transitions.pop();
+    if let Err(fault) = outcome {
+        abort_compiled(interpreter, frame, fault);
+    }
+}
+
 fn outermost_compiled(frame: u64) -> u64 {
     let state = runtime::state();
     let mut outermost = frame as usize;
@@ -370,8 +472,10 @@ pub(crate) unsafe extern "win64" fn fallback_entry(index: u64, arguments: *const
         Ok(loaded) => loaded,
         Err(fault) => abort_compiled(interpreter, frame, fault),
     };
-    let values: Vec<V> = loaded
-        .parameters
+    let Some(parameters) = prims(&loaded.parameters) else {
+        abort_compiled(interpreter, frame, Fault::Unsupported("struct parameters from compiled code".into()))
+    };
+    let values: Vec<V> = parameters
         .iter()
         .enumerate()
         .map(|(position, var)| load_raw(*var, unsafe { *arguments.add(position) }))
@@ -381,8 +485,9 @@ pub(crate) unsafe extern "win64" fn fallback_entry(index: u64, arguments: *const
     runtime::state().transitions.pop();
     match outcome {
         Ok(value) => {
-            let raw = result_raw(loaded.returns, value);
-            if matches!(loaded.returns, Some(VarType::F32 | VarType::F64)) {
+            let returns = loaded.returns.as_ref().and_then(Ty::prim);
+            let raw = result_raw(returns, value);
+            if matches!(returns, Some(VarType::F32 | VarType::F64)) {
                 raw[1]
             } else {
                 raw[0]
@@ -395,6 +500,7 @@ pub(crate) unsafe extern "win64" fn fallback_entry(index: u64, arguments: *const
                 unsafe { *flag = 0 };
             }
             drop(values);
+            drop(parameters);
             drop(loaded);
             abort_compiled(interpreter, frame, fault)
         }
@@ -427,6 +533,8 @@ impl<'s> Interpreter<'s> {
             names: RefCell::new(HashMap::new()),
             resources: RefCell::new(HashMap::new()),
             failed_types: RefCell::new(HashMap::new()),
+            fields: RefCell::new(HashMap::new()),
+            intrinsic_rows: RefCell::new(HashMap::new()),
             depth: Cell::new(0),
             interpreted: Cell::new(0),
             compiled_calls: Cell::new(0),
@@ -461,7 +569,7 @@ impl<'s> Interpreter<'s> {
         }
         let loaded = self.load(key).ok()?;
         let index = bridge.keys.borrow().len() as u64;
-        let address = crate::jit::emit_fallback_stub(&loaded.parameters, index)?;
+        let address = crate::jit::emit_fallback_stub(&prims(&loaded.parameters)?, index)?;
         bridge.keys.borrow_mut().push(key.clone());
         bridge.stubs.borrow_mut().insert(key.clone(), address);
         Some(address)
@@ -538,10 +646,97 @@ impl<'s> Interpreter<'s> {
         Ok(loaded)
     }
 
-    fn signature_var(&self, module: usize, sig: &TypeSig) -> Run<VarType> {
-        match map(self.model.var_type(module, sig))? {
-            Some(var) => Ok(var),
-            None => unsupported(format!("value of type {sig:?}")),
+    fn ty_of(&self, module: usize, sig: &TypeSig) -> Run<Ty> {
+        if let Some(var) = map(self.model.var_type(module, sig))? {
+            return Ok(Ty::Prim(var));
+        }
+        match self.model.shape(module, sig) {
+            Ok(FieldShape::Struct(handle)) => self.value_ty(handle),
+            Ok(_) => unsupported(format!("value of type {sig:?}")),
+            Err(reason) => unsupported(reason),
+        }
+    }
+
+    fn value_ty(&self, handle: TypeHandle) -> Run<Ty> {
+        let set = self.model.set;
+        if !set.is_value_type(handle).unwrap_or(false) {
+            return Ok(Ty::Prim(VarType::Ref));
+        }
+        if set.is_enum(handle).unwrap_or(false) {
+            let size = set
+                .value_type_layout(handle)
+                .map_err(|e| Fault::Unsupported(format!("{e:?}")))?
+                .size;
+            return Ok(Ty::Prim(match size {
+                1 => VarType::U8,
+                2 => VarType::U16,
+                4 => VarType::I32,
+                _ => VarType::I64,
+            }));
+        }
+        let primitive = match self.type_name(handle).as_str() {
+            "System.Boolean" | "System.Byte" => Some(VarType::U8),
+            "System.SByte" => Some(VarType::I8),
+            "System.Int16" => Some(VarType::I16),
+            "System.UInt16" | "System.Char" => Some(VarType::U16),
+            "System.Int32" | "System.UInt32" => Some(VarType::I32),
+            "System.Int64" | "System.UInt64" | "System.IntPtr" | "System.UIntPtr" => {
+                Some(VarType::I64)
+            }
+            "System.Single" => Some(VarType::F32),
+            "System.Double" => Some(VarType::F64),
+            _ => None,
+        };
+        match primitive {
+            Some(var) => Ok(Ty::Prim(var)),
+            None => Ok(Ty::Struct(map(self.model.struct_layout(handle))?)),
+        }
+    }
+
+    fn allocate_box(&self, handle: TypeHandle) -> Run<u64> {
+        let record = self.record(RuntimeType::Class(handle))?;
+        match runtime::allocate_managed(record, 0) {
+            0 => self.throw("OutOfMemoryException"),
+            object => Ok(object),
+        }
+    }
+
+    fn read_value(&self, address: u64, ty: &Ty, keep: &[V]) -> Run<V> {
+        match ty {
+            Ty::Prim(var) => Ok(read(address, *var)),
+            Ty::Struct(layout) => {
+                let _pin = Pin::new(keep);
+                let boxed = self.allocate_box(layout.handle)?;
+                unsafe {
+                    std::ptr::copy(address as *const u8, (boxed + 8) as *mut u8, layout.size as usize);
+                }
+                Ok(V::S(boxed))
+            }
+        }
+    }
+
+    fn write_value(&self, address: u64, ty: &Ty, value: V) -> Run<()> {
+        match ty {
+            Ty::Prim(var) => {
+                write(address, *var, value);
+                Ok(())
+            }
+            Ty::Struct(layout) => match value {
+                V::S(boxed) | V::O(boxed) if boxed != 0 => {
+                    unsafe {
+                        std::ptr::copy(
+                            (boxed + 8) as *const u8,
+                            address as *mut u8,
+                            layout.size as usize,
+                        );
+                    }
+                    Ok(())
+                }
+                other => unsupported(format!(
+                    "a value of struct {} was expected, got {other:?}",
+                    self.type_name(layout.handle)
+                )),
+            },
         }
     }
 
@@ -566,22 +761,36 @@ impl<'s> Interpreter<'s> {
         let owner_is_value = set.is_value_type(owner).unwrap_or(false);
         let mut parameters = Vec::new();
         if sig.has_this {
-            parameters.push(if owner_is_value {
+            parameters.push(Ty::Prim(if owner_is_value {
                 VarType::Pointer
             } else {
                 VarType::Ref
-            });
+            }));
         }
         for parameter in &sig.parameters {
-            parameters.push(self.signature_var(key.module, parameter)?);
+            parameters.push(self.ty_of(key.module, parameter)?);
         }
         let returns = match &sig.return_type {
             TypeSig::Void => None,
             TypeSig::Modified { inner, .. } if **inner == TypeSig::Void => None,
-            other => Some(self.signature_var(key.module, other)?),
+            other => Some(self.ty_of(key.module, other)?),
         };
         let name = metadata.string_cell(TableId::MethodDef, key.row, 3).unwrap_or("");
-        let native = self.native(owner, name, &parameters, returns);
+        let primitive_returns = match &returns {
+            None => Some(None),
+            Some(Ty::Prim(var)) => Some(Some(*var)),
+            Some(Ty::Struct(_)) => None,
+        };
+        let native = match (prims(&parameters), primitive_returns) {
+            (Some(parameters), Some(returns)) => self.native(owner, name, &parameters, returns),
+            _ if name == "InitializeArray"
+                && self.type_name(owner) == "System.Runtime.CompilerServices.RuntimeHelpers"
+                && parameters.len() == 2 =>
+            {
+                Some(Native::Intrinsic(Intrinsic::InitializeArray))
+            }
+            _ => self.delegate_native(owner, name),
+        };
         let mut code: &'static [u8] = &[];
         let mut clauses = Vec::new();
         let mut locals = Vec::new();
@@ -595,12 +804,23 @@ impl<'s> Interpreter<'s> {
                     self.type_name(owner)
                 ));
             }
-            if rva == 0 {
-                return unsupported(if flags & ABSTRACT != 0 {
-                    "abstract method".to_owned()
-                } else {
-                    format!("method without a body {}::{name}", self.type_name(owner))
+            if rva == 0 && flags & ABSTRACT != 0 {
+                return Ok(Loaded {
+                    key: key.clone(),
+                    owner,
+                    code: &[],
+                    clauses: Vec::new(),
+                    parameters,
+                    returns,
+                    locals,
+                    native,
+                    is_static: flags & STATIC != 0,
+                    is_virtual: flags & VIRTUAL != 0,
+                    is_abstract: true,
                 });
+            }
+            if rva == 0 {
+                return unsupported(format!("method without a body {}::{name}", self.type_name(owner)));
             }
             let body = module
                 .image
@@ -618,11 +838,14 @@ impl<'s> Interpreter<'s> {
                 {
                     for local in &types {
                         locals.push(match local {
-                            TypeSig::Pinned(inner) => self.signature_var(key.module, inner)?,
-                            other => self.signature_var(key.module, other)?,
+                            TypeSig::Pinned(inner) => self.ty_of(key.module, inner)?,
+                            other => self.ty_of(key.module, other)?,
                         });
                     }
                 }
+            }
+            if self.is_intrinsic(key, owner) && self.calls_itself(key, body.code) {
+                return unsupported(format!("JIT intrinsic {}::{name}", self.type_name(owner)));
             }
             code = body.code;
             clauses = body.clauses;
@@ -638,6 +861,41 @@ impl<'s> Interpreter<'s> {
             native,
             is_static: flags & STATIC != 0,
             is_virtual: flags & VIRTUAL != 0,
+            is_abstract: false,
+        })
+    }
+
+    fn is_intrinsic(&self, key: &MethodKey, owner: TypeHandle) -> bool {
+        let mut cache = self.intrinsic_rows.borrow_mut();
+        let (methods, types) = cache.entry(key.module).or_insert_with(|| {
+            let scan = |table| {
+                self.model
+                    .set
+                    .rows_with_attribute(
+                        key.module,
+                        table,
+                        "System.Runtime.CompilerServices",
+                        "IntrinsicAttribute",
+                    )
+                    .unwrap_or_default()
+            };
+            (scan(TableId::MethodDef), scan(TableId::TypeDef))
+        });
+        methods.contains(&key.row) || types.contains(&owner.row)
+    }
+
+    fn calls_itself(&self, key: &MethodKey, code: &[u8]) -> bool {
+        let body = MethodBody {
+            max_stack: 0,
+            local_signature: Token(0),
+            init_locals: false,
+            code,
+            clauses: Vec::new(),
+        };
+        body.instructions().flatten().any(|instruction| {
+            instruction.opcode.value == 0x28
+                && matches!(instruction.argument, Argument::Token(token)
+                    if self.method_token(key.module, token).ok().as_ref() == Some(key))
         })
     }
 
@@ -650,12 +908,11 @@ impl<'s> Interpreter<'s> {
     ) -> Option<Native> {
         let type_name = self.type_name(owner);
         let float = parameters.first() == Some(&VarType::F32);
+        if let Some(native) = self.delegate_native(owner, name) {
+            return Some(native);
+        }
         if self.is_delegate(owner) && type_name != "System.Delegate" && type_name != "System.MulticastDelegate" {
-            return match name {
-                ".ctor" => Some(Native::DelegateConstruct),
-                "Invoke" => Some(Native::DelegateInvoke),
-                _ => None,
-            };
+            return None;
         }
         let intrinsic = match (type_name.as_str(), name) {
             (t, "get_IsSupported") if t.starts_with("System.Runtime.Intrinsics.") => {
@@ -665,6 +922,17 @@ impl<'s> Interpreter<'s> {
                 Intrinsic::False
             }
             (t, "UsingResourceKeys") if t == "System.SR" || t.ends_with(".SR") => Intrinsic::False,
+            ("System.Double" | "System.Single", "MultiplyAddEstimate") if parameters.len() == 3 => {
+                match (float, std::arch::is_x86_feature_detected!("fma")) {
+                    (true, true) => Intrinsic::FusedF,
+                    (false, true) => Intrinsic::Fused,
+                    (true, false) => Intrinsic::MultiplyAddF,
+                    (false, false) => Intrinsic::MultiplyAdd,
+                }
+            }
+            ("System.Math" | "System.MathF", "FusedMultiplyAdd") if parameters.len() == 3 => {
+                if float { Intrinsic::FusedF } else { Intrinsic::Fused }
+            }
             ("System.Math" | "System.MathF", _) => return self.math(name, parameters, float),
             ("System.String", "get_Length") => Intrinsic::StringLength,
             ("System.String", "get_Chars") => Intrinsic::StringChar,
@@ -705,7 +973,8 @@ impl<'s> Interpreter<'s> {
             _ => {
                 if (type_name == "System.SR" || type_name.ends_with(".SR"))
                     && name == "GetResourceString"
-                    && (1..=2).contains(&parameters.len())
+                    && (parameters.len() == 1
+                        || (parameters.len() == 2 && !self.forwards_resource_lookup(owner)))
                 {
                     Intrinsic::ResourceString(owner.module)
                 } else {
@@ -714,6 +983,59 @@ impl<'s> Interpreter<'s> {
             }
         };
         Some(Native::Intrinsic(intrinsic))
+    }
+
+    fn forwards_resource_lookup(&self, owner: TypeHandle) -> bool {
+        let set = self.model.set;
+        let metadata = &set.modules[owner.module].metadata;
+        let Ok(range) = metadata.method_range(owner.row) else {
+            return false;
+        };
+        let single: Vec<u32> = range
+            .clone()
+            .filter(|&row| {
+                metadata.string_cell(TableId::MethodDef, row, 3).ok() == Some("GetResourceString")
+                    && self
+                        .model
+                        .method_sig(&MethodKey { module: owner.module, row })
+                        .is_ok_and(|sig| sig.parameters.len() == 1)
+            })
+            .collect();
+        for row in range {
+            if metadata.string_cell(TableId::MethodDef, row, 3).ok() != Some("GetResourceString") {
+                continue;
+            }
+            let key = MethodKey { module: owner.module, row };
+            if self.model.method_sig(&key).is_ok_and(|sig| sig.parameters.len() != 2) {
+                continue;
+            }
+            let rva = metadata.cell(TableId::MethodDef, row, 0).unwrap_or(0);
+            let Ok(body) = set.modules[owner.module]
+                .image
+                .tail_at_rva(rva)
+                .and_then(|tail| MethodBody::parse(tail, rva))
+            else {
+                return false;
+            };
+            return body.instructions().flatten().any(|instruction| {
+                instruction.opcode.value == 0x28
+                    && matches!(instruction.argument, Argument::Token(token)
+                        if self.method_token(owner.module, token).is_ok_and(|target| target.module == owner.module && single.contains(&target.row)))
+            });
+        }
+        false
+    }
+
+    fn delegate_native(&self, owner: TypeHandle, name: &str) -> Option<Native> {
+        let type_name = self.type_name(owner);
+        if !self.is_delegate(owner) || type_name == "System.Delegate" || type_name == "System.MulticastDelegate" {
+            return None;
+        }
+        match name {
+            ".ctor" => Some(Native::DelegateConstruct),
+            "Invoke" => Some(Native::DelegateInvoke),
+            _ => None,
+        }
     }
 
     fn math(&self, name: &str, parameters: &[VarType], float: bool) -> Option<Native> {
@@ -739,6 +1061,8 @@ impl<'s> Interpreter<'s> {
             "Floor" => Some((f64::floor, f32::floor)),
             "Ceiling" => Some((f64::ceil, f32::ceil)),
             "Truncate" => Some((f64::trunc, f32::trunc)),
+            "ReciprocalEstimate" => Some((reciprocal, reciprocal_single)),
+            "ReciprocalSqrtEstimate" => Some((reciprocal_sqrt, reciprocal_sqrt_single)),
             _ => None,
         };
         let two: Option<BinaryPair> = match name {
@@ -793,6 +1117,8 @@ impl<'s> Interpreter<'s> {
         }
         let image = self.image.get();
         if !image.is_null()
+            && prims(&loaded.parameters).is_some()
+            && !matches!(loaded.returns, Some(Ty::Struct(_)))
             && let Some(outcome) = self.call_compiled(unsafe { &*image }, &loaded, arguments)
         {
             return outcome;
@@ -810,7 +1136,7 @@ impl<'s> Interpreter<'s> {
             Some(Pending::Throw(name)) => return Some(self.throw(name)),
             None => {}
         }
-        Some(Ok(loaded.returns.map(|var| match var {
+        Some(Ok(loaded.returns.as_ref().and_then(Ty::prim).map(|var| match var {
             VarType::F32 => V::F4(f32::from_bits(result[1] as u32)),
             VarType::F64 => V::F8(f64::from_bits(result[1])),
             other => load_raw(other, result[0]),
@@ -850,7 +1176,10 @@ impl<'s> Interpreter<'s> {
                 }
                 forwarded.extend_from_slice(&arguments[1..]);
                 let result = self.invoke(&key, &forwarded)?;
-                Ok(result.map(|v| coerce(v, loaded.returns.unwrap_or(VarType::I64))))
+                Ok(result.map(|v| match &loaded.returns {
+                    Some(Ty::Prim(var)) => coerce(v, *var),
+                    _ => v,
+                }))
             }
         }
     }
@@ -966,6 +1295,16 @@ impl<'s> Interpreter<'s> {
                 }
                 return Ok(None);
             }
+            Intrinsic::Fused => V::F8(crt::fma(a[0].float(), a[1].float(), a[2].float())),
+            Intrinsic::FusedF => V::F4(crt::fmaf(
+                a[0].float() as f32,
+                a[1].float() as f32,
+                a[2].float() as f32,
+            )),
+            Intrinsic::MultiplyAdd => V::F8(a[0].float() * a[1].float() + a[2].float()),
+            Intrinsic::MultiplyAddF => {
+                V::F4(a[0].float() as f32 * a[1].float() as f32 + a[2].float() as f32)
+            }
             Intrinsic::Exchange(var) => {
                 let address = self.non_null(a[0])?;
                 let old = read(address, var);
@@ -1014,7 +1353,7 @@ impl<'s> Interpreter<'s> {
                         }
                         V::O(string)
                     }
-                    None if a.len() == 2 => a[1],
+                    None if a.len() == 2 => V::O(0),
                     None if self.model.set.modules[module].name == "System.Private.CoreLib" => a[0],
                     None => V::O(0),
                 }
@@ -1106,24 +1445,37 @@ impl<'s> Interpreter<'s> {
     }
 
     fn interpret(&self, loaded: &Loaded, arguments: &[V]) -> Run<Option<V>> {
+        if loaded.is_abstract {
+            return unsupported("abstract method");
+        }
         let depth = self.depth.get();
         if depth >= MAX_DEPTH {
             return unsupported("interpreter call depth");
         }
         self.depth.set(depth + 1);
         self.interpreted.set(self.interpreted.get() + 1);
-        let count = loaded.parameters.len() + loaded.locals.len();
         let mut kinds = loaded.parameters.clone();
         kinds.extend_from_slice(&loaded.locals);
+        let mut offsets = Vec::with_capacity(kinds.len());
+        let mut words = 0usize;
+        for kind in &kinds {
+            offsets.push(words);
+            words += kind.words();
+        }
         let mut frame = Box::new(Frame {
-            slots: vec![0u64; count].into_boxed_slice(),
+            memory: vec![0u64; words.max(1)].into_boxed_slice(),
+            offsets,
             kinds,
             stack: Vec::new(),
             caught: Vec::new(),
             scratch: Vec::new(),
         });
         for (index, value) in arguments.iter().enumerate() {
-            frame.slots[index] = store_raw(loaded.parameters[index], *value);
+            let (address, kind) = frame.slot(index)?;
+            match kind {
+                Ty::Prim(var) => frame.memory[frame.offsets[index]] = store_raw(var, *value),
+                kind => self.write_value(address, &kind, *value)?,
+            }
         }
         let registered = Registered::new(&frame);
         let result = self.execute(loaded, &mut frame, 0);
@@ -1441,50 +1793,104 @@ impl<'s> Interpreter<'s> {
         unsupported("interface method has no implementation")
     }
 
-    fn field_address(&self, method: &Loaded, token: Token, target: V) -> Run<(u64, VarType)> {
-        let field = map(self.model.field(method.key.module, token))?;
-        let owner_is_value = self.model.set.is_value_type(field.owner).unwrap_or(false);
-        if field.is_static {
-            self.ensure_initialized(field.owner)?;
-            let address = if field.has_rva {
-                map(runtime::rva_data(self.model.set, field.module, field.row))?
-            } else {
-                runtime::state().static_slot(self.model, field.module, field.row, field.var == VarType::Ref)
-            };
-            return Ok((address, field.var));
+    fn field_ref(&self, module: usize, token: Token) -> Run<Rc<FieldRef>> {
+        if let Some(found) = self.fields.borrow().get(&(module, token.0)) {
+            return Ok(found.clone());
         }
-        let offset = if owner_is_value {
-            let (_, placements) = self
-                .model
-                .set
-                .value_type_fields(field.owner)
+        let set = self.model.set;
+        let (field_module, row) = match token.table() {
+            Some(TableId::Field) => (module, token.row()),
+            Some(TableId::MemberRef) => match set.resolve_member_ref(module, token.row()) {
+                Ok(Member::Field(handle)) => (handle.module, handle.token.row()),
+                Ok(_) => return unsupported("member reference is not a field"),
+                Err(error) => return unsupported(format!("field does not resolve: {error:?}")),
+            },
+            _ => return unsupported("token is not a field"),
+        };
+        let metadata = &set.modules[field_module].metadata;
+        let flags = metadata.cell(TableId::Field, row, 0).unwrap_or(0);
+        let sig = map(self.model.field_signature(field_module, row))?;
+        let ty = self.ty_of(field_module, &sig)?;
+        let owner = set.modules[field_module]
+            .field_owner(row)
+            .ok()
+            .flatten()
+            .map(|owner| TypeHandle {
+                module: field_module,
+                row: owner,
+            })
+            .ok_or_else(|| Fault::Unsupported("field has no owner".into()))?;
+        let is_static = flags & 0x10 != 0;
+        let owner_is_value = set.is_value_type(owner).unwrap_or(false);
+        let offset = if is_static {
+            0
+        } else if owner_is_value {
+            u64::from(
+                *map(self.model.struct_layout(owner))?
+                    .fields
+                    .get(&row)
+                    .ok_or_else(|| Fault::Unsupported("value type field".into()))?,
+            )
+        } else {
+            let (_, placements) = set
+                .class_fields(owner)
                 .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
             u64::from(
                 placements
                     .iter()
-                    .find(|p| p.field == field.row)
-                    .map(|p| p.offset)
-                    .ok_or_else(|| Fault::Unsupported("value type field".into()))?,
+                    .find(|p| p.field == row)
+                    .map(|p| p.offset + 8)
+                    .ok_or_else(|| Fault::Unsupported("field is not an instance field of its owner".into()))?,
             )
-        } else {
-            u64::from(map(self.model.instance_offset(&field))?)
         };
+        let found = Rc::new(FieldRef {
+            owner,
+            module: field_module,
+            row,
+            is_static,
+            has_rva: flags & 0x100 != 0,
+            owner_is_value,
+            ty,
+            offset,
+        });
+        self.fields.borrow_mut().insert((module, token.0), found.clone());
+        Ok(found)
+    }
+
+    fn field_address(&self, method: &Loaded, token: Token, target: V) -> Run<(u64, Ty)> {
+        let field = self.field_ref(method.key.module, token)?;
+        if field.is_static {
+            self.ensure_initialized(field.owner)?;
+            let state = runtime::state();
+            let address = if field.has_rva {
+                map(runtime::rva_data(self.model.set, field.module, field.row))?
+            } else {
+                match &field.ty {
+                    Ty::Prim(var) => state.static_slot(self.model, field.module, field.row, *var == VarType::Ref),
+                    Ty::Struct(layout) => {
+                        state.static_block(field.module, field.row, layout.size, &layout.references)
+                    }
+                }
+            };
+            return Ok((address, field.ty.clone()));
+        }
         let base = match target {
             V::O(object) => {
                 if object == 0 {
                     return self.throw("NullReferenceException");
                 }
-                if owner_is_value { object + 8 } else { object }
+                if field.owner_is_value { object + 8 } else { object }
             }
+            V::S(boxed) => boxed + 8,
             other => match other.address() {
                 0 => return self.throw("NullReferenceException"),
                 pointer => pointer,
             },
         };
-        Ok((base + offset, field.var))
+        Ok((base + field.offset, field.ty.clone()))
     }
 
-    fn type_var(&self, module: usize, token: Token) -> Run<(VarType, Option<TypeHandle>)> {
+    fn type_ty(&self, module: usize, token: Token) -> Run<(Ty, Option<TypeHandle>)> {
         match token.table() {
             Some(TableId::TypeSpec) => {
                 let metadata = &self.model.set.modules[module].metadata;
@@ -1493,7 +1899,7 @@ impl<'s> Interpreter<'s> {
                     .and_then(|b| metadata.blob(b))
                     .and_then(Signature::parse_type)
                     .map_err(|e| Fault::Unsupported(e.to_string()))?;
-                Ok((self.signature_var(module, &sig)?, None))
+                Ok((self.ty_of(module, &sig)?, None))
             }
             _ => {
                 let handle = self
@@ -1501,12 +1907,22 @@ impl<'s> Interpreter<'s> {
                     .set
                     .resolve_type_token(module, token)
                     .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
-                if !self.model.set.is_value_type(handle).unwrap_or(false) {
-                    return Ok((VarType::Ref, Some(handle)));
-                }
-                let kind = map(self.model.element_kind(module, token))?;
-                Ok((kind.var(), Some(handle)))
+                Ok((self.value_ty(handle)?, Some(handle)))
             }
+        }
+    }
+
+    fn array_type(&self, module: usize, token: Token) -> Run<(RuntimeType, Ty, u32)> {
+        if let Ok(kind) = self.model.element_kind(module, token) {
+            return Ok((RuntimeType::Array(kind), Ty::Prim(kind.var()), kind.size()));
+        }
+        match self.type_ty(module, token)? {
+            (Ty::Struct(layout), _) => Ok((
+                RuntimeType::ValueArray(layout.handle),
+                Ty::Struct(layout.clone()),
+                layout.size,
+            )),
+            _ => unsupported("array element type"),
         }
     }
 
@@ -1600,38 +2016,31 @@ impl<'s> Interpreter<'s> {
             }
             match opcode {
                 0x00 | 0x01 | 0xFE12 | 0xFE13 | 0xFE14 | 0xFE19 | 0xFE1E => {}
-                0x02..=0x09 => {
-                    let index = if opcode <= 0x05 {
-                        (opcode - 0x02) as usize
-                    } else {
-                        method.parameters.len() + (opcode - 0x06) as usize
+                0x02..=0x09 | 0x0E | 0xFE09 | 0x11 | 0xFE0C => {
+                    let index = match opcode {
+                        0x02..=0x05 => (opcode - 0x02) as usize,
+                        0x06..=0x09 => method.parameters.len() + (opcode - 0x06) as usize,
+                        0x11 | 0xFE0C => method.parameters.len() + variable(argument),
+                        _ => variable(argument),
                     };
-                    let kind = *frame.kinds.get(index).ok_or_else(|| Fault::Unsupported("variable index".into()))?;
-                    frame.stack.push(load_raw(kind, frame.slots[index]));
+                    let (address, kind) = frame.slot(index)?;
+                    let value = self.read_value(address, &kind, &[])?;
+                    frame.stack.push(value);
                 }
-                0x0A..=0x0D => {
-                    let index = method.parameters.len() + (opcode - 0x0A) as usize;
+                0x0A..=0x0D | 0x10 | 0xFE0B | 0x13 | 0xFE0E => {
+                    let index = match opcode {
+                        0x0A..=0x0D => method.parameters.len() + (opcode - 0x0A) as usize,
+                        0x13 | 0xFE0E => method.parameters.len() + variable(argument),
+                        _ => variable(argument),
+                    };
                     let value = pop!();
-                    let kind = *frame.kinds.get(index).ok_or_else(|| Fault::Unsupported("variable index".into()))?;
-                    frame.slots[index] = store_raw(kind, value);
-                }
-                0x0E | 0xFE09 | 0x11 | 0xFE0C => {
-                    let index = variable(argument) + if matches!(opcode, 0x11 | 0xFE0C) { method.parameters.len() } else { 0 };
-                    let kind = *frame.kinds.get(index).ok_or_else(|| Fault::Unsupported("variable index".into()))?;
-                    frame.stack.push(load_raw(kind, frame.slots[index]));
+                    let (address, kind) = frame.slot(index)?;
+                    self.write_value(address, &kind, value)?;
                 }
                 0x0F | 0xFE0A | 0x12 | 0xFE0D => {
                     let index = variable(argument) + if matches!(opcode, 0x12 | 0xFE0D) { method.parameters.len() } else { 0 };
-                    if index >= frame.slots.len() {
-                        return unsupported("variable index");
-                    }
-                    frame.stack.push(V::P(&frame.slots[index] as *const u64 as u64));
-                }
-                0x10 | 0xFE0B | 0x13 | 0xFE0E => {
-                    let index = variable(argument) + if matches!(opcode, 0x13 | 0xFE0E) { method.parameters.len() } else { 0 };
-                    let value = pop!();
-                    let kind = *frame.kinds.get(index).ok_or_else(|| Fault::Unsupported("variable index".into()))?;
-                    frame.slots[index] = store_raw(kind, value);
+                    let (address, _) = frame.slot(index)?;
+                    frame.stack.push(V::P(address));
                 }
                 0x14 => frame.stack.push(V::O(0)),
                 0x15..=0x1E => frame.stack.push(V::I4(i32::from(opcode as i16 - 0x16))),
@@ -1647,8 +2056,9 @@ impl<'s> Interpreter<'s> {
                     pop!();
                 }
                 0x2A => {
-                    let value = match method.returns {
-                        Some(var) => Some(coerce(pop!(), var)),
+                    let value = match &method.returns {
+                        Some(Ty::Prim(var)) => Some(coerce(pop!(), *var)),
+                        Some(Ty::Struct(_)) => Some(pop!()),
                         None => None,
                     };
                     return Ok(Exit::Return(value));
@@ -1806,14 +2216,15 @@ impl<'s> Interpreter<'s> {
                         let _pin = Pin::new(&arguments);
                         let mut target = key.clone();
                         if let Some(prefix) = constrained.take() {
-                            let (var, handle) = self.type_var(module, prefix)?;
-                            if var == VarType::Ref {
+                            let (ty, handle) = self.type_ty(module, prefix)?;
+                            if matches!(ty, Ty::Prim(VarType::Ref)) {
                                 arguments[0] = V::O(read(arguments[0].address(), VarType::Ref).address());
                             } else if let Some(handle) = handle {
                                 match self.find_value_override(handle, &key)? {
                                     Some(found) => target = found,
                                     None => {
-                                        let boxed = self.box_value(handle, var, read(arguments[0].address(), var))?;
+                                        let value = self.read_value(arguments[0].address(), &ty, &[])?;
+                                        let boxed = self.box_any(handle, &ty, value)?;
                                         arguments[0] = V::O(boxed);
                                     }
                                 }
@@ -1873,11 +2284,12 @@ impl<'s> Interpreter<'s> {
                         return unsupported("field token");
                     };
                     let target = if matches!(opcode, 0x7B | 0x7C) { pop!() } else { V::O(0) };
-                    let (address, var) = self.field_address(method, token, target)?;
+                    let _pin = Pin::new(&[target]);
+                    let (address, ty) = self.field_address(method, token, target)?;
                     let value = if matches!(opcode, 0x7C | 0x7F) {
                         V::P(address)
                     } else {
-                        read(address, var)
+                        self.read_value(address, &ty, &[target])?
                     };
                     frame.stack.push(value);
                 }
@@ -1887,22 +2299,24 @@ impl<'s> Interpreter<'s> {
                     };
                     let value = pop!();
                     let target = if opcode == 0x7D { pop!() } else { V::O(0) };
-                    let _pin = Pin::new(&[value]);
-                    let (address, var) = self.field_address(method, token, target)?;
-                    write(address, var, value);
+                    let _pin = Pin::new(&[value, target]);
+                    let (address, ty) = self.field_address(method, token, target)?;
+                    self.write_value(address, &ty, value)?;
                 }
                 0x71 | 0x81 | 0x70 | 0xA5 | 0x79 | 0x8C | 0xFE15 | 0xFE1C => {
                     let Argument::Token(token) = argument else {
                         return unsupported("type token");
                     };
-                    let (var, handle) = self.type_var(module, token)?;
+                    let (ty, handle) = self.type_ty(module, token)?;
+                    let is_reference = matches!(ty, Ty::Prim(VarType::Ref));
                     match opcode {
                         0x71 => {
                             let address = pop!().address();
                             if address == 0 {
                                 return self.throw("NullReferenceException");
                             }
-                            frame.stack.push(read(address, var));
+                            let value = self.read_value(address, &ty, &[])?;
+                            frame.stack.push(value);
                         }
                         0x81 => {
                             let value = pop!();
@@ -1910,31 +2324,36 @@ impl<'s> Interpreter<'s> {
                             if address == 0 {
                                 return self.throw("NullReferenceException");
                             }
-                            write(address, var, value);
+                            self.write_value(address, &ty, value)?;
                         }
                         0x70 => {
                             let source = pop!().address();
                             let destination = pop!().address();
-                            write(destination, var, read(source, var));
+                            unsafe {
+                                std::ptr::copy(source as *const u8, destination as *mut u8, ty.size() as usize);
+                            }
                         }
                         0xFE15 => {
                             let address = pop!().address();
-                            write(address, var, if var == VarType::Ref { V::O(0) } else { V::I8(0) });
+                            if address == 0 {
+                                return self.throw("NullReferenceException");
+                            }
+                            unsafe { std::ptr::write_bytes(address as *mut u8, 0, ty.size() as usize) };
                         }
-                        0xFE1C => frame.stack.push(V::I4(var_size(var) as i32)),
+                        0xFE1C => frame.stack.push(V::I4(ty.size() as i32)),
                         0x8C => {
                             let value = pop!();
-                            if var == VarType::Ref {
+                            if is_reference {
                                 frame.stack.push(value);
                             } else {
                                 let handle = handle.ok_or_else(|| Fault::Unsupported("box of a generic instantiation".into()))?;
-                                let boxed = self.box_value(handle, var, value)?;
+                                let boxed = self.box_any(handle, &ty, value)?;
                                 frame.stack.push(V::O(boxed));
                             }
                         }
                         _ => {
                             let object = pop!().address();
-                            if var == VarType::Ref {
+                            if is_reference {
                                 if opcode == 0x79 {
                                     return unsupported("unbox of a reference type");
                                 }
@@ -1951,11 +2370,12 @@ impl<'s> Interpreter<'s> {
                                 if !self.unbox_compatible(object, handle)? {
                                     return self.throw("InvalidCastException");
                                 }
-                                frame.stack.push(if opcode == 0x79 {
+                                let value = if opcode == 0x79 {
                                     V::P(object + 8)
                                 } else {
-                                    read(object + 8, var)
-                                });
+                                    self.read_value(object + 8, &ty, &[V::O(object)])?
+                                };
+                                frame.stack.push(value);
                             }
                         }
                     }
@@ -1964,12 +2384,12 @@ impl<'s> Interpreter<'s> {
                     let Argument::Token(token) = argument else {
                         return unsupported("array token");
                     };
-                    let kind = map(self.model.element_kind(module, token))?;
+                    let (kind, _, _) = self.array_type(module, token)?;
                     let count = pop!().int();
                     if count < 0 {
                         return self.throw("OverflowException");
                     }
-                    let record = self.record(RuntimeType::Array(kind))?;
+                    let record = self.record(kind)?;
                     let array = runtime::allocate_managed(record, count as u64);
                     if array == 0 {
                         return self.throw("OutOfMemoryException");
@@ -1984,55 +2404,64 @@ impl<'s> Interpreter<'s> {
                     frame.stack.push(V::I8(i64::from(unsafe { *((array + 8) as *const u32) })));
                 }
                 0x8F | 0x90..=0x9A | 0xA3 => {
-                    let kind = match opcode {
-                        0x90 => ElementKind::I8,
-                        0x91 => ElementKind::U8,
-                        0x92 => ElementKind::I16,
-                        0x93 => ElementKind::U16,
-                        0x94 | 0x95 => ElementKind::I32,
-                        0x96 | 0x97 => ElementKind::I64,
-                        0x98 => ElementKind::F32,
-                        0x99 => ElementKind::F64,
-                        0x9A => ElementKind::Reference,
-                        _ => {
+                    let fixed = match opcode {
+                        0x90 => Some(ElementKind::I8),
+                        0x91 => Some(ElementKind::U8),
+                        0x92 => Some(ElementKind::I16),
+                        0x93 => Some(ElementKind::U16),
+                        0x94 | 0x95 => Some(ElementKind::I32),
+                        0x96 | 0x97 => Some(ElementKind::I64),
+                        0x98 => Some(ElementKind::F32),
+                        0x99 => Some(ElementKind::F64),
+                        0x9A => Some(ElementKind::Reference),
+                        _ => None,
+                    };
+                    let (ty, size) = match fixed {
+                        Some(kind) => (Ty::Prim(kind.var()), kind.size()),
+                        None => {
                             let Argument::Token(token) = argument else {
                                 return unsupported("element token");
                             };
-                            map(self.model.element_kind(module, token))?
+                            let (_, ty, size) = self.array_type(module, token)?;
+                            (ty, size)
                         }
                     };
                     let index = pop!().int();
-                    let array = pop!().address();
-                    let address = self.element(array, index, kind)?;
+                    let array = pop!();
+                    let address = self.element(array.address(), index, size)?;
                     let value = if opcode == 0x8F {
                         V::P(address)
                     } else {
-                        read(address, kind.var())
+                        self.read_value(address, &ty, &[array])?
                     };
                     frame.stack.push(value);
                 }
                 0x9B..=0xA2 | 0xA4 => {
-                    let kind = match opcode {
-                        0x9B => ElementKind::I64,
-                        0x9C => ElementKind::I8,
-                        0x9D => ElementKind::I16,
-                        0x9E => ElementKind::I32,
-                        0x9F => ElementKind::I64,
-                        0xA0 => ElementKind::F32,
-                        0xA1 => ElementKind::F64,
-                        0xA2 => ElementKind::Reference,
-                        _ => {
+                    let fixed = match opcode {
+                        0x9B | 0x9F => Some(ElementKind::I64),
+                        0x9C => Some(ElementKind::I8),
+                        0x9D => Some(ElementKind::I16),
+                        0x9E => Some(ElementKind::I32),
+                        0xA0 => Some(ElementKind::F32),
+                        0xA1 => Some(ElementKind::F64),
+                        0xA2 => Some(ElementKind::Reference),
+                        _ => None,
+                    };
+                    let (ty, size) = match fixed {
+                        Some(kind) => (Ty::Prim(kind.var()), kind.size()),
+                        None => {
                             let Argument::Token(token) = argument else {
                                 return unsupported("element token");
                             };
-                            map(self.model.element_kind(module, token))?
+                            let (_, ty, size) = self.array_type(module, token)?;
+                            (ty, size)
                         }
                     };
                     let value = pop!();
                     let index = pop!().int();
                     let array = pop!().address();
-                    let address = self.element(array, index, kind)?;
-                    write(address, kind.var(), value);
+                    let address = self.element(array, index, size)?;
+                    self.write_value(address, &ty, value)?;
                 }
                 0xD0 => {
                     let Argument::Token(token) = argument else {
@@ -2040,7 +2469,7 @@ impl<'s> Interpreter<'s> {
                     };
                     match token.table() {
                         Some(TableId::Field) | Some(TableId::MemberRef) => {
-                            let field = map(self.model.field(module, token))?;
+                            let field = self.field_ref(module, token)?;
                             if !field.has_rva {
                                 return unsupported("field handles");
                             }
@@ -2111,7 +2540,33 @@ impl<'s> Interpreter<'s> {
         let owner = callee.owner;
         let set = self.model.set;
         if set.is_value_type(owner).unwrap_or(false) {
-            return unsupported("value type construction");
+            let count = callee.parameters.len() - 1;
+            if frame.stack.len() < count {
+                return unsupported("evaluation stack underflow");
+            }
+            let ty = self.value_ty(owner)?;
+            let (storage, value) = match &ty {
+                Ty::Struct(_) => {
+                    let boxed = self.allocate_box(owner)?;
+                    (boxed + 8, Some(V::S(boxed)))
+                }
+                Ty::Prim(_) => {
+                    let mut block = vec![0u8; 8].into_boxed_slice();
+                    let address = block.as_mut_ptr() as u64;
+                    frame.scratch.push(block);
+                    (address, None)
+                }
+            };
+            let mut arguments = vec![V::P(storage)];
+            arguments.extend(frame.stack.split_off(frame.stack.len() - count));
+            if let Some(value) = value {
+                frame.stack.push(value);
+            }
+            self.invoke(&callee.key, &arguments)?;
+            if let Ty::Prim(var) = ty {
+                frame.stack.push(read(storage, var));
+            }
+            return Ok(());
         }
         let name = self.type_name(owner);
         if name == "System.String" {
@@ -2170,6 +2625,18 @@ impl<'s> Interpreter<'s> {
         Ok(None)
     }
 
+    fn box_any(&self, handle: TypeHandle, ty: &Ty, value: V) -> Run<u64> {
+        match ty {
+            Ty::Prim(var) => self.box_value(handle, *var, value),
+            Ty::Struct(_) => {
+                let _pin = Pin::new(&[value]);
+                let boxed = self.allocate_box(handle)?;
+                self.write_value(boxed + 8, ty, value)?;
+                Ok(boxed)
+            }
+        }
+    }
+
     fn box_value(&self, handle: TypeHandle, var: VarType, value: V) -> Run<u64> {
         let record = self.record(RuntimeType::Class(handle))?;
         let object = runtime::allocate_managed(record, 0);
@@ -2207,7 +2674,7 @@ impl<'s> Interpreter<'s> {
         Ok(a.is_some() && a == b && (underlying(class).is_some() || underlying(handle).is_some()))
     }
 
-    fn element(&self, array: u64, index: i64, kind: ElementKind) -> Run<u64> {
+    fn element(&self, array: u64, index: i64, size: u32) -> Run<u64> {
         if array == 0 {
             return self.throw("NullReferenceException");
         }
@@ -2215,7 +2682,11 @@ impl<'s> Interpreter<'s> {
         if index < 0 || index >= length {
             return self.throw("IndexOutOfRangeException");
         }
-        Ok(array + u64::from(ARRAY_DATA) + index as u64 * u64::from(kind.size()))
+        Ok(array + u64::from(ARRAY_DATA) + index as u64 * u64::from(size))
+    }
+
+    pub fn has_native(&self, key: &MethodKey) -> bool {
+        self.load(key).is_ok_and(|loaded| loaded.native.is_some())
     }
 
     pub fn blocker(&self, key: &MethodKey) -> Option<String> {
@@ -2288,7 +2759,7 @@ impl<'s> Interpreter<'s> {
                 let (0x28 | 0x6F | 0x73 | 0xFE06..=0xFE07) = instruction.opcode.value else {
                     if matches!(instruction.opcode.value, 0x7E..=0x80)
                         && let Argument::Token(token) = instruction.argument
-                        && let Ok(field) = self.model.field(current.module, token)
+                        && let Ok(field) = self.field_ref(current.module, token)
                     {
                         let metadata = &self.model.set.modules[field.owner.module].metadata;
                         if let Ok(range) = metadata.method_range(field.owner.row) {
@@ -2748,7 +3219,7 @@ pub fn result_raw(var: Option<VarType>, value: Option<V>) -> [u64; 2] {
 }
 
 pub fn method_returns(interpreter: &Interpreter<'_>, key: &MethodKey) -> Option<VarType> {
-    interpreter.load(key).ok().and_then(|l| l.returns)
+    interpreter.load(key).ok().and_then(|l| l.returns.as_ref().and_then(Ty::prim))
 }
 
 mod crt {
@@ -2830,5 +3301,25 @@ mod crt {
         powf: fn(x, y) -> f32;
         atan2f: fn(y, x) -> f32;
         fmodf: fn(x, y) -> f32;
+        fma: fn(x, y, z) -> f64;
+        fmaf: fn(x, y, z) -> f32;
     }
+}
+
+fn reciprocal(value: f64) -> f64 {
+    1.0 / value
+}
+
+fn reciprocal_sqrt(value: f64) -> f64 {
+    1.0 / value.sqrt()
+}
+
+fn reciprocal_single(value: f32) -> f32 {
+    use std::arch::x86_64::{_mm_cvtss_f32, _mm_rcp_ss, _mm_set_ss};
+    unsafe { _mm_cvtss_f32(_mm_rcp_ss(_mm_set_ss(value))) }
+}
+
+fn reciprocal_sqrt_single(value: f32) -> f32 {
+    use std::arch::x86_64::{_mm_cvtss_f32, _mm_rsqrt_ss, _mm_set_ss};
+    unsafe { _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(value))) }
 }

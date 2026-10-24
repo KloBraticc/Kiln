@@ -69,7 +69,23 @@ impl ElementKind {
 pub enum RuntimeType {
     Class(TypeHandle),
     Array(ElementKind),
+    ValueArray(TypeHandle),
     String,
+}
+
+#[derive(Debug)]
+pub struct StructLayout {
+    pub handle: TypeHandle,
+    pub size: u32,
+    pub references: Vec<u32>,
+    pub fields: HashMap<u32, u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldShape {
+    Primitive,
+    Reference,
+    Struct(TypeHandle),
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +122,7 @@ pub struct ObjectModel<'s> {
     classes: RefCell<HashMap<TypeHandle, Rc<ClassInfo>>>,
     slots: RefCell<HashMap<MethodKey, usize>>,
     generic: RefCell<HashMap<usize, std::collections::HashSet<u32>>>,
+    structs: RefCell<HashMap<TypeHandle, Rc<StructLayout>>>,
 }
 
 impl<'s> ObjectModel<'s> {
@@ -115,7 +132,90 @@ impl<'s> ObjectModel<'s> {
             classes: RefCell::new(HashMap::new()),
             slots: RefCell::new(HashMap::new()),
             generic: RefCell::new(HashMap::new()),
+            structs: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub fn shape(&self, module: usize, sig: &TypeSig) -> Outcome<FieldShape> {
+        match sig {
+            TypeSig::Modified { inner, .. } | TypeSig::Pinned(inner) => self.shape(module, inner),
+            TypeSig::ValueType(token) => {
+                let handle = self
+                    .set
+                    .resolve_type_token(module, *token)
+                    .map_err(resolve)?;
+                if self.set.is_enum(handle).map_err(resolve)? {
+                    Ok(FieldShape::Primitive)
+                } else {
+                    Ok(FieldShape::Struct(handle))
+                }
+            }
+            TypeSig::GenericInst {
+                value_type: true, ..
+            } => Err("generic value types".into()),
+            TypeSig::TypedReference => Err("typed references".into()),
+            other => match VarType::from_sig(other) {
+                Some(VarType::Ref) => Ok(FieldShape::Reference),
+                Some(_) => Ok(FieldShape::Primitive),
+                None => Err(format!("field type {other:?}")),
+            },
+        }
+    }
+
+    pub fn field_signature(&self, module: usize, row: u32) -> Outcome<TypeSig> {
+        let metadata = &self.set.modules[module].metadata;
+        let blob = metadata
+            .cell(TableId::Field, row, 2)
+            .and_then(|b| metadata.blob(b))
+            .map_err(|e| e.to_string())?;
+        match Signature::parse(blob).map_err(|e| e.to_string())? {
+            Signature::Field(sig) => Ok(sig),
+            _ => Err("field signature is not a field".into()),
+        }
+    }
+
+    pub fn struct_layout(&self, handle: TypeHandle) -> Outcome<Rc<StructLayout>> {
+        if let Some(found) = self.structs.borrow().get(&handle) {
+            return Ok(found.clone());
+        }
+        if self.is_generic(handle) {
+            return Err("generic value types".into());
+        }
+        let (layout, placements) = self.set.value_type_fields(handle).map_err(resolve)?;
+        let mut references = Vec::new();
+        let mut fields = HashMap::new();
+        for placement in &placements {
+            fields.insert(placement.field, placement.offset);
+            if !placement.layout.has_references {
+                continue;
+            }
+            let sig = self.field_signature(handle.module, placement.field)?;
+            match self.shape(handle.module, &sig)? {
+                FieldShape::Reference => references.push(placement.offset),
+                FieldShape::Struct(inner) => {
+                    let inner = self.struct_layout(inner)?;
+                    references.extend(inner.references.iter().map(|r| placement.offset + r));
+                }
+                FieldShape::Primitive => {}
+            }
+        }
+        if let Some(length) = self.set.modules[handle.module].inline_array_length(handle.row)
+            && let Some(first) = placements.first()
+        {
+            let stride = first.layout.size;
+            let element: Vec<u32> = references.clone();
+            for index in 1..length {
+                references.extend(element.iter().map(|r| r + index * stride));
+            }
+        }
+        let built = Rc::new(StructLayout {
+            handle,
+            size: layout.size,
+            references,
+            fields,
+        });
+        self.structs.borrow_mut().insert(handle, built.clone());
+        Ok(built)
     }
 
     pub fn string_type(&self) -> Option<TypeHandle> {
@@ -318,14 +418,31 @@ impl<'s> ObjectModel<'s> {
             }
             let (end, placements) = self.set.class_fields(handle).map_err(resolve)?;
             for placement in &placements {
-                if placement.layout.has_references {
-                    if placement.layout.size != 8 {
-                        return Err("struct fields holding references".into());
+                if !placement.layout.has_references {
+                    continue;
+                }
+                let sig = self.field_signature(handle.module, placement.field)?;
+                match self.shape(handle.module, &sig)? {
+                    FieldShape::Reference => {
+                        reference_offsets.push(placement.offset + OBJECT_HEADER)
                     }
-                    reference_offsets.push(placement.offset + OBJECT_HEADER);
+                    FieldShape::Struct(inner) => {
+                        let inner = self.struct_layout(inner)?;
+                        reference_offsets.extend(
+                            inner
+                                .references
+                                .iter()
+                                .map(|r| placement.offset + OBJECT_HEADER + r),
+                        );
+                    }
+                    FieldShape::Primitive => {}
                 }
             }
             base_size = (end + OBJECT_HEADER).next_multiple_of(8).max(16);
+        } else if is_value_type {
+            let layout = self.struct_layout(handle)?;
+            reference_offsets.extend(layout.references.iter().map(|r| r + OBJECT_HEADER));
+            base_size = (layout.size + OBJECT_HEADER).next_multiple_of(8).max(16);
         }
         let mut vtable = match parent {
             Some(parent) if !is_value_type => self.class(parent)?.vtable.clone(),
