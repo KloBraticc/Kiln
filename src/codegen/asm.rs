@@ -80,6 +80,7 @@ pub enum AbsoluteTarget {
     InitFlag(crate::loader::TypeHandle),
     Literal(usize, u32),
     Rva(usize, u32),
+    Array(crate::objects::ElementKind, usize, u32),
 }
 
 #[derive(Default)]

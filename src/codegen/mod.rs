@@ -153,7 +153,7 @@ enum Resolved {
         var: VarType,
         init: Option<(TypeHandle, usize)>,
     },
-    NewArray(ElementKind),
+    NewArray(ElementKind, u32),
     Element(ElementKind),
     Literal(u32),
     Cast(RuntimeType),
@@ -577,6 +577,7 @@ impl<'s> Compiler<'s> {
                         self.model
                             .element_kind(key.module, token)
                             .map_err(CompileError::Unsupported)?,
+                        token.0,
                     ),
                     0x8F | 0xA3 | 0xA4 => Resolved::Element(
                         self.model
@@ -1550,13 +1551,13 @@ impl<'a> Lowering<'a> {
                 self.store_memory(var, RCX, 0);
             }
             0x8D => {
-                let Some(Resolved::NewArray(kind)) =
+                let Some(Resolved::NewArray(kind, token)) =
                     self.resolved.get(&instruction.offset).cloned()
                 else {
                     return unsupported("unresolved array");
                 };
                 self.allocate(
-                    AbsoluteTarget::Type(RuntimeType::Array(kind)),
+                    AbsoluteTarget::Array(kind, self.module, token),
                     Some(inputs[0]),
                 )?;
                 self.store_result(out()?, RAX)?;

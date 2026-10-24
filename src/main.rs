@@ -926,7 +926,7 @@ fn interp_check(arguments: &[String]) -> ExitCode {
     let image = if mixed {
         interpreter.install_bridge();
         let eligible = compile_with_fallback(&set, &helpers, &interpreter);
-        match kiln::jit::Image::link_with_fallback(&eligible, &model, &|key| interpreter.stub_for(key)) {
+        match kiln::jit::Image::link_with_fallback(&eligible, &model, &|key| interpreter.stub_for(key), &|module, token| interpreter.array_record_for(module, token)) {
             Ok(image) => Some(image),
             Err(error) => {
                 eprintln!("linking failed: {error}");

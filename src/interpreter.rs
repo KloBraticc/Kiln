@@ -116,17 +116,35 @@ enum Pass {
     Bool,
     Wide,
     Ansi,
+    Utf8,
     Array,
     Value(u32),
     Copy(u32),
+    Field(u32),
+    SafeHandle(u32),
+    Delegate,
 }
 
 enum Back {
     Nothing,
     Raw(VarType),
-    Bool,
+    Bool(u64),
     Value(Rc<StructLayout>),
     Buffer(Rc<StructLayout>),
+    SafeHandle(Gen, u32),
+}
+
+struct Callback {
+    key: MethodKey,
+    ctx: Ctx,
+    receiver: Option<u64>,
+    parameters: Vec<VarType>,
+    returns: Option<VarType>,
+}
+
+unsafe fn callback_handler(context: usize, slot: usize, integers: *const u64, floats: *const u64) -> u64 {
+    let interpreter = unsafe { &*(context as *const Interpreter<'static>) };
+    interpreter.reverse(slot, integers, floats)
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +192,8 @@ enum Intrinsic {
     SetLastError,
     ClearMemory,
     LockTaken,
+    DelegatePointer,
+    Fence,
     Nothing,
     True,
     CanCastTo,
@@ -414,6 +434,10 @@ pub struct Interpreter<'s> {
     pub budget: Cell<u64>,
     trace_calls: bool,
     platforms: RefCell<Vec<Rc<Platform>>>,
+    callbacks: RefCell<Vec<Callback>>,
+    unmanaged_rows: RefCell<HashMap<usize, Rc<HashSet<u32>>>>,
+    unmanaged_stubs: RefCell<HashMap<MethodKey, u64>>,
+    delegate_stubs: RefCell<HashMap<u64, u64>>,
 }
 
 enum Pending {
@@ -657,7 +681,19 @@ impl<'s> Interpreter<'s> {
             budget: Cell::new(u64::MAX),
             trace_calls: std::env::var_os("KILN_CALLS").is_some(),
             platforms: RefCell::new(Vec::new()),
+            callbacks: RefCell::new(Vec::new()),
+            unmanaged_rows: RefCell::new(HashMap::new()),
+            unmanaged_stubs: RefCell::new(HashMap::new()),
+            delegate_stubs: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub fn array_record_for(&self, module: usize, token: u32) -> Option<u64> {
+        let empty = Ctx {
+            types: Rc::from(Vec::new()),
+            methods: Rc::from(Vec::new()),
+        };
+        self.array_type(module, Token(token), &empty).ok().map(|(record, _, _)| record)
     }
 
     pub fn install_bridge(&self) {
@@ -991,8 +1027,9 @@ impl<'s> Interpreter<'s> {
         match self.gen_ty(element)? {
             Ty::Prim(var) => {
                 let kind = ElementKind::from_var(var).unwrap_or(ElementKind::I64);
+                let shared = self.record(RuntimeType::Array(kind))?;
                 if map(self.types.core(element_core_name(kind)))? == *element {
-                    return self.record(RuntimeType::Array(kind));
+                    return Ok(shared);
                 }
                 let references = if kind == ElementKind::Reference {
                     runtime::FLAG_REFERENCE_ELEMENTS
@@ -1004,7 +1041,7 @@ impl<'s> Interpreter<'s> {
                     u64::from(ARRAY_DATA),
                     u64::from(kind.size()),
                     runtime::FLAG_ARRAY | references,
-                    0,
+                    shared,
                     Vec::new(),
                     u64::MAX,
                 ))
@@ -1141,7 +1178,7 @@ impl<'s> Interpreter<'s> {
         };
         let native = match native {
             None if flags & PINVOKE != 0 => {
-                Some(self.platform_invoke(key, name, &sig, &parameters, &returns, implementation)?)
+                Some(self.platform_invoke(key, name, &sig, &parameters, &returns, implementation, ctx)?)
             }
             other => other,
         };
@@ -1328,6 +1365,17 @@ impl<'s> Interpreter<'s> {
             }
             ("System.Threading.Monitor", "Exit" | "Enter") if parameters.len() == 1 => Intrinsic::Nothing,
             ("System.Threading.Monitor", "IsEnteredNative") => Intrinsic::True,
+            ("System.GC", "_SuppressFinalize" | "_ReRegisterForFinalize") if parameters.len() == 1 => {
+                Intrinsic::Nothing
+            }
+            ("System.Runtime.InteropServices.Marshal", "GetFunctionPointerForDelegateInternal")
+                if parameters.len() == 1 =>
+            {
+                Intrinsic::DelegatePointer
+            }
+            ("System.Threading.Interlocked", "MemoryBarrier" | "ReadMemoryBarrier") if parameters.is_empty() => {
+                Intrinsic::Fence
+            }
             ("System.RuntimeTypeHandle", "CanCastTo") if parameters.len() == 2 => Intrinsic::CanCastTo,
             ("System.RuntimeTypeHandle", "CreateInstanceForAnotherGenericParameter")
                 if (2..=3).contains(&parameters.len())
@@ -1387,6 +1435,7 @@ impl<'s> Interpreter<'s> {
         parameters: &[Ty],
         returns: &Option<Ty>,
         implementation: u32,
+        ctx: &Ctx,
     ) -> Run<Native> {
         let module = &self.model.set.modules[key.module];
         let metadata = &module.metadata;
@@ -1395,9 +1444,8 @@ impl<'s> Interpreter<'s> {
         if implementation & pinvoke::PRESERVE_SIG == 0 {
             return unsupported("platform invoke without PreserveSig");
         }
-        if pinvoke::has_field_marshal(metadata, key.row) {
-            return unsupported("platform invoke marshaling attributes");
-        }
+        let marshals = pinvoke::marshals(metadata, key.row);
+        let native_of = |sequence: u32| marshals.iter().find(|(s, _)| *s == sequence).map(|(_, n)| *n);
         if import.library.eq_ignore_ascii_case("QCall") {
             let entry = if import.entry.is_empty() { name } else { import.entry };
             let intrinsic = match (entry, parameters.len()) {
@@ -1421,11 +1469,26 @@ impl<'s> Interpreter<'s> {
             .parameters
             .iter()
             .zip(parameters)
-            .map(|(parameter, ty)| platform_pass(unmodified(parameter), ty, unicode))
+            .enumerate()
+            .map(|(index, (parameter, ty))| {
+                self.platform_pass(key.module, unmodified(parameter), ty, unicode, native_of(index as u32 + 1), ctx)
+            })
             .collect::<Run<Vec<_>>>()?;
-        let back = match (returns, unmodified(&sig.return_type)) {
+        let declared = unmodified(&sig.return_type);
+        let back = match (returns, declared) {
             (None, _) => Back::Nothing,
-            (Some(_), TypeSig::Boolean) => Back::Bool,
+            (Some(_), TypeSig::Boolean) => match native_of(0) {
+                None | Some(0x02) => Back::Bool(0xFFFF_FFFF),
+                Some(0x03 | 0x04) => Back::Bool(0xFF),
+                Some(other) => return unsupported(format!("platform invoke MarshalAs return type 0x{other:02x}")),
+            },
+            (Some(Ty::Prim(VarType::Ref)), TypeSig::Class(token)) => {
+                let exact = map(self.types.resolve_token(key.module, *token, ctx))?;
+                if !self.is_safe_handle(&exact)? {
+                    return unsupported("platform invoke returning an object");
+                }
+                Back::SafeHandle(exact, self.safe_handle_offset()?)
+            }
             (Some(Ty::Prim(VarType::Ref)), _) => return unsupported("platform invoke returning an object"),
             (Some(Ty::Prim(var)), _) => Back::Raw(*var),
             (Some(Ty::Struct(layout)), _) if !layout.references.is_empty() => {
@@ -1444,6 +1507,109 @@ impl<'s> Interpreter<'s> {
             last_error: import.flags & pinvoke::SUPPORTS_LAST_ERROR != 0,
         }));
         Ok(Native::PlatformInvoke(platforms.len() - 1))
+    }
+
+    fn platform_pass(
+        &self,
+        module: usize,
+        sig: &TypeSig,
+        ty: &Ty,
+        unicode: bool,
+        native: Option<u8>,
+        ctx: &Ctx,
+    ) -> Run<Pass> {
+        let declared = match sig {
+            TypeSig::Class(token) | TypeSig::ValueType(token) => Some(map(self.types.resolve_token(module, *token, ctx))?),
+            TypeSig::GenericInst { definition, .. } => Some(map(self.types.resolve_token(module, *definition, ctx))?),
+            _ => None,
+        };
+        let is_delegate = declared
+            .as_ref()
+            .and_then(Gen::handle)
+            .is_some_and(|handle| self.is_delegate(handle));
+        if let Some(native) = native {
+            return Ok(match (sig, native) {
+                (TypeSig::Boolean, 0x02..=0x04) => Pass::Bool,
+                (TypeSig::String, 0x14) => Pass::Ansi,
+                (TypeSig::String, 0x15 | 0x16) => Pass::Wide,
+                (TypeSig::String, 0x30) => Pass::Utf8,
+                (TypeSig::SzArray(element), 0x2A) if blittable(element, unicode) => Pass::Array,
+                (_, 0x26) if is_delegate => Pass::Delegate,
+                (
+                    TypeSig::I1
+                    | TypeSig::U1
+                    | TypeSig::I2
+                    | TypeSig::U2
+                    | TypeSig::I4
+                    | TypeSig::U4
+                    | TypeSig::I8
+                    | TypeSig::U8
+                    | TypeSig::R4
+                    | TypeSig::R8
+                    | TypeSig::IntPtr
+                    | TypeSig::UIntPtr
+                    | TypeSig::Char,
+                    0x03..=0x0D | 0x1F | 0x20,
+                ) => match ty {
+                    Ty::Prim(var) => Pass::Raw(*var),
+                    Ty::Struct(_) => return unsupported("platform invoke MarshalAs on a struct"),
+                },
+                _ => return unsupported(format!("platform invoke MarshalAs native type 0x{native:02x}")),
+            });
+        }
+        Ok(match (sig, ty) {
+            (TypeSig::Boolean, _) => Pass::Bool,
+            (TypeSig::String, _) if unicode => Pass::Wide,
+            (TypeSig::String, _) => Pass::Ansi,
+            (TypeSig::SzArray(element), _) if blittable(element, unicode) => Pass::Array,
+            (_, Ty::Prim(VarType::Ref)) if is_delegate => Pass::Delegate,
+            (_, Ty::Prim(VarType::Ref)) => match &declared {
+                Some(exact) if self.is_safe_handle(exact)? => Pass::SafeHandle(self.safe_handle_offset()?),
+                _ => return unsupported("platform invoke object marshaling"),
+            },
+            (_, Ty::Prim(var)) => Pass::Raw(*var),
+            (_, Ty::Struct(layout)) if self.type_name(layout.handle) == "System.Runtime.InteropServices.HandleRef" => {
+                Pass::Field(self.struct_field_offset(layout, "_handle")?)
+            }
+            (_, Ty::Struct(layout)) if !layout.references.is_empty() => {
+                return unsupported("platform invoke struct with references");
+            }
+            (_, Ty::Struct(layout)) if matches!(layout.size, 1 | 2 | 4 | 8) => Pass::Value(layout.size),
+            (_, Ty::Struct(layout)) => Pass::Copy(layout.size),
+        })
+    }
+
+    fn is_safe_handle(&self, exact: &Gen) -> Run<bool> {
+        let safe = Gen::Named(
+            self.corelib_type("System.Runtime.InteropServices", "SafeHandle")?,
+            Rc::from(Vec::new()),
+        );
+        Ok(self.gen_assignable(exact, &safe))
+    }
+
+    fn safe_handle_offset(&self) -> Run<u32> {
+        let handle = self.corelib_type("System.Runtime.InteropServices", "SafeHandle")?;
+        let (_, placements) = self
+            .model
+            .set
+            .class_fields(handle)
+            .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
+        let metadata = &self.model.set.modules[handle.module].metadata;
+        placements
+            .iter()
+            .find(|p| metadata.string_cell(TableId::Field, p.field, 1).ok() == Some("handle"))
+            .map(|p| p.offset + 8)
+            .ok_or_else(|| Fault::Unsupported("SafeHandle has no handle field".into()))
+    }
+
+    fn struct_field_offset(&self, layout: &StructLayout, name: &str) -> Run<u32> {
+        let metadata = &self.model.set.modules[layout.handle.module].metadata;
+        layout
+            .fields
+            .iter()
+            .find(|(row, _)| metadata.string_cell(TableId::Field, **row, 1).ok() == Some(name))
+            .map(|(_, offset)| *offset)
+            .ok_or_else(|| Fault::Unsupported(format!("struct field {name} is missing")))
     }
 
     fn platform_call(&self, index: usize, arguments: &[V]) -> Run<Option<V>> {
@@ -1471,14 +1637,14 @@ impl<'s> Interpreter<'s> {
                     0 => 0,
                     array => array + u64::from(ARRAY_DATA),
                 },
-                Pass::Wide | Pass::Ansi => match value.address() {
+                Pass::Wide | Pass::Ansi | Pass::Utf8 => match value.address() {
                     0 => 0,
                     string => {
                         let units = string_units(string);
-                        let bytes: Vec<u8> = if matches!(pass, Pass::Wide) {
-                            units.iter().chain(&[0]).flat_map(|u| u.to_le_bytes()).collect()
-                        } else {
-                            pinvoke::ansi(units)
+                        let bytes: Vec<u8> = match pass {
+                            Pass::Wide => units.iter().chain(&[0]).flat_map(|u| u.to_le_bytes()).collect(),
+                            Pass::Utf8 => String::from_utf16_lossy(units).bytes().chain([0]).collect(),
+                            _ => pinvoke::ansi(units),
                         };
                         buffers.push(words(&bytes));
                         buffers[buffers.len() - 1].as_ptr() as u64
@@ -1496,12 +1662,21 @@ impl<'s> Interpreter<'s> {
                     buffers.push(words(bytes));
                     buffers[buffers.len() - 1].as_ptr() as u64
                 }
+                Pass::Field(offset) => unsafe { *((data + u64::from(*offset)) as *const u64) },
+                Pass::SafeHandle(offset) => match value.address() {
+                    0 => return self.throw("ArgumentNullException"),
+                    object => unsafe { *((object + u64::from(*offset)) as *const u64) },
+                },
+                Pass::Delegate => match value.address() {
+                    0 => 0,
+                    object => self.delegate_stub(object)?,
+                },
             });
         }
         let (integer, float) = unsafe { pinvoke::call(platform.function, &raw, platform.last_error) };
         Ok(match &platform.back {
             Back::Nothing => None,
-            Back::Bool => Some(V::I4(i32::from(integer as u32 != 0))),
+            Back::Bool(mask) => Some(V::I4(i32::from(integer & mask != 0))),
             Back::Raw(VarType::F32) => Some(V::F4(f32::from_bits(float as u32))),
             Back::Raw(VarType::F64) => Some(V::F8(f64::from_bits(float))),
             Back::Raw(var) => Some(load_raw(*var, integer)),
@@ -1517,7 +1692,153 @@ impl<'s> Interpreter<'s> {
                 Some(V::S(boxed))
             }
             Back::Buffer(_) => buffer.first().copied(),
+            Back::SafeHandle(exact, offset) => {
+                let object = self.construct_default(exact)?;
+                unsafe { *((object + u64::from(*offset)) as *mut u64) = integer };
+                Some(V::O(object))
+            }
         })
+    }
+
+    fn is_unmanaged_entry(&self, key: &MethodKey) -> bool {
+        let rows = self
+            .unmanaged_rows
+            .borrow_mut()
+            .entry(key.module)
+            .or_insert_with(|| Rc::new(self.scan_unmanaged_entries(key.module)))
+            .clone();
+        rows.contains(&key.row)
+    }
+
+    fn scan_unmanaged_entries(&self, module: usize) -> HashSet<u32> {
+        let set = self.model.set;
+        let metadata = &set.modules[module].metadata;
+        let mut rows = HashSet::new();
+        for row in 1..=metadata.rows(TableId::CustomAttribute) {
+            let (Ok(Some(owner)), Ok(Some(constructor))) = (
+                metadata.coded(TableId::CustomAttribute, row, 0),
+                metadata.coded(TableId::CustomAttribute, row, 1),
+            ) else {
+                continue;
+            };
+            if owner.table() != Some(TableId::MethodDef) {
+                continue;
+            }
+            let name = match constructor.table() {
+                Some(TableId::MemberRef) => metadata
+                    .coded(TableId::MemberRef, constructor.row(), 0)
+                    .ok()
+                    .flatten()
+                    .filter(|parent| parent.table() == Some(TableId::TypeRef))
+                    .and_then(|parent| metadata.string_cell(TableId::TypeRef, parent.row(), 1).ok()),
+                Some(TableId::MethodDef) => set.modules[module]
+                    .method_owner(constructor.row())
+                    .ok()
+                    .flatten()
+                    .and_then(|owner| metadata.string_cell(TableId::TypeDef, owner, 1).ok()),
+                _ => None,
+            };
+            if name == Some("UnmanagedCallersOnlyAttribute") {
+                rows.insert(owner.row());
+            }
+        }
+        rows
+    }
+
+    fn unmanaged_stub(&self, key: &MethodKey, ctx: &Ctx) -> Run<u64> {
+        if let Some(stub) = self.unmanaged_stubs.borrow().get(key) {
+            return Ok(*stub);
+        }
+        let stub = self.callback_stub(key, ctx, None)?;
+        self.unmanaged_stubs.borrow_mut().insert(key.clone(), stub);
+        Ok(stub)
+    }
+
+    fn delegate_stub(&self, object: u64) -> Run<u64> {
+        if let Some(stub) = self.delegate_stubs.borrow().get(&object) {
+            return Ok(*stub);
+        }
+        let exact = self.object_gen(object)?;
+        let handle = exact
+            .handle()
+            .ok_or_else(|| Fault::Unsupported("delegate without a type".into()))?;
+        let metadata = &self.model.set.modules[handle.module].metadata;
+        let row = metadata
+            .method_range(handle.row)
+            .ok()
+            .and_then(|mut range| range.find(|&row| metadata.string_cell(TableId::MethodDef, row, 3).ok() == Some("Invoke")))
+            .ok_or_else(|| Fault::Unsupported("delegate without Invoke".into()))?;
+        let key = MethodKey { module: handle.module, row };
+        type_roots().push(object);
+        let stub = self.callback_stub(&key, &exact.context(), Some(object))?;
+        self.delegate_stubs.borrow_mut().insert(object, stub);
+        Ok(stub)
+    }
+
+    fn callback_stub(&self, key: &MethodKey, ctx: &Ctx, receiver: Option<u64>) -> Run<u64> {
+        let loaded = self.load_ctx(key, ctx)?;
+        let skip = usize::from(receiver.is_some());
+        let parameters = prims(&loaded.parameters[skip.min(loaded.parameters.len())..])
+            .ok_or_else(|| Fault::Unsupported("native callback with struct arguments".into()))?;
+        let returns = match &loaded.returns {
+            None => None,
+            Some(Ty::Prim(var)) => Some(*var),
+            Some(Ty::Struct(_)) => return unsupported("native callback returning a struct"),
+        };
+        let slot = {
+            let mut callbacks = self.callbacks.borrow_mut();
+            callbacks.push(Callback {
+                key: key.clone(),
+                ctx: ctx.clone(),
+                receiver,
+                parameters,
+                returns,
+            });
+            callbacks.len() - 1
+        };
+        pinvoke::make_stub(callback_handler, self as *const Self as usize, slot)
+            .map(|stub| stub as u64)
+            .ok_or_else(|| Fault::Unsupported("no executable memory for a native callback".into()))
+    }
+
+    fn reverse(&self, slot: usize, integers: *const u64, floats: *const u64) -> u64 {
+        let (key, ctx, receiver, parameters, returns) = {
+            let callbacks = self.callbacks.borrow();
+            let callback = &callbacks[slot];
+            (
+                callback.key.clone(),
+                callback.ctx.clone(),
+                callback.receiver,
+                callback.parameters.clone(),
+                callback.returns,
+            )
+        };
+        let mut arguments = Vec::with_capacity(parameters.len() + 1);
+        if let Some(receiver) = receiver {
+            arguments.push(V::O(receiver));
+        }
+        for (index, var) in parameters.iter().enumerate() {
+            let raw = unsafe {
+                if index < 4 && matches!(var, VarType::F32 | VarType::F64) {
+                    *floats.add(index)
+                } else {
+                    *integers.add(index)
+                }
+            };
+            arguments.push(load_raw(*var, raw));
+        }
+        match self.invoke_ctx(&key, &ctx, &arguments) {
+            Ok(Some(value)) => returns.map_or(0, |var| store_raw(var, value)),
+            Ok(None) => 0,
+            Err(Fault::Exception(object)) => {
+                eprintln!("unhandled {} in a native callback", self.exception_type(object));
+                std::process::abort();
+            }
+            Err(Fault::Unsupported(reason)) => {
+                eprintln!("native callback could not run: {reason}");
+                std::process::abort();
+            }
+        }
     }
 
     fn forwards_resource_lookup(&self, owner: TypeHandle) -> bool {
@@ -1925,6 +2246,11 @@ impl<'s> Interpreter<'s> {
                 return Ok(None);
             }
             Intrinsic::Nothing => return Ok(None),
+            Intrinsic::DelegatePointer => V::P(self.delegate_stub(self.non_null(a[0])?)?),
+            Intrinsic::Fence => {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                return Ok(None);
+            }
             Intrinsic::True => V::I4(1),
             Intrinsic::CanCastTo => {
                 let types = self.object_types.borrow();
@@ -2457,7 +2783,14 @@ impl<'s> Interpreter<'s> {
                     self.failed_types.borrow_mut().insert(owner, Some(reason.clone()));
                     return unsupported(reason);
                 }
-                Err(Fault::Exception(_)) => {
+                Err(Fault::Exception(object)) => {
+                    if self.trace_calls {
+                        eprintln!(
+                            "static constructor of {} threw {}",
+                            self.type_name(owner),
+                            self.exception_type(object)
+                        );
+                    }
                     unsafe { *flag = 0 };
                     self.failed_types.borrow_mut().insert(owner, None);
                     return self.throw("TypeInitializationException");
@@ -3720,7 +4053,11 @@ impl<'s> Interpreter<'s> {
                             (key, call_ctx) = self.resolve_virtual(&key, &call_ctx, this)?;
                         }
                     }
-                    let encoded = self.encode_function(&key, &call_ctx);
+                    let encoded = if opcode == 0xFE06 && self.is_unmanaged_entry(&key) {
+                        self.unmanaged_stub(&key, &call_ctx)?
+                    } else {
+                        self.encode_function(&key, &call_ctx)
+                    };
                     frame.stack.push(V::I8(encoded as i64));
                 }
                 0xDC => return Ok(Exit::EndFinally),
@@ -4674,37 +5011,22 @@ fn unmodified(sig: &TypeSig) -> &TypeSig {
     }
 }
 
-fn platform_pass(sig: &TypeSig, ty: &Ty, unicode: bool) -> Run<Pass> {
-    let blittable = |element: &TypeSig| {
-        matches!(
-            unmodified(element),
-            TypeSig::I1
-                | TypeSig::U1
-                | TypeSig::I2
-                | TypeSig::U2
-                | TypeSig::I4
-                | TypeSig::U4
-                | TypeSig::I8
-                | TypeSig::U8
-                | TypeSig::R4
-                | TypeSig::R8
-                | TypeSig::IntPtr
-                | TypeSig::UIntPtr
-        ) || (unicode && matches!(unmodified(element), TypeSig::Char))
-    };
-    Ok(match (sig, ty) {
-        (TypeSig::Boolean, _) => Pass::Bool,
-        (TypeSig::String, _) if unicode => Pass::Wide,
-        (TypeSig::String, _) => Pass::Ansi,
-        (TypeSig::SzArray(element), _) if blittable(element) => Pass::Array,
-        (_, Ty::Prim(VarType::Ref)) => return unsupported("platform invoke object marshaling"),
-        (_, Ty::Prim(var)) => Pass::Raw(*var),
-        (_, Ty::Struct(layout)) if !layout.references.is_empty() => {
-            return unsupported("platform invoke struct with references");
-        }
-        (_, Ty::Struct(layout)) if matches!(layout.size, 1 | 2 | 4 | 8) => Pass::Value(layout.size),
-        (_, Ty::Struct(layout)) => Pass::Copy(layout.size),
-    })
+fn blittable(element: &TypeSig, unicode: bool) -> bool {
+    matches!(
+        unmodified(element),
+        TypeSig::I1
+            | TypeSig::U1
+            | TypeSig::I2
+            | TypeSig::U2
+            | TypeSig::I4
+            | TypeSig::U4
+            | TypeSig::I8
+            | TypeSig::U8
+            | TypeSig::R4
+            | TypeSig::R8
+            | TypeSig::IntPtr
+            | TypeSig::UIntPtr
+    ) || (unicode && matches!(unmodified(element), TypeSig::Char))
 }
 
 fn words(bytes: &[u8]) -> Vec<u64> {

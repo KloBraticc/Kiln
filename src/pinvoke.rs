@@ -40,14 +40,31 @@ pub fn find_import<'a>(metadata: &Metadata<'a>, method_row: u32) -> Option<Impor
     })
 }
 
-pub fn has_field_marshal(metadata: &Metadata<'_>, method_row: u32) -> bool {
+pub fn marshals(metadata: &Metadata<'_>, method_row: u32) -> Vec<(u32, u8)> {
     let first = metadata.cell(TableId::MethodDef, method_row, 5).unwrap_or(0);
     let end = if method_row < metadata.rows(TableId::MethodDef) {
         metadata.cell(TableId::MethodDef, method_row + 1, 5).unwrap_or(first)
     } else {
         metadata.rows(TableId::Param) + 1
     };
-    (first..end).any(|row| metadata.cell(TableId::Param, row, 0).unwrap_or(0) & HAS_FIELD_MARSHAL != 0)
+    let marked: Vec<u32> = (first..end)
+        .filter(|&row| metadata.cell(TableId::Param, row, 0).unwrap_or(0) & HAS_FIELD_MARSHAL != 0)
+        .collect();
+    if marked.is_empty() {
+        return Vec::new();
+    }
+    (1..=metadata.rows(TableId::FieldMarshal))
+        .filter_map(|row| {
+            let parent = metadata.coded(TableId::FieldMarshal, row, 0).ok().flatten()?;
+            if parent.table() != Some(TableId::Param) || !marked.contains(&parent.row()) {
+                return None;
+            }
+            let blob = metadata.cell(TableId::FieldMarshal, row, 1).ok()?;
+            let native = *metadata.blob(blob).ok()?.first()?;
+            let sequence = metadata.cell(TableId::Param, parent.row(), 1).ok()?;
+            Some((sequence, native))
+        })
+        .collect()
 }
 
 #[link(name = "kernel32")]
@@ -205,4 +222,72 @@ pub unsafe fn call(function: usize, arguments: &[u64], capture_error: bool) -> (
         set_last_error(unsafe { GetLastError() });
     }
     (integer, float.to_bits())
+}
+
+pub type Handler = unsafe fn(context: usize, slot: usize, integers: *const u64, floats: *const u64) -> u64;
+
+#[derive(Clone, Copy)]
+struct Entry {
+    handler: Handler,
+    context: usize,
+    slot: usize,
+}
+
+thread_local! {
+    static ENTRIES: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const STUB_SIZE: usize = 96;
+const CHUNK: usize = 64 * 1024;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn VirtualAlloc(address: *mut u8, size: usize, allocation: u32, protection: u32) -> *mut u8;
+}
+
+unsafe extern "win64" fn reverse_entry(index: u64, integers: *const u64, floats: *const u64) -> u64 {
+    let entry = ENTRIES.with(|entries| entries.borrow().get(index as usize).copied());
+    match entry {
+        Some(entry) => unsafe { (entry.handler)(entry.context, entry.slot, integers, floats) },
+        None => {
+            eprintln!("native callback {index} was called on a thread that did not create it");
+            std::process::abort();
+        }
+    }
+}
+
+fn executable(size: usize) -> Option<usize> {
+    static MEMORY: Mutex<(usize, usize)> = Mutex::new((0, 0));
+    let mut memory = MEMORY.lock().ok()?;
+    if memory.0 == 0 || memory.1 + size > CHUNK {
+        let base = unsafe { VirtualAlloc(std::ptr::null_mut(), CHUNK, 0x3000, 0x40) };
+        if base.is_null() {
+            return None;
+        }
+        *memory = (base as usize, 0);
+    }
+    let address = memory.0 + memory.1;
+    memory.1 += size;
+    Some(address)
+}
+
+pub fn make_stub(handler: Handler, context: usize, slot: usize) -> Option<usize> {
+    let index = ENTRIES.with(|entries| {
+        let mut entries = entries.borrow_mut();
+        entries.push(Entry { handler, context, slot });
+        entries.len() - 1
+    }) as u64;
+    let target = reverse_entry as *const () as usize as u64;
+    let mut code: Vec<u8> = vec![
+        0x48, 0x89, 0x4C, 0x24, 0x08, 0x48, 0x89, 0x54, 0x24, 0x10, 0x4C, 0x89, 0x44, 0x24, 0x18, 0x4C, 0x89,
+        0x4C, 0x24, 0x20, 0x48, 0x83, 0xEC, 0x48, 0x66, 0x0F, 0xD6, 0x44, 0x24, 0x20, 0x66, 0x0F, 0xD6, 0x4C,
+        0x24, 0x28, 0x66, 0x0F, 0xD6, 0x54, 0x24, 0x30, 0x66, 0x0F, 0xD6, 0x5C, 0x24, 0x38, 0x48, 0xB9,
+    ];
+    code.extend_from_slice(&index.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, 0x50, 0x4C, 0x8D, 0x44, 0x24, 0x20, 0x48, 0xB8]);
+    code.extend_from_slice(&target.to_le_bytes());
+    code.extend_from_slice(&[0xFF, 0xD0, 0x66, 0x48, 0x0F, 0x6E, 0xC0, 0x48, 0x83, 0xC4, 0x48, 0xC3]);
+    let address = executable(STUB_SIZE)?;
+    unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), address as *mut u8, code.len()) };
+    Some(address)
 }

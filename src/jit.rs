@@ -119,13 +119,14 @@ impl Image {
         methods: &HashMap<MethodKey, CompiledMethod>,
         model: &crate::objects::ObjectModel<'_>,
     ) -> Result<Image, String> {
-        Self::link_with_fallback(methods, model, &|_| None)
+        Self::link_with_fallback(methods, model, &|_| None, &|_, _| None)
     }
 
     pub fn link_with_fallback(
         methods: &HashMap<MethodKey, CompiledMethod>,
         model: &crate::objects::ObjectModel<'_>,
         fallback: &dyn Fn(&MethodKey) -> Option<u64>,
+        arrays: &dyn Fn(usize, u32) -> Option<u64>,
     ) -> Result<Image, String> {
         let state = crate::runtime::install();
         let set = model.set;
@@ -182,6 +183,10 @@ impl Image {
                     AbsoluteTarget::Literal(module, offset) => {
                         Relocation::Address(state.string_literal(set, model, module, offset)?)
                     }
+                    AbsoluteTarget::Array(kind, module, token) => match arrays(module, token) {
+                        Some(record) => Relocation::Address(record),
+                        None => Relocation::Address(state.type_record(model, crate::objects::RuntimeType::Array(kind))?),
+                    },
                     AbsoluteTarget::Rva(module, row) => {
                         Relocation::Address(crate::runtime::rva_data(set, module, row)?)
                     }
