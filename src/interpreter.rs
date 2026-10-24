@@ -1582,6 +1582,20 @@ impl<'s> Interpreter<'s> {
         if arguments.len() != loaded.parameters.len() {
             return unsupported("argument count mismatch");
         }
+        let receiver;
+        let arguments = match arguments.first() {
+            Some(V::O(boxed) | V::S(boxed))
+                if *boxed != 0
+                    && !loaded.is_static
+                    && matches!(loaded.parameters.first(), Some(Ty::Prim(VarType::Pointer))) =>
+            {
+                let mut adjusted = arguments.to_vec();
+                adjusted[0] = V::P(boxed + 8);
+                receiver = adjusted;
+                &receiver[..]
+            }
+            _ => arguments,
+        };
         if let Some(native) = loaded.native {
             if self.trace_calls {
                 let name = self.model.set.modules[key.module]
