@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use crate::loader::{AssemblySet, TypeHandle};
 use crate::metadata::TableId;
@@ -16,47 +16,155 @@ unsafe extern "system" {
 }
 
 const CHUNK: usize = 64 * 1024 * 1024;
+const MINIMUM: usize = 16;
+const MARK: u64 = 1;
+
+struct Chunk {
+    base: usize,
+    length: usize,
+    used: usize,
+}
 
 pub struct Heap {
-    chunks: Vec<(usize, usize)>,
-    cursor: usize,
-    limit: usize,
+    chunks: Vec<Chunk>,
+    free: Vec<(usize, usize)>,
     pub allocated: u64,
+    pub live: u64,
+    budget: u64,
 }
 
 impl Heap {
     fn new() -> Self {
         Self {
             chunks: Vec::new(),
-            cursor: 0,
-            limit: 0,
+            free: Vec::new(),
             allocated: 0,
+            live: 0,
+            budget: CHUNK as u64,
         }
     }
 
     pub fn allocate(&mut self, size: usize) -> *mut u8 {
-        let size = size.next_multiple_of(8);
-        if self.cursor + size > self.limit {
-            let length = size.max(CHUNK);
-            let base = unsafe { VirtualAlloc(std::ptr::null_mut(), length, 0x3000, 0x04) } as usize;
-            if base == 0 {
-                return std::ptr::null_mut();
+        let size = size.next_multiple_of(8).max(MINIMUM);
+        match self.take_free(size).or_else(|| self.bump(size)) {
+            Some(address) => {
+                self.allocated += size as u64;
+                address as *mut u8
             }
-            self.chunks.push((base, length));
-            self.cursor = base;
-            self.limit = base + length;
+            None => std::ptr::null_mut(),
         }
-        let address = self.cursor;
-        self.cursor += size;
-        self.allocated += size as u64;
-        address as *mut u8
+    }
+
+    fn take_free(&mut self, size: usize) -> Option<usize> {
+        let index = self
+            .free
+            .iter()
+            .position(|&(_, length)| length == size || length >= size + MINIMUM)?;
+        let (address, length) = self.free[index];
+        if length == size {
+            self.free.remove(index);
+        } else {
+            self.free[index] = (address + size, length - size);
+            write_free(address + size, length - size);
+        }
+        Some(address)
+    }
+
+    fn bump(&mut self, size: usize) -> Option<usize> {
+        if let Some(chunk) = self.chunks.last_mut()
+            && chunk.used + size <= chunk.length
+        {
+            let address = chunk.base + chunk.used;
+            chunk.used += size;
+            return Some(address);
+        }
+        let length = size.max(CHUNK).next_multiple_of(4096);
+        let base = unsafe { VirtualAlloc(std::ptr::null_mut(), length, 0x3000, 0x04) } as usize;
+        if base == 0 {
+            return None;
+        }
+        if let Some(previous) = self.chunks.last_mut() {
+            let rest = previous.length - previous.used;
+            if rest >= MINIMUM {
+                write_free(previous.base + previous.used, rest);
+                self.free.push((previous.base + previous.used, rest));
+                previous.used = previous.length;
+            }
+        }
+        self.chunks.push(Chunk {
+            base,
+            length,
+            used: size,
+        });
+        Some(base)
     }
 
     pub fn contains(&self, address: usize) -> bool {
         self.chunks
             .iter()
-            .any(|&(base, length)| address >= base && address < base + length)
+            .any(|chunk| address >= chunk.base && address < chunk.base + chunk.used)
     }
+
+    fn should_collect(&self) -> bool {
+        self.allocated >= self.budget
+    }
+
+    fn sweep(&mut self) {
+        self.free.clear();
+        let mut live = 0u64;
+        for chunk in &self.chunks {
+            let end = chunk.base + chunk.used;
+            let mut cursor = chunk.base;
+            let mut run: Option<usize> = None;
+            while cursor < end {
+                let header = unsafe { *(cursor as *const u64) };
+                let size = block_size(cursor);
+                if header & MARK != 0 {
+                    unsafe { *(cursor as *mut u64) = header & !MARK };
+                    live += size as u64;
+                    if let Some(start) = run.take() {
+                        write_free(start, cursor - start);
+                        self.free.push((start, cursor - start));
+                    }
+                } else if run.is_none() {
+                    run = Some(cursor);
+                }
+                cursor += size;
+            }
+            if let Some(start) = run {
+                write_free(start, end - start);
+                self.free.push((start, end - start));
+            }
+        }
+        self.live = live;
+        self.allocated = 0;
+        self.budget = (CHUNK as u64).max(live);
+    }
+}
+
+fn write_free(address: usize, length: usize) {
+    unsafe {
+        *(address as *mut u64) = 0;
+        *((address + 8) as *mut u64) = length as u64;
+    }
+}
+
+fn block_size(address: usize) -> usize {
+    let header = unsafe { *(address as *const u64) } & !MARK;
+    if header == 0 {
+        return unsafe { *((address + 8) as *const u64) } as usize;
+    }
+    let record = header as *const u64;
+    let (base, component, flags) =
+        unsafe { (*record & 0xFFFF_FFFF, *record >> 32, *record.add(1)) };
+    let count = if flags & (FLAG_ARRAY | FLAG_STRING) != 0 {
+        u64::from(unsafe { *((address + 8) as *const u32) })
+    } else {
+        0
+    };
+    ((base + component * count) as usize)
+        .next_multiple_of(8)
+        .max(MINIMUM)
 }
 
 pub struct TypeRecord {
@@ -74,10 +182,13 @@ pub struct RuntimeState {
     pub string_type: u64,
     pub empty_string: u64,
     frozen: Vec<Box<[u64]>>,
+    methods: Vec<(usize, usize, Box<[i32]>)>,
 }
 
 static STATE: AtomicPtr<RuntimeState> = AtomicPtr::new(std::ptr::null_mut());
 pub static TRAPPED: AtomicU64 = AtomicU64::new(0);
+pub static STRESS: AtomicBool = AtomicBool::new(false);
+pub static COLLECTIONS: AtomicU64 = AtomicU64::new(0);
 
 pub fn state() -> &'static mut RuntimeState {
     unsafe { &mut *STATE.load(Ordering::Acquire) }
@@ -98,6 +209,7 @@ pub fn install() -> &'static mut RuntimeState {
         string_type: 0,
         empty_string: 0,
         frozen: Vec::new(),
+        methods: Vec::new(),
     }));
     STATE.store(state, Ordering::Release);
     unsafe { &mut *state }
@@ -252,6 +364,73 @@ impl RuntimeState {
     }
 }
 
+impl RuntimeState {
+    pub fn register_method(&mut self, start: usize, end: usize, references: &[i32]) {
+        let at = self.methods.partition_point(|entry| entry.0 < start);
+        self.methods
+            .insert(at, (start, end, references.to_vec().into_boxed_slice()));
+    }
+
+    fn method_at(&self, address: usize) -> Option<&[i32]> {
+        let at = self.methods.partition_point(|entry| entry.0 <= address);
+        let (start, end, references) = self.methods.get(at.checked_sub(1)?)?;
+        (address > *start && address <= *end).then_some(&**references)
+    }
+
+    pub fn collect(&mut self, frame: u64, stack: u64) {
+        let mut pending: Vec<usize> = Vec::new();
+        for &slot in &self.reference_statics {
+            self.mark(unsafe { *(slot as *const u64) } as usize, &mut pending);
+        }
+        if frame != 0 && stack != 0 {
+            let mut base = frame as usize;
+            let mut returned = unsafe { *((stack - 8) as *const u64) } as usize;
+            while base != 0 {
+                let Some(references) = self.method_at(returned) else {
+                    break;
+                };
+                for &offset in references {
+                    let slot = base.wrapping_add_signed(offset as isize);
+                    self.mark(unsafe { *(slot as *const u64) } as usize, &mut pending);
+                }
+                returned = unsafe { *((base + 8) as *const u64) } as usize;
+                base = unsafe { *(base as *const u64) } as usize;
+            }
+        }
+        while let Some(object) = pending.pop() {
+            let record = (unsafe { *(object as *const u64) } & !MARK) as *const u64;
+            let flags = unsafe { *record.add(1) };
+            if flags & FLAG_REFERENCE_ELEMENTS != 0 {
+                let count = unsafe { *((object + 8) as *const u32) } as usize;
+                for index in 0..count {
+                    let element = object + ARRAY_DATA as usize + 8 * index;
+                    self.mark(unsafe { *(element as *const u64) } as usize, &mut pending);
+                }
+            } else if flags & (FLAG_ARRAY | FLAG_STRING) == 0 {
+                let (offsets, count) = unsafe { (*record.add(3) as *const u32, *record.add(4)) };
+                for index in 0..count as usize {
+                    let field = object + unsafe { *offsets.add(index) } as usize;
+                    self.mark(unsafe { *(field as *const u64) } as usize, &mut pending);
+                }
+            }
+        }
+        self.heap.sweep();
+        COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark(&self, object: usize, pending: &mut Vec<usize>) {
+        if object == 0 || !self.heap.contains(object) {
+            return;
+        }
+        let header = unsafe { &mut *(object as *mut u64) };
+        if *header & MARK != 0 || *header == 0 {
+            return;
+        }
+        *header |= MARK;
+        pending.push(object);
+    }
+}
+
 pub fn rva_data(set: &AssemblySet, module: usize, field: u32) -> Result<u64, String> {
     let metadata = &set.modules[module].metadata;
     for row in 1..=metadata.rows(TableId::FieldRva) {
@@ -273,8 +452,11 @@ pub fn rva_data(set: &AssemblySet, module: usize, field: u32) -> Result<u64, Str
     Err("field has no RVA data".into())
 }
 
-pub extern "win64" fn allocate(type_record: u64, count: u64, _frame: u64) -> u64 {
+pub extern "win64" fn allocate(type_record: u64, count: u64, frame: u64, stack: u64) -> u64 {
     let state = state();
+    if frame != 0 && (STRESS.load(Ordering::Relaxed) || state.heap.should_collect()) {
+        state.collect(frame, stack);
+    }
     let record = type_record as *const u64;
     let (base, component, flags) =
         unsafe { (*record & 0xFFFF_FFFF, *record >> 32, *record.add(1)) };
@@ -336,7 +518,7 @@ pub fn new_string(units: &[u16]) -> u64 {
     if units.is_empty() && state().empty_string != 0 {
         return state().empty_string;
     }
-    let object = allocate(record, units.len() as u64, 0);
+    let object = allocate(record, units.len() as u64, 0, 0);
     if object != 0 {
         unsafe {
             std::ptr::copy_nonoverlapping(

@@ -3,8 +3,8 @@ pub mod asm;
 use std::collections::HashMap;
 
 use asm::{
-    ARGUMENT_REGISTERS, Absolute, AbsoluteTarget, Alu, Assembler, Cond, Label, R8, RAX, RBP, RCX,
-    RDX, RSP, Shift, Sse, Unary,
+    ARGUMENT_REGISTERS, Absolute, AbsoluteTarget, Alu, Assembler, Cond, Label, R8, R9, RAX, RBP,
+    RCX, RDX, RSP, Shift, Sse, Unary,
 };
 
 use crate::runtime::TYPE_VTABLE;
@@ -95,6 +95,7 @@ pub struct CompiledMethod {
     pub parameters: Vec<VarType>,
     pub returns: Option<VarType>,
     pub uses_objects: bool,
+    pub references: Vec<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +298,7 @@ struct Lowering<'a> {
     helpers: &'a Helpers,
     resolved: HashMap<u32, Resolved>,
     module: usize,
+    cleared: Vec<i32>,
 }
 
 impl<'s> Compiler<'s> {
@@ -643,6 +645,34 @@ impl<'s> Compiler<'s> {
         let slots = frame.values + frame.arguments + frame.locals + max_parameters;
         let frame_size = (8 * slots as u32 + 32 + 8 * max_outgoing as u32).next_multiple_of(16);
 
+        let mut references: Vec<i32> = ir
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                b.parameters
+                    .iter()
+                    .copied()
+                    .chain(b.instructions.iter().filter_map(|i| i.output))
+            })
+            .filter(|(_, kind)| *kind == crate::ir::Kind::Object)
+            .map(|(id, _)| frame.value(id))
+            .collect();
+        references.extend(
+            parameters
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v == VarType::Ref)
+                .map(|(i, _)| frame.argument(i)),
+        );
+        references.extend(
+            locals
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v == VarType::Ref)
+                .map(|(i, _)| frame.local(i)),
+        );
+        references.sort_unstable();
+        references.dedup();
         let uses_objects = resolved.values().any(|r| !matches!(r, Resolved::Direct(_)))
             || ir
                 .blocks
@@ -660,6 +690,7 @@ impl<'s> Compiler<'s> {
             helpers: self.helpers,
             resolved,
             module: key.module,
+            cleared: references.clone(),
         };
         let _ = &call_index;
         lowering.emit(&ir, frame_size)?;
@@ -671,6 +702,7 @@ impl<'s> Compiler<'s> {
             parameters,
             returns,
             uses_objects,
+            references,
         })
     }
 }
@@ -1010,10 +1042,18 @@ impl<'a> Lowering<'a> {
             }
         }
         let locals = self.locals.clone();
+        self.asm.alu(Alu::Xor, true, RAX, RAX);
         for index in 0..locals.len() {
-            self.asm.alu(Alu::Xor, true, RAX, RAX);
             let slot = self.frame.local(index);
             self.asm.store(true, RBP, slot, RAX);
+        }
+        let arguments: Vec<i32> = (0..parameters.len())
+            .map(|i| self.frame.argument(i))
+            .collect();
+        for slot in self.cleared.clone() {
+            if !arguments.contains(&slot) {
+                self.asm.store(true, RBP, slot, RAX);
+            }
         }
 
         let labels: Vec<Label> = (0..ir.blocks.len()).map(|_| self.asm.label()).collect();
@@ -1645,6 +1685,7 @@ impl<'a> Lowering<'a> {
         }
         self.asm.move_absolute(RCX, record);
         self.asm.move_register(true, R8, RBP);
+        self.asm.move_register(true, R9, RSP);
         self.call_address(AbsoluteTarget::Address(self.helpers.allocate));
         Ok(())
     }

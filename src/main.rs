@@ -518,6 +518,30 @@ fn compile_eligible(set: &kiln::loader::AssemblySet, helpers: &kiln::codegen::He
             }
         }
     }
+    let mut failed: std::collections::HashSet<MethodKey> = Default::default();
+    loop {
+        let wanted: Vec<MethodKey> = methods
+            .values()
+            .flat_map(|m| m.callees.iter())
+            .filter(|c| !methods.contains_key(*c) && !failed.contains(*c))
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        if wanted.is_empty() {
+            break;
+        }
+        for key in wanted {
+            match compiler.compile(&key) {
+                Ok(method) => {
+                    methods.insert(key, method);
+                }
+                Err(_) => {
+                    failed.insert(key);
+                }
+            }
+        }
+    }
     loop {
         let missing: Vec<MethodKey> = methods
             .iter()
@@ -667,6 +691,10 @@ fn jit_check(arguments: &[String]) -> ExitCode {
     };
     let (mut compared, mut matched, mut skipped, mut trapped) = (0u64, 0u64, 0u64, 0u64);
     let trace = std::env::var_os("KILN_TRACE").is_some();
+    kiln::runtime::STRESS.store(
+        std::env::var_os("KILN_GC_STRESS").is_some(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut mismatched_methods: std::collections::BTreeMap<String, u64> = Default::default();
     let mut examples = Vec::new();
     let mut methods_seen = std::collections::HashSet::new();
@@ -753,11 +781,12 @@ fn jit_check(arguments: &[String]) -> ExitCode {
         object_methods.len()
     );
     println!(
-        "{} methods compiled into {compiled_bytes} bytes of x64 and linked in {linked:.2?}, {} methods executed, {compared} cases compared, {matched} identical to .NET, {} mismatched in {} methods, {skipped} cases skipped (.NET threw or the case was not runnable), {trapped} cases reached a method that is not compiled yet, total {:.2?}",
+        "{} methods compiled into {compiled_bytes} bytes of x64 and linked in {linked:.2?}, {} methods executed, {compared} cases compared, {matched} identical to .NET, {} mismatched in {} methods, {skipped} cases skipped (.NET threw or the case was not runnable), {trapped} cases reached a method that is not compiled yet, {} collections, total {:.2?}",
         eligible.methods.len(),
         methods_seen.len(),
         compared - matched,
         mismatched_methods.len(),
+        kiln::runtime::COLLECTIONS.load(std::sync::atomic::Ordering::Relaxed),
         started.elapsed()
     );
     if compared == matched {

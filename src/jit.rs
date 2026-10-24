@@ -180,6 +180,11 @@ impl Image {
 
         let memory = ExecutableMemory::new_at_any(&code, &relocations)?;
         let trap = memory.address(trap_offset);
+        for key in &keys {
+            let start = memory.address(offsets[*key]) as usize;
+            let method = &methods[*key];
+            state.register_method(start, start + method.code.len(), &method.references);
+        }
         for (kind, record) in state.types.iter_mut() {
             let crate::objects::RuntimeType::Class(handle) = kind else {
                 continue;
