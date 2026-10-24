@@ -11,6 +11,7 @@ pub mod loader;
 pub mod members;
 pub mod metadata;
 pub mod objects;
+pub mod pinvoke;
 pub mod pe;
 pub mod reachability;
 pub mod reader;

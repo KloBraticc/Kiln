@@ -9,6 +9,7 @@ use crate::jit::Image;
 use crate::loader::TypeHandle;
 use crate::members::Member;
 use crate::metadata::{TableId, Token};
+use crate::pinvoke;
 use crate::objects::{
     ARRAY_DATA, ElementKind, ObjectModel, RuntimeType, STRING_DATA, StructLayout,
 };
@@ -100,6 +101,32 @@ enum Native {
     DelegateConstruct,
     DelegateInvoke,
     StringConstructor,
+    PlatformInvoke(usize),
+}
+
+struct Platform {
+    function: usize,
+    passes: Vec<Pass>,
+    back: Back,
+    last_error: bool,
+}
+
+enum Pass {
+    Raw(VarType),
+    Bool,
+    Wide,
+    Ansi,
+    Array,
+    Value(u32),
+    Copy(u32),
+}
+
+enum Back {
+    Nothing,
+    Raw(VarType),
+    Bool,
+    Value(Rc<StructLayout>),
+    Buffer(Rc<StructLayout>),
 }
 
 #[derive(Clone, Copy)]
@@ -143,6 +170,11 @@ enum Intrinsic {
     BlockCopy,
     RandomBytes,
     ThreadId,
+    LastError,
+    SetLastError,
+    ClearMemory,
+    ProcessorCount,
+    SpinWait,
 }
 
 #[derive(Clone, Copy)]
@@ -376,6 +408,7 @@ pub struct Interpreter<'s> {
     pending: RefCell<Option<Pending>>,
     pub budget: Cell<u64>,
     trace_calls: bool,
+    platforms: RefCell<Vec<Rc<Platform>>>,
 }
 
 enum Pending {
@@ -618,6 +651,7 @@ impl<'s> Interpreter<'s> {
             pending: RefCell::new(None),
             budget: Cell::new(u64::MAX),
             trace_calls: std::env::var_os("KILN_CALLS").is_some(),
+            platforms: RefCell::new(Vec::new()),
         }
     }
 
@@ -1094,13 +1128,16 @@ impl<'s> Interpreter<'s> {
             }
             _ => self.delegate_native(owner, name),
         };
+        let native = match native {
+            None if flags & PINVOKE != 0 => {
+                Some(self.platform_invoke(key, name, &sig, &parameters, &returns, implementation)?)
+            }
+            other => other,
+        };
         let mut code: &'static [u8] = &[];
         let mut clauses = Vec::new();
         let mut locals = Vec::new();
         if native.is_none() {
-            if flags & PINVOKE != 0 {
-                return unsupported("platform invoke");
-            }
             if implementation & INTERNAL_CALL != 0 || implementation & RUNTIME_IMPL != 0 {
                 return unsupported(format!(
                     "internal call {}::{name}",
@@ -1273,6 +1310,14 @@ impl<'s> Interpreter<'s> {
             ("System.Buffer", "BlockCopy") if parameters.len() == 5 => Intrinsic::BlockCopy,
             ("Interop+BCrypt", "BCryptGenRandom") if parameters.len() == 4 => Intrinsic::RandomBytes,
             ("System.Environment", "get_CurrentManagedThreadId") => Intrinsic::ThreadId,
+            ("System.Runtime.InteropServices.Marshal", "GetLastPInvokeError" | "GetLastWin32Error")
+                if parameters.is_empty() =>
+            {
+                Intrinsic::LastError
+            }
+            ("System.Runtime.InteropServices.Marshal", "SetLastPInvokeError") if parameters.len() == 1 => {
+                Intrinsic::SetLastError
+            }
             ("System.Threading.Interlocked", "Exchange")
                 if parameters.len() == 2 && parameters[0] == VarType::Pointer =>
             {
@@ -1306,6 +1351,140 @@ impl<'s> Interpreter<'s> {
             }
         };
         Some(Native::Intrinsic(intrinsic))
+    }
+
+    fn platform_invoke(
+        &self,
+        key: &MethodKey,
+        name: &str,
+        sig: &crate::signature::MethodSig,
+        parameters: &[Ty],
+        returns: &Option<Ty>,
+        implementation: u32,
+    ) -> Run<Native> {
+        let module = &self.model.set.modules[key.module];
+        let metadata = &module.metadata;
+        let import = pinvoke::find_import(metadata, key.row)
+            .ok_or_else(|| Fault::Unsupported("platform invoke without an import".into()))?;
+        if implementation & pinvoke::PRESERVE_SIG == 0 {
+            return unsupported("platform invoke without PreserveSig");
+        }
+        if pinvoke::has_field_marshal(metadata, key.row) {
+            return unsupported("platform invoke marshaling attributes");
+        }
+        if import.library.eq_ignore_ascii_case("QCall") {
+            let entry = if import.entry.is_empty() { name } else { import.entry };
+            let intrinsic = match (entry, parameters.len()) {
+                ("Buffer_Clear", 2) => Intrinsic::ClearMemory,
+                ("Environment_GetProcessorCount", 0) => Intrinsic::ProcessorCount,
+                ("ThreadNative_SpinWait", 1) => Intrinsic::SpinWait,
+                ("MarshalNative_IsBuiltInComSupported", 0) => Intrinsic::False,
+                _ => return unsupported(format!("runtime QCall {entry}")),
+            };
+            return Ok(Native::Intrinsic(intrinsic));
+        }
+        let unicode = import.unicode();
+        let passes = sig
+            .parameters
+            .iter()
+            .zip(parameters)
+            .map(|(parameter, ty)| platform_pass(unmodified(parameter), ty, unicode))
+            .collect::<Run<Vec<_>>>()?;
+        let back = match (returns, unmodified(&sig.return_type)) {
+            (None, _) => Back::Nothing,
+            (Some(_), TypeSig::Boolean) => Back::Bool,
+            (Some(Ty::Prim(VarType::Ref)), _) => return unsupported("platform invoke returning an object"),
+            (Some(Ty::Prim(var)), _) => Back::Raw(*var),
+            (Some(Ty::Struct(layout)), _) if !layout.references.is_empty() => {
+                return unsupported("platform invoke returning a struct with references");
+            }
+            (Some(Ty::Struct(layout)), _) if matches!(layout.size, 1 | 2 | 4 | 8) => Back::Value(layout.clone()),
+            (Some(Ty::Struct(layout)), _) => Back::Buffer(layout.clone()),
+        };
+        let directory = module.path.parent().unwrap_or(std::path::Path::new("."));
+        let function = map(pinvoke::resolve(directory, &import, name))?;
+        let mut platforms = self.platforms.borrow_mut();
+        platforms.push(Rc::new(Platform {
+            function,
+            passes,
+            back,
+            last_error: import.flags & pinvoke::SUPPORTS_LAST_ERROR != 0,
+        }));
+        Ok(Native::PlatformInvoke(platforms.len() - 1))
+    }
+
+    fn platform_call(&self, index: usize, arguments: &[V]) -> Run<Option<V>> {
+        let platform = self.platforms.borrow()[index].clone();
+        let mut buffers: Vec<Vec<u64>> = Vec::new();
+        let mut raw = Vec::with_capacity(arguments.len() + 1);
+        let buffer = match &platform.back {
+            Back::Buffer(layout) => {
+                let boxed = self.allocate_box(&self.layout_gen(layout))?;
+                raw.push(boxed + 8);
+                vec![V::S(boxed)]
+            }
+            _ => Vec::new(),
+        };
+        let _pin = Pin::new(&buffer);
+        for (pass, value) in platform.passes.iter().zip(arguments) {
+            let data = match value {
+                V::S(boxed) | V::O(boxed) if *boxed != 0 => boxed + 8,
+                other => other.address(),
+            };
+            raw.push(match pass {
+                Pass::Raw(var) => store_raw(*var, *value),
+                Pass::Bool => u64::from(value.int() != 0),
+                Pass::Array => match value.address() {
+                    0 => 0,
+                    array => array + u64::from(ARRAY_DATA),
+                },
+                Pass::Wide | Pass::Ansi => match value.address() {
+                    0 => 0,
+                    string => {
+                        let units = string_units(string);
+                        let bytes: Vec<u8> = if matches!(pass, Pass::Wide) {
+                            units.iter().chain(&[0]).flat_map(|u| u.to_le_bytes()).collect()
+                        } else {
+                            pinvoke::ansi(units)
+                        };
+                        buffers.push(words(&bytes));
+                        buffers[buffers.len() - 1].as_ptr() as u64
+                    }
+                },
+                Pass::Value(size) => {
+                    let mut bits = 0u64;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(data as *const u8, (&raw mut bits).cast(), *size as usize);
+                    }
+                    bits
+                }
+                Pass::Copy(size) => {
+                    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, *size as usize) };
+                    buffers.push(words(bytes));
+                    buffers[buffers.len() - 1].as_ptr() as u64
+                }
+            });
+        }
+        let (integer, float) = unsafe { pinvoke::call(platform.function, &raw, platform.last_error) };
+        Ok(match &platform.back {
+            Back::Nothing => None,
+            Back::Bool => Some(V::I4(i32::from(integer as u32 != 0))),
+            Back::Raw(VarType::F32) => Some(V::F4(f32::from_bits(float as u32))),
+            Back::Raw(VarType::F64) => Some(V::F8(f64::from_bits(float))),
+            Back::Raw(var) => Some(load_raw(*var, integer)),
+            Back::Value(layout) => {
+                let boxed = self.allocate_box(&self.layout_gen(layout))?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (&raw const integer).cast::<u8>(),
+                        (boxed + 8) as *mut u8,
+                        layout.size as usize,
+                    );
+                }
+                Some(V::S(boxed))
+            }
+            Back::Buffer(_) => buffer.first().copied(),
+        })
     }
 
     fn forwards_resource_lookup(&self, owner: TypeHandle) -> bool {
@@ -1642,6 +1821,7 @@ impl<'s> Interpreter<'s> {
     fn run_native(&self, loaded: &Loaded, native: Native, arguments: &[V]) -> Run<Option<V>> {
         match native {
             Native::Intrinsic(intrinsic) => self.intrinsic(intrinsic, arguments, &loaded.ctx),
+            Native::PlatformInvoke(index) => self.platform_call(index, arguments),
             Native::StringConstructor => unsupported("string constructors are only reached through newobj"),
             Native::DelegateConstruct => {
                 let this = arguments[0].address();
@@ -1707,6 +1887,22 @@ impl<'s> Interpreter<'s> {
             Intrinsic::Unsafe(operation) => return self.run_unsafe(operation, a, ctx),
             Intrinsic::ArrayData => V::P(self.non_null(a[0])? + u64::from(ARRAY_DATA)),
             Intrinsic::ThreadId => V::I4(1),
+            Intrinsic::ClearMemory => {
+                unsafe { std::ptr::write_bytes(a[0].address() as *mut u8, 0, a[1].bits() as usize) };
+                return Ok(None);
+            }
+            Intrinsic::ProcessorCount => V::I4(processor_count()),
+            Intrinsic::SpinWait => {
+                for _ in 0..a[0].int().max(0) {
+                    std::hint::spin_loop();
+                }
+                return Ok(None);
+            }
+            Intrinsic::LastError => V::I4(pinvoke::last_error() as i32),
+            Intrinsic::SetLastError => {
+                pinvoke::set_last_error(a[0].int() as u32);
+                return Ok(None);
+            }
             Intrinsic::RandomBytes => {
                 use std::hash::{BuildHasher, Hasher};
                 let buffer = a[1].address() as *mut u8;
@@ -4388,6 +4584,59 @@ fn store_raw(var: VarType, value: V) -> u64 {
         VarType::F64 => value.float().to_bits(),
         _ => value.bits(),
     }
+}
+
+fn processor_count() -> i32 {
+    static COUNT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get() as i32))
+}
+
+fn unmodified(sig: &TypeSig) -> &TypeSig {
+    match sig {
+        TypeSig::Modified { inner, .. } => unmodified(inner),
+        other => other,
+    }
+}
+
+fn platform_pass(sig: &TypeSig, ty: &Ty, unicode: bool) -> Run<Pass> {
+    let blittable = |element: &TypeSig| {
+        matches!(
+            unmodified(element),
+            TypeSig::I1
+                | TypeSig::U1
+                | TypeSig::I2
+                | TypeSig::U2
+                | TypeSig::I4
+                | TypeSig::U4
+                | TypeSig::I8
+                | TypeSig::U8
+                | TypeSig::R4
+                | TypeSig::R8
+                | TypeSig::IntPtr
+                | TypeSig::UIntPtr
+        ) || (unicode && matches!(unmodified(element), TypeSig::Char))
+    };
+    Ok(match (sig, ty) {
+        (TypeSig::Boolean, _) => Pass::Bool,
+        (TypeSig::String, _) if unicode => Pass::Wide,
+        (TypeSig::String, _) => Pass::Ansi,
+        (TypeSig::SzArray(element), _) if blittable(element) => Pass::Array,
+        (_, Ty::Prim(VarType::Ref)) => return unsupported("platform invoke object marshaling"),
+        (_, Ty::Prim(var)) => Pass::Raw(*var),
+        (_, Ty::Struct(layout)) if !layout.references.is_empty() => {
+            return unsupported("platform invoke struct with references");
+        }
+        (_, Ty::Struct(layout)) if matches!(layout.size, 1 | 2 | 4 | 8) => Pass::Value(layout.size),
+        (_, Ty::Struct(layout)) => Pass::Copy(layout.size),
+    })
+}
+
+fn words(bytes: &[u8]) -> Vec<u64> {
+    let mut words = vec![0u64; bytes.len().div_ceil(8).max(1)];
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr().cast(), bytes.len());
+    }
+    words
 }
 
 fn coerce(value: V, var: VarType) -> V {
