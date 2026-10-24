@@ -35,12 +35,23 @@ The fallback runs code that is not compiled ahead of time:
 - Exception handling with catch, filter, finally and fault clauses, virtual and interface dispatch, delegates, boxing and static constructors
 - Struct values in locals, arguments, fields, statics, arrays and boxes, with exact CoreCLR layouts and garbage collector reference maps for embedded references
 - Generic classes, structs, interfaces and methods, with exact layouts, statics, static constructors and virtual tables per instantiation, including static abstract interface members
-- Platform invoke into any Windows library, with primitives, pointers, byrefs, `bool`, Unicode and ANSI strings, blittable arrays and structs by value, `SetLastError`, and native versions of the runtime QCalls ordinary code reaches
+- Platform invoke into any Windows library, with primitives, pointers, byrefs, `bool`, Unicode, ANSI and UTF-8 strings, blittable arrays, structs by value, `SafeHandle`, `HandleRef`, delegates, the common `MarshalAs` forms, `SetLastError`, and native versions of the runtime QCalls ordinary code reaches
+- Native code calls back into managed code through generated entry stubs, for `UnmanagedCallersOnly` function pointers and for delegates passed to native code
+- Globalization through the Windows NLS APIs, so culture aware comparison, casing, number and date formatting work without ICU
+- GC handles, dependent handles, locks and identity hash codes, so `ConditionalWeakTable`, `GCHandle` and `lock` work as they do in .NET
 - Native versions of runtime intrinsics, such as math through the Windows C runtime, interlocked operations and string resources read from each assembly
 - Compiled code and the fallback call each other freely: calls to methods that are not compiled go through generated stubs, and a fault or exception unwinds compiled frames back to the fallback
 - Compiled code checks array bounds, casts, overflow and null receivers, and turns hardware faults into the matching .NET exceptions
 
 `kiln fallback-report <application> <folder>...` shows how much of an application the fallback can load and what still blocks the rest.
+
+Applications run without an installed .NET runtime:
+
+- `kiln run <application> <folder>... [-- arguments]` runs an application's entry point on Kiln, passing its `runtimeconfig.json` properties to `AppContext`
+- `kiln publish <application> <folder>... -o <output.exe>` compiles the reachable methods to x64 ahead of time and writes one Windows executable holding the Kiln runtime, the compiled code and the assemblies the application uses, next to the native libraries it imports
+- `msbuild/Kiln.targets` runs `kiln publish` after `dotnet publish -r win-x64 --self-contained -p:PublishKiln=true` and writes the executable to the `native` folder of the publish directory
+
+Console applications run today. WPF applications package and start, and stop where they first need the reflection object model (`Assembly`, `Module` and manifest resources).
 
 ## Roadmap
 
@@ -50,7 +61,8 @@ The fallback runs code that is not compiled ahead of time:
 4. Runtime: garbage collector, exception handling, type loader and interop
 5. Reachability analysis that understands XAML and BAML
 6. Fallback execution for code that cannot be compiled ahead of time
-7. MSBuild integration for `dotnet publish`
+7. Standalone executables and MSBuild integration for `dotnet publish`
+8. Reflection object model: assemblies, modules, members and manifest resources
 
 ## Building
 
