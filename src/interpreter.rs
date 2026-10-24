@@ -3,13 +3,14 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::codegen::{MethodKey, VarType};
+use crate::generics::{Ctx, Gen, Types};
 use crate::il::{Argument, ClauseKind, ExceptionClause, MethodBody};
 use crate::jit::Image;
 use crate::loader::TypeHandle;
 use crate::members::Member;
 use crate::metadata::{TableId, Token};
 use crate::objects::{
-    ARRAY_DATA, ElementKind, FieldShape, ObjectModel, RuntimeType, STRING_DATA, StructLayout,
+    ARRAY_DATA, ElementKind, ObjectModel, RuntimeType, STRING_DATA, StructLayout,
 };
 use crate::runtime;
 use crate::signature::{CallingConvention, Signature, TypeSig};
@@ -98,6 +99,7 @@ enum Native {
     Intrinsic(Intrinsic),
     DelegateConstruct,
     DelegateInvoke,
+    StringConstructor,
 }
 
 #[derive(Clone, Copy)]
@@ -123,6 +125,48 @@ enum Intrinsic {
     FusedF,
     MultiplyAdd,
     MultiplyAddF,
+    TypeFromHandle,
+    ContainsReferences,
+    BitwiseEquatable,
+    DefaultEqualityComparer,
+    DefaultComparer,
+    CreateInstance,
+    GetType,
+    TypeIsValueType,
+    TypeIsEnum,
+    Unsafe(UnsafeOp),
+    CreateSpan,
+    MemmoveElements,
+    ArrayData,
+    ArrayCopy,
+    ArrayClear,
+    BlockCopy,
+    RandomBytes,
+    ThreadId,
+}
+
+#[derive(Clone, Copy)]
+enum UnsafeOp {
+    Same,
+    Add,
+    AddBytes,
+    Subtract,
+    SubtractBytes,
+    SizeOf,
+    Read,
+    Write,
+    Copy,
+    CopyBlock,
+    InitBlock,
+    AreSame,
+    Greater,
+    Less,
+    ByteOffset,
+    IsNull,
+    Null,
+    Nothing,
+    Unbox,
+    BitCast,
 }
 
 type IntrinsicRows = (HashSet<u32>, HashSet<u32>);
@@ -163,7 +207,7 @@ fn prims(types: &[Ty]) -> Option<Vec<VarType>> {
 }
 
 struct FieldRef {
-    owner: TypeHandle,
+    owner: Gen,
     module: usize,
     row: u32,
     is_static: bool,
@@ -175,7 +219,9 @@ struct FieldRef {
 
 struct Loaded {
     key: MethodKey,
+    ctx: Ctx,
     owner: TypeHandle,
+    owner_gen: Gen,
     code: &'static [u8],
     clauses: Vec<ExceptionClause>,
     parameters: Vec<Ty>,
@@ -207,6 +253,21 @@ fn pinned() -> std::sync::MutexGuard<'static, Vec<u64>> {
     PINNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+static TYPE_ROOTS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+fn type_roots() -> std::sync::MutexGuard<'static, Vec<u64>> {
+    TYPE_ROOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+const EXACT_TAG: u64 = 0x8000_0000_0000_0000;
+
+type InstKey = (MethodKey, Vec<u32>, Vec<u32>);
+
+struct VTable {
+    slots: Vec<Option<(MethodKey, Gen)>>,
+    slot_of: HashMap<MethodKey, usize>,
+}
+
 fn scan_roots(out: &mut Vec<u64>) {
     {
         for &frame in frames().iter() {
@@ -233,6 +294,7 @@ fn scan_roots(out: &mut Vec<u64>) {
         }
     }
     out.extend_from_slice(&pinned());
+    out.extend_from_slice(&type_roots());
 }
 
 struct Pin(usize);
@@ -293,19 +355,27 @@ enum Exit {
 pub struct Interpreter<'s> {
     pub model: &'s ObjectModel<'s>,
     image: Cell<*const Image>,
-    loaded: RefCell<HashMap<MethodKey, Rc<Loaded>>>,
-    interfaces: RefCell<HashMap<usize, HashMap<u32, Vec<Token>>>>,
-    implementations: RefCell<HashMap<(u64, MethodKey), MethodKey>>,
+    loaded: RefCell<HashMap<InstKey, Rc<Loaded>>>,
+    types: Types<'s>,
+    exact_layouts: RefCell<HashMap<u32, Rc<StructLayout>>>,
+    generic_init: RefCell<HashMap<u32, Option<Option<String>>>>,
+    vtables: RefCell<HashMap<u32, Rc<VTable>>>,
+    functions: RefCell<Vec<(MethodKey, Ctx)>>,
+    type_objects: RefCell<HashMap<Gen, u64>>,
+    object_types: RefCell<HashMap<u64, Gen>>,
+    rva_sizes: RefCell<HashMap<u64, u32>>,
+    implementations: RefCell<HashMap<(u64, InstKey), (MethodKey, Ctx)>>,
     names: RefCell<HashMap<TypeHandle, String>>,
     resources: RefCell<HashMap<usize, HashMap<String, String>>>,
     failed_types: RefCell<HashMap<TypeHandle, Option<String>>>,
-    fields: RefCell<HashMap<(usize, u32), Rc<FieldRef>>>,
+    fields: RefCell<HashMap<(usize, u32, Vec<u32>, Vec<u32>), Rc<FieldRef>>>,
     intrinsic_rows: RefCell<HashMap<usize, IntrinsicRows>>,
     depth: Cell<usize>,
     pub interpreted: Cell<u64>,
     pub compiled_calls: Cell<u64>,
     pending: RefCell<Option<Pending>>,
     pub budget: Cell<u64>,
+    trace_calls: bool,
 }
 
 enum Pending {
@@ -528,7 +598,14 @@ impl<'s> Interpreter<'s> {
             model,
             image: Cell::new(image.map_or(std::ptr::null(), |i| i as *const Image)),
             loaded: RefCell::new(HashMap::new()),
-            interfaces: RefCell::new(HashMap::new()),
+            types: Types::new(model.set),
+            exact_layouts: RefCell::new(HashMap::new()),
+            generic_init: RefCell::new(HashMap::new()),
+            vtables: RefCell::new(HashMap::new()),
+            functions: RefCell::new(Vec::new()),
+            type_objects: RefCell::new(HashMap::new()),
+            object_types: RefCell::new(HashMap::new()),
+            rva_sizes: RefCell::new(HashMap::new()),
             implementations: RefCell::new(HashMap::new()),
             names: RefCell::new(HashMap::new()),
             resources: RefCell::new(HashMap::new()),
@@ -540,6 +617,7 @@ impl<'s> Interpreter<'s> {
             compiled_calls: Cell::new(0),
             pending: RefCell::new(None),
             budget: Cell::new(u64::MAX),
+            trace_calls: std::env::var_os("KILN_CALLS").is_some(),
         }
     }
 
@@ -621,80 +699,297 @@ impl<'s> Interpreter<'s> {
     }
 
     fn object_class(&self, object: u64) -> Run<TypeHandle> {
+        match self.object_gen(object)? {
+            Gen::Named(handle, _) => Ok(handle),
+            _ => self.corelib_type("System", "Array"),
+        }
+    }
+
+    fn object_gen(&self, object: u64) -> Run<Gen> {
         let record = unsafe { *(object as *const u64) } & !1;
         let identity = unsafe { *((record + 40) as *const u64) };
+        if identity & EXACT_TAG != 0 && identity != u64::MAX {
+            return self
+                .types
+                .get((identity & !EXACT_TAG) as u32)
+                .ok_or_else(|| Fault::Unsupported("unknown exact type".into()));
+        }
         if identity != u64::MAX {
-            return Ok(TypeHandle {
-                module: (identity >> 32) as usize,
-                row: identity as u32,
-            });
+            return Ok(Gen::Named(
+                TypeHandle {
+                    module: (identity >> 32) as usize,
+                    row: identity as u32,
+                },
+                Rc::from(Vec::new()),
+            ));
         }
-        let flags = unsafe { *((record + 8) as *const u64) };
-        if flags & runtime::FLAG_STRING != 0 {
-            self.corelib_type("System", "String")
-        } else {
-            self.corelib_type("System", "Array")
-        }
+        let kind = runtime::state().kinds.get(&record).copied();
+        let element = match kind {
+            Some(RuntimeType::String) => return map(self.types.core("String")),
+            Some(RuntimeType::Array(kind)) => map(self.types.core(match kind {
+                ElementKind::I8 => "SByte",
+                ElementKind::U8 => "Byte",
+                ElementKind::I16 => "Int16",
+                ElementKind::U16 => "UInt16",
+                ElementKind::I32 => "Int32",
+                ElementKind::I64 => "Int64",
+                ElementKind::F32 => "Single",
+                ElementKind::F64 => "Double",
+                ElementKind::Reference => "Object",
+            }))?,
+            Some(RuntimeType::ValueArray(handle)) => Gen::Named(handle, Rc::from(Vec::new())),
+            Some(RuntimeType::ExactArray(id)) => self
+                .types
+                .get(id)
+                .ok_or_else(|| Fault::Unsupported("unknown exact type".into()))?,
+            _ => {
+                let flags = unsafe { *((record + 8) as *const u64) };
+                if flags & runtime::FLAG_STRING != 0 {
+                    return map(self.types.core("String"));
+                }
+                return unsupported("object of an unknown type");
+            }
+        };
+        Ok(Gen::SzArray(Rc::new(element)))
     }
 
     fn load(&self, key: &MethodKey) -> Run<Rc<Loaded>> {
-        if let Some(loaded) = self.loaded.borrow().get(key) {
+        self.load_ctx(key, &Ctx::default())
+    }
+
+    fn inst_key(&self, key: &MethodKey, ctx: &Ctx) -> InstKey {
+        (
+            key.clone(),
+            ctx.types.iter().map(|g| self.types.id(g)).collect(),
+            ctx.methods.iter().map(|g| self.types.id(g)).collect(),
+        )
+    }
+
+    fn load_ctx(&self, key: &MethodKey, ctx: &Ctx) -> Run<Rc<Loaded>> {
+        let inst = self.inst_key(key, ctx);
+        if let Some(loaded) = self.loaded.borrow().get(&inst) {
             return Ok(loaded.clone());
         }
-        let loaded = Rc::new(self.load_uncached(key)?);
-        self.loaded.borrow_mut().insert(key.clone(), loaded.clone());
+        let loaded = Rc::new(self.load_uncached(key, ctx)?);
+        self.loaded.borrow_mut().insert(inst, loaded.clone());
         Ok(loaded)
     }
 
-    fn ty_of(&self, module: usize, sig: &TypeSig) -> Run<Ty> {
-        if let Some(var) = map(self.model.var_type(module, sig))? {
-            return Ok(Ty::Prim(var));
-        }
-        match self.model.shape(module, sig) {
-            Ok(FieldShape::Struct(handle)) => self.value_ty(handle),
-            Ok(_) => unsupported(format!("value of type {sig:?}")),
-            Err(reason) => unsupported(reason),
-        }
+    fn ty_of(&self, module: usize, sig: &TypeSig, ctx: &Ctx) -> Run<Ty> {
+        let exact = map(self.types.resolve(module, sig, ctx))?;
+        self.gen_ty(&exact)
     }
 
-    fn value_ty(&self, handle: TypeHandle) -> Run<Ty> {
-        let set = self.model.set;
-        if !set.is_value_type(handle).unwrap_or(false) {
-            return Ok(Ty::Prim(VarType::Ref));
-        }
-        if set.is_enum(handle).unwrap_or(false) {
-            let size = set
-                .value_type_layout(handle)
-                .map_err(|e| Fault::Unsupported(format!("{e:?}")))?
-                .size;
-            return Ok(Ty::Prim(match size {
-                1 => VarType::U8,
-                2 => VarType::U16,
-                4 => VarType::I32,
-                _ => VarType::I64,
-            }));
-        }
-        let primitive = match self.type_name(handle).as_str() {
-            "System.Boolean" | "System.Byte" => Some(VarType::U8),
-            "System.SByte" => Some(VarType::I8),
-            "System.Int16" => Some(VarType::I16),
-            "System.UInt16" | "System.Char" => Some(VarType::U16),
-            "System.Int32" | "System.UInt32" => Some(VarType::I32),
-            "System.Int64" | "System.UInt64" | "System.IntPtr" | "System.UIntPtr" => {
-                Some(VarType::I64)
+    fn gen_ty(&self, exact: &Gen) -> Run<Ty> {
+        match exact {
+            Gen::Named(handle, arguments) => {
+                let set = self.model.set;
+                let name = self.type_name(*handle);
+                let primitive = match name.as_str() {
+                    "System.Boolean" | "System.Byte" => Some(VarType::U8),
+                    "System.SByte" => Some(VarType::I8),
+                    "System.Int16" => Some(VarType::I16),
+                    "System.UInt16" | "System.Char" => Some(VarType::U16),
+                    "System.Int32" | "System.UInt32" => Some(VarType::I32),
+                    "System.Int64" | "System.UInt64" | "System.IntPtr" | "System.UIntPtr" => {
+                        Some(VarType::I64)
+                    }
+                    "System.Single" => Some(VarType::F32),
+                    "System.Double" => Some(VarType::F64),
+                    "System.Void" => return unsupported("a value of type void"),
+                    "System.TypedReference" => return unsupported("typed references"),
+                    _ => None,
+                };
+                if let Some(var) = primitive {
+                    return Ok(Ty::Prim(var));
+                }
+                if !set.is_value_type(*handle).unwrap_or(false) {
+                    return Ok(Ty::Prim(VarType::Ref));
+                }
+                if arguments.is_empty() && set.is_enum(*handle).unwrap_or(false) {
+                    let size = set
+                        .value_type_layout(*handle)
+                        .map_err(|e| Fault::Unsupported(format!("{e:?}")))?
+                        .size;
+                    return Ok(Ty::Prim(match size {
+                        1 => VarType::U8,
+                        2 => VarType::U16,
+                        4 => VarType::I32,
+                        _ => VarType::I64,
+                    }));
+                }
+                Ok(Ty::Struct(self.layout_of(exact)?))
             }
-            "System.Single" => Some(VarType::F32),
-            "System.Double" => Some(VarType::F64),
-            _ => None,
-        };
-        match primitive {
-            Some(var) => Ok(Ty::Prim(var)),
-            None => Ok(Ty::Struct(map(self.model.struct_layout(handle))?)),
+            Gen::SzArray(_) | Gen::Array(_, _) => Ok(Ty::Prim(VarType::Ref)),
+            Gen::ByRef(_) => Ok(Ty::Prim(VarType::Pointer)),
+            Gen::Pointer(_) | Gen::FunctionPointer => Ok(Ty::Prim(VarType::I64)),
         }
     }
 
-    fn allocate_box(&self, handle: TypeHandle) -> Run<u64> {
-        let record = self.record(RuntimeType::Class(handle))?;
+    fn layout_of(&self, exact: &Gen) -> Run<Rc<StructLayout>> {
+        let Gen::Named(handle, arguments) = exact else {
+            return unsupported("layout of a non struct");
+        };
+        if arguments.is_empty() {
+            return map(self.model.struct_layout(*handle));
+        }
+        let id = self.types.id(exact);
+        if let Some(found) = self.exact_layouts.borrow().get(&id) {
+            return Ok(found.clone());
+        }
+        let layout_arguments = arguments
+            .iter()
+            .map(|a| self.types.layout_argument(a))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(Fault::Unsupported)?;
+        let (layout, placements) = self
+            .model
+            .set
+            .value_type_fields_with(*handle, &layout_arguments)
+            .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
+        let ctx = exact.context();
+        let mut references = Vec::new();
+        let mut fields = HashMap::new();
+        for placement in &placements {
+            fields.insert(placement.field, placement.offset);
+            if !placement.layout.has_references {
+                continue;
+            }
+            let sig = map(self.model.field_signature(handle.module, placement.field))?;
+            let field = map(self.types.resolve(handle.module, &sig, &ctx))?;
+            match self.gen_ty(&field)? {
+                Ty::Prim(VarType::Ref) => references.push(placement.offset),
+                Ty::Struct(inner) => {
+                    references.extend(inner.references.iter().map(|r| placement.offset + r))
+                }
+                Ty::Prim(_) => {}
+            }
+        }
+        let built = Rc::new(StructLayout {
+            handle: *handle,
+            instance: Some(id),
+            size: layout.size,
+            references,
+            fields,
+        });
+        self.exact_layouts.borrow_mut().insert(id, built.clone());
+        Ok(built)
+    }
+
+    fn layout_gen(&self, layout: &StructLayout) -> Gen {
+        layout
+            .instance
+            .and_then(|id| self.types.get(id))
+            .unwrap_or_else(|| Gen::Named(layout.handle, Rc::from(Vec::new())))
+    }
+
+    fn record_of(&self, exact: &Gen) -> Run<u64> {
+        match exact {
+            Gen::Named(handle, arguments) => {
+                if arguments.is_empty() {
+                    if self.type_name(*handle) == "System.String" {
+                        return self.record(RuntimeType::String);
+                    }
+                    if let Ok(record) = self.record(RuntimeType::Class(*handle)) {
+                        return Ok(record);
+                    }
+                }
+                let id = self.types.id(exact);
+                if let Some(found) = runtime::state().types.get(&RuntimeType::Exact(id)) {
+                    return Ok(found.words.as_ptr() as u64);
+                }
+                let set = self.model.set;
+                if set.is_value_type(*handle).unwrap_or(false) {
+                    let layout = self.layout_of(exact)?;
+                    let offsets: Vec<u32> = layout.references.iter().map(|r| r + 8).collect();
+                    return Ok(runtime::state().custom_record(
+                        RuntimeType::Exact(id),
+                        u64::from((layout.size + 8).next_multiple_of(8).max(16)),
+                        0,
+                        0,
+                        0,
+                        offsets,
+                        EXACT_TAG | u64::from(id),
+                    ));
+                }
+                let layout_arguments = arguments
+                    .iter()
+                    .map(|a| self.types.layout_argument(a))
+                    .collect::<Result<Vec<_>, String>>()
+                    .map_err(Fault::Unsupported)?;
+                let (end, placements) = set
+                    .class_fields_with(*handle, &layout_arguments)
+                    .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
+                let parent = match map(self.types.base(exact))? {
+                    Some(base) => self.record_of(&base)?,
+                    None => 0,
+                };
+                let mut offsets = if parent != 0 {
+                    runtime::state().record_offsets(parent)
+                } else {
+                    Vec::new()
+                };
+                let ctx = exact.context();
+                for placement in &placements {
+                    if !placement.layout.has_references {
+                        continue;
+                    }
+                    let sig = map(self.model.field_signature(handle.module, placement.field))?;
+                    let field = map(self.types.resolve(handle.module, &sig, &ctx))?;
+                    match self.gen_ty(&field)? {
+                        Ty::Prim(VarType::Ref) => offsets.push(placement.offset + 8),
+                        Ty::Struct(inner) => offsets
+                            .extend(inner.references.iter().map(|r| placement.offset + 8 + r)),
+                        Ty::Prim(_) => {}
+                    }
+                }
+                Ok(runtime::state().custom_record(
+                    RuntimeType::Exact(id),
+                    u64::from((end + 8).next_multiple_of(8).max(16)),
+                    0,
+                    0,
+                    parent,
+                    offsets,
+                    EXACT_TAG | u64::from(id),
+                ))
+            }
+            Gen::SzArray(element) => self.array_record(element),
+            _ => unsupported(format!("objects of type {}", self.types.full_name(exact))),
+        }
+    }
+
+    fn array_record(&self, element: &Gen) -> Run<u64> {
+        match self.gen_ty(element)? {
+            Ty::Prim(var) => {
+                let kind = ElementKind::from_var(var).unwrap_or(ElementKind::I64);
+                self.record(RuntimeType::Array(kind))
+            }
+            Ty::Struct(layout) => match layout.instance {
+                None => self.record(RuntimeType::ValueArray(layout.handle)),
+                Some(id) => Ok(runtime::state().custom_record(
+                    RuntimeType::ExactArray(id),
+                    u64::from(ARRAY_DATA),
+                    u64::from(layout.size),
+                    runtime::FLAG_ARRAY | runtime::FLAG_STRUCT_ELEMENTS,
+                    0,
+                    layout.references.clone(),
+                    u64::MAX,
+                )),
+            },
+        }
+    }
+
+    fn element_size(&self, element: &Gen) -> Run<(Ty, u32)> {
+        let ty = self.gen_ty(element)?;
+        let size = match &ty {
+            Ty::Prim(var) => ElementKind::from_var(*var).map_or(8, ElementKind::size),
+            Ty::Struct(layout) => layout.size,
+        };
+        Ok((ty, size))
+    }
+
+    fn allocate_box(&self, exact: &Gen) -> Run<u64> {
+        let record = self.record_of(exact)?;
         match runtime::allocate_managed(record, 0) {
             0 => self.throw("OutOfMemoryException"),
             object => Ok(object),
@@ -706,7 +1001,7 @@ impl<'s> Interpreter<'s> {
             Ty::Prim(var) => Ok(read(address, *var)),
             Ty::Struct(layout) => {
                 let _pin = Pin::new(keep);
-                let boxed = self.allocate_box(layout.handle)?;
+                let boxed = self.allocate_box(&self.layout_gen(layout))?;
                 unsafe {
                     std::ptr::copy(address as *const u8, (boxed + 8) as *mut u8, layout.size as usize);
                 }
@@ -740,18 +1035,17 @@ impl<'s> Interpreter<'s> {
         }
     }
 
-    fn load_uncached(&self, key: &MethodKey) -> Run<Loaded> {
+    fn load_uncached(&self, key: &MethodKey, ctx: &Ctx) -> Run<Loaded> {
         let set = self.model.set;
         let module = &set.modules[key.module];
         let metadata = &module.metadata;
         let owner = map(self.model.method_owner(key))?;
-        if self.model.is_generic(owner) {
-            return unsupported("methods of generic types");
-        }
         let sig = map(self.model.method_sig(key))?;
-        if sig.generic_parameters != 0 {
-            return unsupported("generic methods");
+        let owner_parameters = self.types.parameter_count(TableId::TypeDef, owner.row, owner.module);
+        if ctx.types.len() != owner_parameters || ctx.methods.len() != sig.generic_parameters as usize {
+            return unsupported("open generic method");
         }
+        let owner_gen = Gen::Named(owner, ctx.types.clone());
         if sig.convention != CallingConvention::Default {
             return unsupported("non default calling convention");
         }
@@ -768,12 +1062,12 @@ impl<'s> Interpreter<'s> {
             }));
         }
         for parameter in &sig.parameters {
-            parameters.push(self.ty_of(key.module, parameter)?);
+            parameters.push(self.ty_of(key.module, parameter, ctx)?);
         }
         let returns = match &sig.return_type {
             TypeSig::Void => None,
             TypeSig::Modified { inner, .. } if **inner == TypeSig::Void => None,
-            other => Some(self.ty_of(key.module, other)?),
+            other => Some(self.ty_of(key.module, other, ctx)?),
         };
         let name = metadata.string_cell(TableId::MethodDef, key.row, 3).unwrap_or("");
         let primitive_returns = match &returns {
@@ -782,7 +1076,16 @@ impl<'s> Interpreter<'s> {
             Some(Ty::Struct(_)) => None,
         };
         let native = match (prims(&parameters), primitive_returns) {
+            _ if name == ".ctor" && self.type_name(owner) == "System.String" => {
+                Some(Native::StringConstructor)
+            }
+            _ if self.generic_native(owner, name, ctx).is_some() => {
+                self.generic_native(owner, name, ctx)
+            }
             (Some(parameters), Some(returns)) => self.native(owner, name, &parameters, returns),
+            _ if name == "GetTypeFromHandle" && self.type_name(owner) == "System.Type" => {
+                Some(Native::Intrinsic(Intrinsic::TypeFromHandle))
+            }
             _ if name == "InitializeArray"
                 && self.type_name(owner) == "System.Runtime.CompilerServices.RuntimeHelpers"
                 && parameters.len() == 2 =>
@@ -807,7 +1110,9 @@ impl<'s> Interpreter<'s> {
             if rva == 0 && flags & ABSTRACT != 0 {
                 return Ok(Loaded {
                     key: key.clone(),
+                    ctx: ctx.clone(),
                     owner,
+                    owner_gen,
                     code: &[],
                     clauses: Vec::new(),
                     parameters,
@@ -838,8 +1143,8 @@ impl<'s> Interpreter<'s> {
                 {
                     for local in &types {
                         locals.push(match local {
-                            TypeSig::Pinned(inner) => self.ty_of(key.module, inner)?,
-                            other => self.ty_of(key.module, other)?,
+                            TypeSig::Pinned(inner) => self.ty_of(key.module, inner, ctx)?,
+                            other => self.ty_of(key.module, other, ctx)?,
                         });
                     }
                 }
@@ -852,7 +1157,9 @@ impl<'s> Interpreter<'s> {
         }
         Ok(Loaded {
             key: key.clone(),
+            ctx: ctx.clone(),
             owner,
+            owner_gen,
             code,
             clauses,
             parameters,
@@ -895,7 +1202,8 @@ impl<'s> Interpreter<'s> {
         body.instructions().flatten().any(|instruction| {
             instruction.opcode.value == 0x28
                 && matches!(instruction.argument, Argument::Token(token)
-                    if self.method_token(key.module, token).ok().as_ref() == Some(key))
+                    if self.method_inst(key.module, token, &Ctx::default()).ok().map(|m| m.0).as_ref() == Some(key)
+                        || self.method_token(key.module, token).ok().as_ref() == Some(key))
         })
     }
 
@@ -915,10 +1223,16 @@ impl<'s> Interpreter<'s> {
             return None;
         }
         let intrinsic = match (type_name.as_str(), name) {
-            (t, "get_IsSupported") if t.starts_with("System.Runtime.Intrinsics.") => {
+            (t, "get_IsSupported")
+                if t.starts_with("System.Runtime.Intrinsics.X86.")
+                    || t.starts_with("System.Runtime.Intrinsics.Arm.")
+                    || t.starts_with("System.Runtime.Intrinsics.Wasm.") =>
+            {
                 Intrinsic::False
             }
-            (t, "get_IsHardwareAccelerated") if t.starts_with("System.Runtime.Intrinsics.") => {
+            (t, "get_IsHardwareAccelerated")
+                if t.starts_with("System.Runtime.Intrinsics.") || t == "System.Numerics.Vector" =>
+            {
                 Intrinsic::False
             }
             (t, "UsingResourceKeys") if t == "System.SR" || t.ends_with(".SR") => Intrinsic::False,
@@ -950,6 +1264,15 @@ impl<'s> Interpreter<'s> {
                 Intrinsic::StringConcat
             }
             ("System.Object", "MemberwiseClone") => Intrinsic::ObjectClone,
+            ("System.Array", "Copy" | "ConstrainedCopy")
+                if (parameters.len() == 3 || parameters.len() == 5) && parameters[0] == VarType::Ref =>
+            {
+                Intrinsic::ArrayCopy
+            }
+            ("System.Array", "Clear") if parameters.len() == 3 || parameters.len() == 1 => Intrinsic::ArrayClear,
+            ("System.Buffer", "BlockCopy") if parameters.len() == 5 => Intrinsic::BlockCopy,
+            ("Interop+BCrypt", "BCryptGenRandom") if parameters.len() == 4 => Intrinsic::RandomBytes,
+            ("System.Environment", "get_CurrentManagedThreadId") => Intrinsic::ThreadId,
             ("System.Threading.Interlocked", "Exchange")
                 if parameters.len() == 2 && parameters[0] == VarType::Pointer =>
             {
@@ -1024,6 +1347,149 @@ impl<'s> Interpreter<'s> {
             });
         }
         false
+    }
+
+    fn generic_native(&self, owner: TypeHandle, name: &str, ctx: &Ctx) -> Option<Native> {
+        let type_name = self.type_name(owner);
+        let intrinsic = match (type_name.as_str(), name) {
+            ("System.Runtime.CompilerServices.RuntimeHelpers", "IsReferenceOrContainsReferences")
+                if ctx.methods.len() == 1 =>
+            {
+                Intrinsic::ContainsReferences
+            }
+            ("System.Runtime.CompilerServices.RuntimeHelpers", "IsBitwiseEquatable")
+                if ctx.methods.len() == 1 =>
+            {
+                Intrinsic::BitwiseEquatable
+            }
+            ("System.Collections.Generic.EqualityComparer`1", "get_Default") => {
+                Intrinsic::DefaultEqualityComparer
+            }
+            ("System.Collections.Generic.Comparer`1", "get_Default") => Intrinsic::DefaultComparer,
+            ("System.Activator", "CreateInstance") if ctx.methods.len() == 1 => {
+                Intrinsic::CreateInstance
+            }
+            ("System.Object", "GetType") => Intrinsic::GetType,
+            ("System.Buffer", "Memmove") if ctx.methods.len() == 1 => Intrinsic::MemmoveElements,
+            ("System.Runtime.InteropServices.MemoryMarshal", "GetArrayDataReference") => Intrinsic::ArrayData,
+            ("System.Runtime.CompilerServices.Unsafe", _) => Intrinsic::Unsafe(self.unsafe_operation(name)?),
+            ("System.Runtime.CompilerServices.RuntimeHelpers", "CreateSpan") if ctx.methods.len() == 1 => {
+                Intrinsic::CreateSpan
+            }
+            ("System.Type" | "System.RuntimeType", "get_IsValueType" | "IsValueTypeImpl") => {
+                Intrinsic::TypeIsValueType
+            }
+            ("System.Type" | "System.RuntimeType", "get_IsEnum") => Intrinsic::TypeIsEnum,
+            _ => return None,
+        };
+        Some(Native::Intrinsic(intrinsic))
+    }
+
+    fn unsafe_operation(&self, name: &str) -> Option<UnsafeOp> {
+        Some(match name {
+            "As" | "AsRef" | "AsPointer" => UnsafeOp::Same,
+            "Add" => UnsafeOp::Add,
+            "AddByteOffset" => UnsafeOp::AddBytes,
+            "Subtract" => UnsafeOp::Subtract,
+            "SubtractByteOffset" => UnsafeOp::SubtractBytes,
+            "SizeOf" => UnsafeOp::SizeOf,
+            "Read" | "ReadUnaligned" => UnsafeOp::Read,
+            "Write" | "WriteUnaligned" => UnsafeOp::Write,
+            "Copy" => UnsafeOp::Copy,
+            "CopyBlock" | "CopyBlockUnaligned" => UnsafeOp::CopyBlock,
+            "InitBlock" | "InitBlockUnaligned" => UnsafeOp::InitBlock,
+            "AreSame" => UnsafeOp::AreSame,
+            "IsAddressGreaterThan" => UnsafeOp::Greater,
+            "IsAddressLessThan" => UnsafeOp::Less,
+            "ByteOffset" => UnsafeOp::ByteOffset,
+            "IsNullRef" => UnsafeOp::IsNull,
+            "NullRef" => UnsafeOp::Null,
+            "SkipInit" => UnsafeOp::Nothing,
+            "Unbox" => UnsafeOp::Unbox,
+            "BitCast" => UnsafeOp::BitCast,
+            _ => return None,
+        })
+    }
+
+    fn unsafe_element(&self, ctx: &Ctx, index: usize) -> Run<(Ty, u32)> {
+        let exact = ctx
+            .methods
+            .get(index)
+            .ok_or_else(|| Fault::Unsupported("unsafe operation without a type".into()))?;
+        let ty = self.gen_ty(exact)?;
+        let size = ty.size();
+        Ok((ty, size))
+    }
+
+    fn run_unsafe(&self, operation: UnsafeOp, a: &[V], ctx: &Ctx) -> Run<Option<V>> {
+        let base = |value: V| value.address() as i64;
+        Ok(Some(match operation {
+            UnsafeOp::Same => a[0],
+            UnsafeOp::Add => {
+                let size = i64::from(self.unsafe_element(ctx, 0)?.1);
+                V::P(base(a[0]).wrapping_add(a[1].int().wrapping_mul(size)) as u64)
+            }
+            UnsafeOp::AddBytes => V::P(base(a[0]).wrapping_add(a[1].int()) as u64),
+            UnsafeOp::Subtract => {
+                let size = i64::from(self.unsafe_element(ctx, 0)?.1);
+                V::P(base(a[0]).wrapping_sub(a[1].int().wrapping_mul(size)) as u64)
+            }
+            UnsafeOp::SubtractBytes => V::P(base(a[0]).wrapping_sub(a[1].int()) as u64),
+            UnsafeOp::SizeOf => V::I4(self.unsafe_element(ctx, 0)?.1 as i32),
+            UnsafeOp::Read => {
+                let (ty, _) = self.unsafe_element(ctx, 0)?;
+                self.read_value(a[0].address(), &ty, &[])?
+            }
+            UnsafeOp::Write => {
+                let (ty, _) = self.unsafe_element(ctx, 0)?;
+                self.write_value(a[0].address(), &ty, a[1])?;
+                return Ok(None);
+            }
+            UnsafeOp::Copy => {
+                let (_, size) = self.unsafe_element(ctx, 0)?;
+                unsafe {
+                    std::ptr::copy(a[1].address() as *const u8, a[0].address() as *mut u8, size as usize);
+                }
+                return Ok(None);
+            }
+            UnsafeOp::CopyBlock => {
+                unsafe {
+                    std::ptr::copy(
+                        a[1].address() as *const u8,
+                        a[0].address() as *mut u8,
+                        a[2].int() as u32 as usize,
+                    );
+                }
+                return Ok(None);
+            }
+            UnsafeOp::InitBlock => {
+                unsafe {
+                    std::ptr::write_bytes(a[0].address() as *mut u8, a[1].int() as u8, a[2].int() as u32 as usize);
+                }
+                return Ok(None);
+            }
+            UnsafeOp::AreSame => V::I4(i32::from(a[0].address() == a[1].address())),
+            UnsafeOp::Greater => V::I4(i32::from(a[0].address() > a[1].address())),
+            UnsafeOp::Less => V::I4(i32::from(a[0].address() < a[1].address())),
+            UnsafeOp::ByteOffset => V::I8(base(a[1]).wrapping_sub(base(a[0]))),
+            UnsafeOp::IsNull => V::I4(i32::from(a[0].address() == 0)),
+            UnsafeOp::Null => V::P(0),
+            UnsafeOp::Nothing => return Ok(None),
+            UnsafeOp::Unbox => V::P(self.non_null(a[0])? + 8),
+            UnsafeOp::BitCast => {
+                let (from, _) = self.unsafe_element(ctx, 0)?;
+                let (to, _) = self.unsafe_element(ctx, 1)?;
+                match (&from, &to) {
+                    (Ty::Prim(from), Ty::Prim(to)) => load_raw(*to, store_raw(*from, a[0])),
+                    _ => {
+                        let mut scratch = [0u64; 64];
+                        let address = scratch.as_mut_ptr() as u64;
+                        self.write_value(address, &from, a[0])?;
+                        self.read_value(address, &to, &[a[0]])?
+                    }
+                }
+            }
+        }))
     }
 
     fn delegate_native(&self, owner: TypeHandle, name: &str) -> Option<Native> {
@@ -1107,16 +1573,32 @@ impl<'s> Interpreter<'s> {
     }
 
     pub fn invoke(&self, key: &MethodKey, arguments: &[V]) -> Run<Option<V>> {
+        self.invoke_ctx(key, &Ctx::default(), arguments)
+    }
+
+    fn invoke_ctx(&self, key: &MethodKey, ctx: &Ctx, arguments: &[V]) -> Run<Option<V>> {
         let _pin = Pin::new(arguments);
-        let loaded = self.load(key)?;
+        let loaded = self.load_ctx(key, ctx)?;
         if arguments.len() != loaded.parameters.len() {
             return unsupported("argument count mismatch");
         }
         if let Some(native) = loaded.native {
+            if self.trace_calls {
+                let name = self.model.set.modules[key.module]
+                    .metadata
+                    .string_cell(TableId::MethodDef, key.row, 3)
+                    .unwrap_or("?");
+                eprintln!(
+                    "{}native {}::{name} {arguments:?}",
+                    " ".repeat(self.depth.get().min(60)),
+                    self.types.full_name(&loaded.owner_gen)
+                );
+            }
             return self.run_native(&loaded, native, arguments);
         }
         let image = self.image.get();
         if !image.is_null()
+            && ctx.is_empty()
             && prims(&loaded.parameters).is_some()
             && !matches!(loaded.returns, Some(Ty::Struct(_)))
             && let Some(outcome) = self.call_compiled(unsafe { &*image }, &loaded, arguments)
@@ -1145,7 +1627,8 @@ impl<'s> Interpreter<'s> {
 
     fn run_native(&self, loaded: &Loaded, native: Native, arguments: &[V]) -> Run<Option<V>> {
         match native {
-            Native::Intrinsic(intrinsic) => self.intrinsic(intrinsic, arguments),
+            Native::Intrinsic(intrinsic) => self.intrinsic(intrinsic, arguments, &loaded.ctx),
+            Native::StringConstructor => unsupported("string constructors are only reached through newobj"),
             Native::DelegateConstruct => {
                 let this = arguments[0].address();
                 let (target, function) = self.delegate_fields()?;
@@ -1167,15 +1650,16 @@ impl<'s> Interpreter<'s> {
                         *((this + function) as *const u64),
                     )
                 };
-                let key = decode_function(function)
+                let (key, ctx) = self
+                    .decode_function(function)
                     .ok_or_else(|| Fault::Unsupported("delegate to native code".into()))?;
-                let callee = self.load(&key)?;
+                let callee = self.load_ctx(&key, &ctx)?;
                 let mut forwarded = Vec::with_capacity(arguments.len());
                 if !callee.is_static {
                     forwarded.push(V::O(target));
                 }
                 forwarded.extend_from_slice(&arguments[1..]);
-                let result = self.invoke(&key, &forwarded)?;
+                let result = self.invoke_ctx(&key, &ctx, &forwarded)?;
                 Ok(result.map(|v| match &loaded.returns {
                     Some(Ty::Prim(var)) => coerce(v, *var),
                     _ => v,
@@ -1204,8 +1688,186 @@ impl<'s> Interpreter<'s> {
         }
     }
 
-    fn intrinsic(&self, intrinsic: Intrinsic, a: &[V]) -> Run<Option<V>> {
+    fn intrinsic(&self, intrinsic: Intrinsic, a: &[V], ctx: &Ctx) -> Run<Option<V>> {
         Ok(Some(match intrinsic {
+            Intrinsic::Unsafe(operation) => return self.run_unsafe(operation, a, ctx),
+            Intrinsic::ArrayData => V::P(self.non_null(a[0])? + u64::from(ARRAY_DATA)),
+            Intrinsic::ThreadId => V::I4(1),
+            Intrinsic::RandomBytes => {
+                use std::hash::{BuildHasher, Hasher};
+                let buffer = a[1].address() as *mut u8;
+                let length = a[2].int().max(0) as usize;
+                let state = std::collections::hash_map::RandomState::new();
+                for chunk in 0..length.div_ceil(8) {
+                    let mut hasher = state.build_hasher();
+                    hasher.write_usize(chunk);
+                    let bytes = hasher.finish().to_le_bytes();
+                    for (index, byte) in bytes.iter().enumerate() {
+                        let at = chunk * 8 + index;
+                        if at < length {
+                            unsafe { *buffer.add(at) = *byte };
+                        }
+                    }
+                }
+                V::I4(0)
+            }
+            Intrinsic::ArrayCopy => {
+                let (source, source_index, destination, destination_index, length) = if a.len() == 3 {
+                    (a[0].address(), 0, a[1].address(), 0, a[2].int())
+                } else {
+                    (a[0].address(), a[1].int(), a[2].address(), a[3].int(), a[4].int())
+                };
+                self.copy_array(source, source_index, destination, destination_index, length)?;
+                return Ok(None);
+            }
+            Intrinsic::ArrayClear => {
+                let array = a[0].address();
+                if array == 0 {
+                    return self.throw("ArgumentNullException");
+                }
+                let count = i64::from(unsafe { *((array + 8) as *const u32) });
+                let (index, length) = if a.len() == 3 { (a[1].int(), a[2].int()) } else { (0, count) };
+                if index < 0 || length < 0 || index + length > count {
+                    return self.throw("IndexOutOfRangeException");
+                }
+                let component = array_component(array);
+                unsafe {
+                    std::ptr::write_bytes(
+                        (array + u64::from(ARRAY_DATA) + index as u64 * component) as *mut u8,
+                        0,
+                        (length as u64 * component) as usize,
+                    );
+                }
+                return Ok(None);
+            }
+            Intrinsic::BlockCopy => {
+                let (source, destination) = (a[0].address(), a[2].address());
+                if source == 0 || destination == 0 {
+                    return self.throw("ArgumentNullException");
+                }
+                let bytes = |array: u64| -> i64 {
+                    i64::from(unsafe { *((array + 8) as *const u32) }) * array_component(array) as i64
+                };
+                let (source_offset, destination_offset, count) = (a[1].int(), a[3].int(), a[4].int());
+                if source_offset < 0 || destination_offset < 0 || count < 0 {
+                    return self.throw("ArgumentOutOfRangeException");
+                }
+                if source_offset + count > bytes(source) || destination_offset + count > bytes(destination) {
+                    return self.throw("ArgumentException");
+                }
+                unsafe {
+                    std::ptr::copy(
+                        (source + u64::from(ARRAY_DATA) + source_offset as u64) as *const u8,
+                        (destination + u64::from(ARRAY_DATA) + destination_offset as u64) as *mut u8,
+                        count as usize,
+                    );
+                }
+                return Ok(None);
+            }
+            Intrinsic::MemmoveElements => {
+                let size = self.gen_ty(&ctx.methods[0])?.size() as usize;
+                unsafe {
+                    std::ptr::copy(
+                        a[1].address() as *const u8,
+                        a[0].address() as *mut u8,
+                        a[2].int() as usize * size,
+                    );
+                }
+                return Ok(None);
+            }
+            Intrinsic::CreateSpan => {
+                let address = a[0].address();
+                let size = *self
+                    .rva_sizes
+                    .borrow()
+                    .get(&address)
+                    .ok_or_else(|| Fault::Unsupported("span data from an unknown field".into()))?;
+                let element = self.gen_ty(&ctx.methods[0])?.size();
+                let span = Gen::Named(
+                    map(self.types.core_handle("System.ReadOnlySpan`1"))?,
+                    Rc::from(vec![ctx.methods[0].clone()]),
+                );
+                let layout = self.layout_of(&span)?;
+                let metadata = &self.model.set.modules[layout.handle.module].metadata;
+                let boxed = self.allocate_box(&span)?;
+                for (row, offset) in &layout.fields {
+                    let target = boxed + 8 + u64::from(*offset);
+                    match metadata.string_cell(TableId::Field, *row, 1).ok() {
+                        Some("_reference") => unsafe { *(target as *mut u64) = address },
+                        Some("_length") => unsafe { *(target as *mut i32) = (size / element.max(1)) as i32 },
+                        _ => {}
+                    }
+                }
+                V::S(boxed)
+            }
+            Intrinsic::TypeFromHandle => match a[0] {
+                V::S(boxed) | V::O(boxed) if boxed != 0 => V::O(unsafe { *((boxed + 8) as *const u64) }),
+                _ => V::O(0),
+            },
+            Intrinsic::ContainsReferences => {
+                let argument = &ctx.methods[0];
+                V::I4(i32::from(match self.gen_ty(argument)? {
+                    Ty::Prim(VarType::Ref) => true,
+                    Ty::Struct(layout) => !layout.references.is_empty(),
+                    Ty::Prim(_) => false,
+                }))
+            }
+            Intrinsic::BitwiseEquatable => {
+                let argument = &ctx.methods[0];
+                let name = argument.handle().map(|h| self.type_name(h)).unwrap_or_default();
+                let enumeration = argument
+                    .handle()
+                    .is_some_and(|h| self.model.set.is_enum(h).unwrap_or(false));
+                V::I4(i32::from(
+                    enumeration
+                        || matches!(
+                            name.as_str(),
+                            "System.Boolean"
+                                | "System.Byte"
+                                | "System.SByte"
+                                | "System.Char"
+                                | "System.Int16"
+                                | "System.UInt16"
+                                | "System.Int32"
+                                | "System.UInt32"
+                                | "System.Int64"
+                                | "System.UInt64"
+                                | "System.IntPtr"
+                                | "System.UIntPtr"
+                        ),
+                ))
+            }
+            Intrinsic::DefaultEqualityComparer => V::O(self.default_comparer(&ctx.types[0], true)?),
+            Intrinsic::DefaultComparer => V::O(self.default_comparer(&ctx.types[0], false)?),
+            Intrinsic::CreateInstance => {
+                let target = ctx.methods[0].clone();
+                match self.gen_ty(&target)? {
+                    Ty::Prim(VarType::Ref) => V::O(self.construct_default(&target)?),
+                    Ty::Prim(var) => load_raw(var, 0),
+                    Ty::Struct(_) => V::S(self.allocate_box(&target)?),
+                }
+            }
+            Intrinsic::GetType => {
+                let object = self.non_null(a[0])?;
+                let exact = self.object_gen(object)?;
+                V::O(self.type_object(&exact)?)
+            }
+            Intrinsic::TypeIsValueType | Intrinsic::TypeIsEnum => {
+                let object = self.non_null(a[0])?;
+                let exact = self
+                    .object_types
+                    .borrow()
+                    .get(&object)
+                    .cloned()
+                    .ok_or_else(|| Fault::Unsupported("type object from outside the fallback".into()))?;
+                let result = match intrinsic {
+                    Intrinsic::TypeIsValueType => self.types.is_value_type(&exact),
+                    _ => exact
+                        .handle()
+                        .is_some_and(|h| self.model.set.is_enum(h).unwrap_or(false)),
+                };
+                V::I4(i32::from(result))
+            }
             Intrinsic::False => V::I4(0),
             Intrinsic::Math1(f) => V::F8(f(a[0].float())),
             Intrinsic::MathF1(f) => V::F4(f(a[0].float() as f32)),
@@ -1385,6 +2047,56 @@ impl<'s> Interpreter<'s> {
         table.get(key).cloned()
     }
 
+    fn copy_array(
+        &self,
+        source: u64,
+        source_index: i64,
+        destination: u64,
+        destination_index: i64,
+        length: i64,
+    ) -> Run<()> {
+        if source == 0 || destination == 0 {
+            return self.throw("ArgumentNullException");
+        }
+        let source_length = i64::from(unsafe { *((source + 8) as *const u32) });
+        let destination_length = i64::from(unsafe { *((destination + 8) as *const u32) });
+        if length < 0 || source_index < 0 || destination_index < 0 {
+            return self.throw("ArgumentOutOfRangeException");
+        }
+        if source_index + length > source_length || destination_index + length > destination_length {
+            return self.throw("ArgumentException");
+        }
+        let source_record = unsafe { *(source as *const u64) } & !1;
+        let destination_record = unsafe { *(destination as *const u64) } & !1;
+        let component = array_component(source);
+        let source_data = source + u64::from(ARRAY_DATA) + source_index as u64 * component;
+        let destination_data = destination + u64::from(ARRAY_DATA) + destination_index as u64 * component;
+        if source_record == destination_record {
+            unsafe {
+                std::ptr::copy(source_data as *const u8, destination_data as *mut u8, (length as u64 * component) as usize);
+            }
+            return Ok(());
+        }
+        let (Gen::SzArray(from), Gen::SzArray(to)) = (self.object_gen(source)?, self.object_gen(destination)?) else {
+            return unsupported("copies between multi dimensional arrays");
+        };
+        if self.types.is_value_type(&from) || self.types.is_value_type(&to) {
+            return self.throw("ArrayTypeMismatchException");
+        }
+        let items: Vec<u64> = (0..length as u64)
+            .map(|i| unsafe { *((source_data + 8 * i) as *const u64) })
+            .collect();
+        for item in &items {
+            if *item != 0 && !self.is_assignable(*item, &to) {
+                return self.throw("InvalidCastException");
+            }
+        }
+        unsafe {
+            std::ptr::copy(items.as_ptr(), destination_data as *mut u64, items.len());
+        }
+        Ok(())
+    }
+
     fn allocate_string(&self, length: usize) -> Run<u64> {
         let record = runtime::state().string_type;
         if record == 0 {
@@ -1405,6 +2117,45 @@ impl<'s> Interpreter<'s> {
             0 => self.throw("NullReferenceException"),
             address => Ok(address),
         }
+    }
+
+    fn ensure_initialized_gen(&self, owner: &Gen) -> Run<()> {
+        let Gen::Named(handle, arguments) = owner else {
+            return Ok(());
+        };
+        if arguments.is_empty() {
+            return self.ensure_initialized(*handle);
+        }
+        let id = self.types.id(owner);
+        match self.generic_init.borrow().get(&id) {
+            Some(None) => return Ok(()),
+            Some(Some(Some(reason))) => return unsupported(reason.clone()),
+            Some(Some(None)) => return self.throw("TypeInitializationException"),
+            None => {}
+        }
+        self.generic_init.borrow_mut().insert(id, None);
+        let metadata = &self.model.set.modules[handle.module].metadata;
+        let Ok(range) = metadata.method_range(handle.row) else {
+            return Ok(());
+        };
+        for row in range {
+            if metadata.string_cell(TableId::MethodDef, row, 3).ok() != Some(".cctor") {
+                continue;
+            }
+            let key = MethodKey { module: handle.module, row };
+            match self.invoke_ctx(&key, &owner.context(), &[]) {
+                Ok(_) => {}
+                Err(Fault::Unsupported(reason)) => {
+                    self.generic_init.borrow_mut().insert(id, Some(Some(reason.clone())));
+                    return unsupported(reason);
+                }
+                Err(Fault::Exception(_)) => {
+                    self.generic_init.borrow_mut().insert(id, Some(None));
+                    return self.throw("TypeInitializationException");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn ensure_initialized(&self, owner: TypeHandle) -> Run<()> {
@@ -1454,6 +2205,17 @@ impl<'s> Interpreter<'s> {
         }
         self.depth.set(depth + 1);
         self.interpreted.set(self.interpreted.get() + 1);
+        if self.trace_calls {
+            let name = self.model.set.modules[loaded.key.module]
+                .metadata
+                .string_cell(TableId::MethodDef, loaded.key.row, 3)
+                .unwrap_or("?");
+            eprintln!(
+                "{}{}::{name}",
+                " ".repeat(depth.min(60)),
+                self.types.full_name(&loaded.owner_gen)
+            );
+        }
         let mut kinds = loaded.parameters.clone();
         kinds.extend_from_slice(&loaded.locals);
         let mut offsets = Vec::with_capacity(kinds.len());
@@ -1611,67 +2373,60 @@ impl<'s> Interpreter<'s> {
     }
 
     fn catches(&self, method: &Loaded, token: u32, object: u64) -> Run<bool> {
-        let token = Token(token);
-        let handle = match self.model.set.resolve_type_token(method.key.module, token) {
-            Ok(handle) => handle,
-            Err(_) => return unsupported("catch type does not resolve"),
-        };
-        Ok(self.is_assignable(object, handle))
+        let target = map(self.types.resolve_token(method.key.module, Token(token), &method.ctx))?;
+        Ok(self.is_assignable(object, &target))
     }
 
-    fn is_assignable(&self, object: u64, target: TypeHandle) -> bool {
-        let Ok(class) = self.object_class(object) else {
+    fn is_assignable(&self, object: u64, target: &Gen) -> bool {
+        let Ok(exact) = self.object_gen(object) else {
             return false;
         };
-        let name = self.type_name(target);
-        if name == "System.Object" {
+        self.gen_assignable(&exact, target)
+    }
+
+    fn gen_assignable(&self, exact: &Gen, target: &Gen) -> bool {
+        if exact == target {
             return true;
         }
-        let mut current = Some(class);
-        let mut depth = 0;
-        while let Some(handle) = current {
-            if handle == target || self.implements(handle, target) {
-                return true;
-            }
-            depth += 1;
-            if depth > 64 {
-                break;
-            }
-            current = self.model.set.base_type(handle).ok().flatten();
+        if let Some(handle) = target.handle()
+            && self.type_name(handle) == "System.Object"
+        {
+            return true;
         }
-        false
+        if let (Gen::SzArray(element), Gen::SzArray(wanted)) = (exact, target) {
+            return element == wanted
+                || (!self.types.is_value_type(element)
+                    && !self.types.is_value_type(wanted)
+                    && self.gen_assignable(element, wanted));
+        }
+        if let Gen::SzArray(element) = exact
+            && let Gen::Named(handle, arguments) = target
+        {
+            let name = self.type_name(*handle);
+            if arguments.is_empty() {
+                return matches!(
+                    name.as_str(),
+                    "System.Array"
+                        | "System.ICloneable"
+                        | "System.Collections.IList"
+                        | "System.Collections.ICollection"
+                        | "System.Collections.IEnumerable"
+                        | "System.Collections.IStructuralComparable"
+                        | "System.Collections.IStructuralEquatable"
+                );
+            }
+            return arguments.len() == 1
+                && name.starts_with("System.Collections.Generic.I")
+                && (&arguments[0] == element.as_ref()
+                    || (!self.types.is_value_type(element) && self.gen_assignable(element, &arguments[0])));
+        }
+        self.types.ancestry(exact).iter().any(|g| g == target)
+            || self.types.all_interfaces(exact).iter().any(|g| g == target)
     }
 
-    fn implements(&self, handle: TypeHandle, interface: TypeHandle) -> bool {
-        let tokens = self.interface_tokens(handle);
-        for token in tokens {
-            if let Ok(found) = self.model.set.resolve_type_token(handle.module, token)
-                && (found == interface || self.implements(found, interface))
-            {
-                return true;
-            }
-        }
-        false
-    }
 
-    fn interface_tokens(&self, handle: TypeHandle) -> Vec<Token> {
-        let mut cache = self.interfaces.borrow_mut();
-        let index = cache.entry(handle.module).or_insert_with(|| {
-            let metadata = &self.model.set.modules[handle.module].metadata;
-            let mut index: HashMap<u32, Vec<Token>> = HashMap::new();
-            for row in 1..=metadata.rows(TableId::InterfaceImpl) {
-                if let (Ok(class), Ok(Some(interface))) = (
-                    metadata.cell(TableId::InterfaceImpl, row, 0),
-                    metadata.coded(TableId::InterfaceImpl, row, 1),
-                ) && interface.table() != Some(TableId::TypeSpec)
-                {
-                    index.entry(class).or_default().push(interface);
-                }
-            }
-            index
-        });
-        index.get(&handle.row).cloned().unwrap_or_default()
-    }
+
+
 
     fn method_token(&self, module: usize, token: Token) -> Run<MethodKey> {
         match token.table() {
@@ -1695,49 +2450,244 @@ impl<'s> Interpreter<'s> {
         }
     }
 
-    fn resolve_virtual(&self, key: &MethodKey, this: u64) -> Run<MethodKey> {
-        let record = unsafe { *(this as *const u64) } & !1;
-        if let Some(found) = self.implementations.borrow().get(&(record, key.clone())) {
+    fn method_inst(&self, module: usize, token: Token, ctx: &Ctx) -> Run<(MethodKey, Ctx)> {
+        let set = self.model.set;
+        match token.table() {
+            Some(TableId::MethodDef) => {
+                let key = MethodKey { module, row: token.row() };
+                let owner = map(self.model.method_owner(&key))?;
+                let count = self.types.parameter_count(TableId::TypeDef, owner.row, owner.module);
+                let types = if count > 0 && ctx.types.len() == count {
+                    ctx.types.clone()
+                } else {
+                    Rc::from(Vec::new())
+                };
+                Ok((key, Ctx { types, methods: Rc::from(Vec::new()) }))
+            }
+            Some(TableId::MemberRef) => {
+                let key = self.method_token(module, token)?;
+                let metadata = &set.modules[module].metadata;
+                let parent = metadata
+                    .coded(TableId::MemberRef, token.row(), 0)
+                    .map_err(|e| Fault::Unsupported(e.to_string()))?;
+                let mut types: Rc<[Gen]> = Rc::from(Vec::new());
+                if let Some(parent) = parent
+                    && parent.table() == Some(TableId::TypeSpec)
+                {
+                    let parent = map(self.types.resolve_token(module, parent, ctx))?;
+                    let owner = map(self.model.method_owner(&key))?;
+                    types = match self.types.instance_of(&parent, owner) {
+                        Some(found) => found.arguments(),
+                        None => parent.arguments(),
+                    };
+                }
+                Ok((key, Ctx { types, methods: Rc::from(Vec::new()) }))
+            }
+            Some(TableId::MethodSpec) => {
+                let metadata = &set.modules[module].metadata;
+                let method = metadata
+                    .coded(TableId::MethodSpec, token.row(), 0)
+                    .map_err(|e| Fault::Unsupported(e.to_string()))?
+                    .ok_or_else(|| Fault::Unsupported("method instantiation has no method".into()))?;
+                let (key, inner) = self.method_inst(module, method, ctx)?;
+                let blob = metadata
+                    .cell(TableId::MethodSpec, token.row(), 1)
+                    .and_then(|b| metadata.blob(b))
+                    .map_err(|e| Fault::Unsupported(e.to_string()))?;
+                let Ok(Signature::MethodSpec(arguments)) = Signature::parse(blob) else {
+                    return unsupported("method instantiation does not parse");
+                };
+                let methods = arguments
+                    .iter()
+                    .map(|a| self.types.resolve(module, a, ctx))
+                    .collect::<Result<Vec<_>, String>>()
+                    .map_err(Fault::Unsupported)?;
+                Ok((key, Ctx { types: inner.types, methods: Rc::from(methods) }))
+            }
+            _ => unsupported("method token"),
+        }
+    }
+
+    fn parameter_gens(&self, key: &MethodKey, ctx: &Ctx) -> Option<Vec<Gen>> {
+        let sig = self.model.method_sig(key).ok()?;
+        let mut methods = ctx.methods.to_vec();
+        while methods.len() < sig.generic_parameters as usize {
+            methods.push(Gen::Array(Rc::new(Gen::FunctionPointer), 1000 + methods.len() as u32));
+        }
+        let ctx = Ctx { types: ctx.types.clone(), methods: Rc::from(methods) };
+        let mut gens = Vec::with_capacity(sig.parameters.len() + 1);
+        gens.push(self.types.resolve(key.module, &sig.return_type, &ctx).ok()?);
+        for parameter in &sig.parameters {
+            gens.push(self.types.resolve(key.module, parameter, &ctx).ok()?);
+        }
+        Some(gens)
+    }
+
+    fn signatures_match(&self, a: &MethodKey, a_ctx: &Ctx, b: &MethodKey, b_ctx: &Ctx) -> bool {
+        let set = self.model.set;
+        let (Ok(a_sig), Ok(b_sig)) = (self.model.method_sig(a), self.model.method_sig(b)) else {
+            return false;
+        };
+        if a_sig.parameters.len() != b_sig.parameters.len()
+            || a_sig.generic_parameters != b_sig.generic_parameters
+        {
+            return false;
+        }
+        match (self.parameter_gens(a, a_ctx), self.parameter_gens(b, b_ctx)) {
+            (Some(x), Some(y)) => x == y,
+            _ => set.methods_equal(a.module, &a_sig, b.module, &b_sig).unwrap_or(false),
+        }
+    }
+
+    fn vtable_of(&self, exact: &Gen) -> Run<Rc<VTable>> {
+        let id = self.types.id(exact);
+        if let Some(found) = self.vtables.borrow().get(&id) {
             return Ok(found.clone());
         }
-        let class = self.object_class(this)?;
+        let Gen::Named(handle, _) = exact else {
+            return unsupported("virtual table of a non class");
+        };
+        let mut table = match map(self.types.base(exact))? {
+            Some(base) if !self.types.is_value_type(exact) => {
+                let base = self.vtable_of(&base)?;
+                VTable {
+                    slots: base.slots.clone(),
+                    slot_of: base.slot_of.clone(),
+                }
+            }
+            _ => VTable {
+                slots: Vec::new(),
+                slot_of: HashMap::new(),
+            },
+        };
+        let metadata = &self.model.set.modules[handle.module].metadata;
+        let ctx = exact.context();
+        let range = metadata
+            .method_range(handle.row)
+            .map_err(|e| Fault::Unsupported(e.to_string()))?;
+        for row in range {
+            let key = MethodKey { module: handle.module, row };
+            let flags = metadata.cell(TableId::MethodDef, row, 2).unwrap_or(0);
+            if flags & VIRTUAL == 0 {
+                continue;
+            }
+            let name = metadata.string_cell(TableId::MethodDef, row, 3).unwrap_or("");
+            let mut assigned = None;
+            if flags & 0x100 == 0 {
+                for (slot, existing) in table.slots.iter().enumerate().rev() {
+                    let Some((existing, owner)) = existing else { continue };
+                    if self.model.set.modules[existing.module]
+                        .metadata
+                        .string_cell(TableId::MethodDef, existing.row, 3)
+                        .ok()
+                        != Some(name)
+                    {
+                        continue;
+                    }
+                    if self.signatures_match(&key, &ctx, existing, &owner.context()) {
+                        assigned = Some(slot);
+                        break;
+                    }
+                }
+            }
+            let slot = match assigned {
+                Some(slot) => {
+                    table.slots[slot] = Some((key.clone(), exact.clone()));
+                    slot
+                }
+                None => {
+                    table.slots.push(Some((key.clone(), exact.clone())));
+                    table.slots.len() - 1
+                }
+            };
+            table.slot_of.insert(key, slot);
+        }
+        for row in 1..=metadata.rows(TableId::MethodImpl) {
+            if metadata.cell(TableId::MethodImpl, row, 0).ok() != Some(handle.row) {
+                continue;
+            }
+            let (Ok(Some(body)), Ok(Some(declaration))) = (
+                metadata.coded(TableId::MethodImpl, row, 1),
+                metadata.coded(TableId::MethodImpl, row, 2),
+            ) else {
+                continue;
+            };
+            let (Ok((body, _)), Ok((declaration, _))) = (
+                self.method_inst(handle.module, body, &ctx),
+                self.method_inst(handle.module, declaration, &ctx),
+            ) else {
+                continue;
+            };
+            if let Some(&slot) = table.slot_of.get(&declaration) {
+                table.slots[slot] = Some((body.clone(), exact.clone()));
+                table.slot_of.insert(body, slot);
+            }
+        }
+        let table = Rc::new(table);
+        self.vtables.borrow_mut().insert(id, table.clone());
+        Ok(table)
+    }
+
+    fn owner_context(&self, exact: &Gen, owner: TypeHandle, methods: &Rc<[Gen]>) -> Ctx {
+        let types = self
+            .types
+            .instance_of(exact, owner)
+            .map(|g| g.arguments())
+            .unwrap_or_else(|| Rc::from(Vec::new()));
+        Ctx { types, methods: methods.clone() }
+    }
+
+    fn resolve_virtual(&self, key: &MethodKey, ctx: &Ctx, this: u64) -> Run<(MethodKey, Ctx)> {
+        let record = unsafe { *(this as *const u64) } & !1;
+        let inst = self.inst_key(key, ctx);
+        if let Some(found) = self.implementations.borrow().get(&(record, inst.clone())) {
+            return Ok(found.clone());
+        }
+        let exact = self.object_gen(this)?;
         let owner = map(self.model.method_owner(key))?;
-        let owner_info = map(self.model.class(owner))?;
-        let found = if owner_info.is_interface {
-            self.find_interface_implementation(class, key)?
+        let owner_flags = self.model.set.modules[owner.module]
+            .metadata
+            .cell(TableId::TypeDef, owner.row, 0)
+            .unwrap_or(0);
+        let class = match &exact {
+            Gen::Named(_, _) => exact.clone(),
+            _ => map(self.types.core("Array"))?,
+        };
+        let found = if owner_flags & 0x20 != 0 {
+            self.find_interface_implementation(&class, key, ctx)?
         } else {
-            let slot = map(self.model.virtual_slot(key))?;
-            let info = map(self.model.class(class))?;
-            info.vtable
-                .get(slot)
-                .cloned()
-                .flatten()
-                .ok_or_else(|| Fault::Unsupported("virtual slot is empty".into()))?
+            let table = self.vtable_of(&class)?;
+            let slot = *table
+                .slot_of
+                .get(key)
+                .ok_or_else(|| Fault::Unsupported("method has no virtual slot".into()))?;
+            let (target, declaring) = table.slots[slot]
+                .clone()
+                .ok_or_else(|| Fault::Unsupported("virtual slot is empty".into()))?;
+            let target_owner = map(self.model.method_owner(&target))?;
+            let mut context = self.owner_context(&declaring, target_owner, &ctx.methods);
+            if context.types.is_empty() {
+                context = self.owner_context(&class, target_owner, &ctx.methods);
+            }
+            (target, context)
         };
         self.implementations
             .borrow_mut()
-            .insert((record, key.clone()), found.clone());
+            .insert((record, inst), found.clone());
         Ok(found)
     }
 
-    fn find_interface_implementation(&self, class: TypeHandle, key: &MethodKey) -> Run<MethodKey> {
+    fn find_interface_implementation(&self, class: &Gen, key: &MethodKey, ctx: &Ctx) -> Run<(MethodKey, Ctx)> {
         let set = self.model.set;
         let name = set.modules[key.module]
             .metadata
             .string_cell(TableId::MethodDef, key.row, 3)
             .unwrap_or("");
-        let sig = map(self.model.method_sig(key))?;
-        let mut chain = Vec::new();
-        let mut current = Some(class);
-        while let Some(handle) = current {
-            chain.push(handle);
-            if chain.len() > 64 {
-                break;
-            }
-            current = set.base_type(handle).ok().flatten();
-        }
-        for handle in &chain {
+        let chain = self.types.ancestry(class);
+        for exact in &chain {
+            let Some(handle) = exact.handle() else { continue };
             let metadata = &set.modules[handle.module].metadata;
+            let type_ctx = exact.context();
             for row in 1..=metadata.rows(TableId::MethodImpl) {
                 if metadata.cell(TableId::MethodImpl, row, 0).ok() != Some(handle.row) {
                     continue;
@@ -1748,38 +2698,36 @@ impl<'s> Interpreter<'s> {
                 ) else {
                     continue;
                 };
-                if self.model.method_key(handle.module, declaration).as_ref() == Some(key)
-                    && let Some(body) = self.model.method_key(handle.module, body)
-                {
-                    return Ok(body);
+                let Ok((declared, declared_ctx)) = self.method_inst(handle.module, declaration, &type_ctx) else {
+                    continue;
+                };
+                if &declared != key || (!ctx.types.is_empty() && declared_ctx.types != ctx.types) {
+                    continue;
+                }
+                if let Ok((body, _)) = self.method_inst(handle.module, body, &type_ctx) {
+                    let owner = map(self.model.method_owner(&body))?;
+                    return Ok((body, self.owner_context(exact, owner, &ctx.methods)));
                 }
             }
         }
-        for handle in &chain {
+        for exact in &chain {
+            let Some(handle) = exact.handle() else { continue };
             let metadata = &set.modules[handle.module].metadata;
             let Ok(range) = metadata.method_range(handle.row) else {
                 continue;
             };
+            let type_ctx = Ctx { types: exact.arguments(), methods: ctx.methods.clone() };
             for row in range {
                 if metadata.string_cell(TableId::MethodDef, row, 3).ok() != Some(name) {
                     continue;
                 }
-                let candidate = MethodKey {
-                    module: handle.module,
-                    row,
-                };
                 let flags = metadata.cell(TableId::MethodDef, row, 2).unwrap_or(0);
                 if flags & VIRTUAL == 0 {
                     continue;
                 }
-                let Ok(candidate_sig) = self.model.method_sig(&candidate) else {
-                    continue;
-                };
-                if set
-                    .methods_equal(handle.module, &candidate_sig, key.module, &sig)
-                    .unwrap_or(false)
-                {
-                    return Ok(candidate);
+                let candidate = MethodKey { module: handle.module, row };
+                if self.signatures_match(&candidate, &type_ctx, key, ctx) {
+                    return Ok((candidate, type_ctx));
                 }
             }
         }
@@ -1788,52 +2736,86 @@ impl<'s> Interpreter<'s> {
             .cell(TableId::MethodDef, key.row, 2)
             .unwrap_or(0);
         if flags & ABSTRACT == 0 {
-            return Ok(key.clone());
+            return Ok((key.clone(), ctx.clone()));
         }
         unsupported("interface method has no implementation")
     }
 
-    fn field_ref(&self, module: usize, token: Token) -> Run<Rc<FieldRef>> {
-        if let Some(found) = self.fields.borrow().get(&(module, token.0)) {
+    fn field_ref(&self, module: usize, token: Token, ctx: &Ctx) -> Run<Rc<FieldRef>> {
+        let cache_key = (
+            module,
+            token.0,
+            ctx.types.iter().map(|g| self.types.id(g)).collect::<Vec<_>>(),
+            ctx.methods.iter().map(|g| self.types.id(g)).collect::<Vec<_>>(),
+        );
+        if let Some(found) = self.fields.borrow().get(&cache_key) {
             return Ok(found.clone());
         }
         let set = self.model.set;
-        let (field_module, row) = match token.table() {
-            Some(TableId::Field) => (module, token.row()),
-            Some(TableId::MemberRef) => match set.resolve_member_ref(module, token.row()) {
-                Ok(Member::Field(handle)) => (handle.module, handle.token.row()),
-                Ok(_) => return unsupported("member reference is not a field"),
-                Err(error) => return unsupported(format!("field does not resolve: {error:?}")),
-            },
+        let (field_module, row, parent) = match token.table() {
+            Some(TableId::Field) => (module, token.row(), None),
+            Some(TableId::MemberRef) => {
+                let parent = set.modules[module]
+                    .metadata
+                    .coded(TableId::MemberRef, token.row(), 0)
+                    .ok()
+                    .flatten()
+                    .filter(|p| p.table() == Some(TableId::TypeSpec));
+                match set.resolve_member_ref(module, token.row()) {
+                    Ok(Member::Field(handle)) => (handle.module, handle.token.row(), parent),
+                    Ok(_) => return unsupported("member reference is not a field"),
+                    Err(error) => return unsupported(format!("field does not resolve: {error:?}")),
+                }
+            }
             _ => return unsupported("token is not a field"),
+        };
+        let handle = set.modules[field_module]
+            .field_owner(row)
+            .ok()
+            .flatten()
+            .map(|owner| TypeHandle { module: field_module, row: owner })
+            .ok_or_else(|| Fault::Unsupported("field has no owner".into()))?;
+        let owner = match parent {
+            Some(parent) => {
+                let parent = map(self.types.resolve_token(module, parent, ctx))?;
+                self.types
+                    .instance_of(&parent, handle)
+                    .unwrap_or(parent)
+            }
+            None => {
+                let count = self.types.parameter_count(TableId::TypeDef, handle.row, handle.module);
+                if count > 0 && ctx.types.len() == count {
+                    Gen::Named(handle, ctx.types.clone())
+                } else {
+                    Gen::Named(handle, Rc::from(Vec::new()))
+                }
+            }
         };
         let metadata = &set.modules[field_module].metadata;
         let flags = metadata.cell(TableId::Field, row, 0).unwrap_or(0);
         let sig = map(self.model.field_signature(field_module, row))?;
-        let ty = self.ty_of(field_module, &sig)?;
-        let owner = set.modules[field_module]
-            .field_owner(row)
-            .ok()
-            .flatten()
-            .map(|owner| TypeHandle {
-                module: field_module,
-                row: owner,
-            })
-            .ok_or_else(|| Fault::Unsupported("field has no owner".into()))?;
+        let ty = self.ty_of(field_module, &sig, &owner.context())?;
         let is_static = flags & 0x10 != 0;
-        let owner_is_value = set.is_value_type(owner).unwrap_or(false);
+        let owner_is_value = set.is_value_type(handle).unwrap_or(false);
         let offset = if is_static {
             0
         } else if owner_is_value {
             u64::from(
-                *map(self.model.struct_layout(owner))?
+                *self
+                    .layout_of(&owner)?
                     .fields
                     .get(&row)
                     .ok_or_else(|| Fault::Unsupported("value type field".into()))?,
             )
         } else {
+            let arguments = owner
+                .arguments()
+                .iter()
+                .map(|a| self.types.layout_argument(a))
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(Fault::Unsupported)?;
             let (_, placements) = set
-                .class_fields(owner)
+                .class_fields_with(handle, &arguments)
                 .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
             u64::from(
                 placements
@@ -1853,17 +2835,32 @@ impl<'s> Interpreter<'s> {
             ty,
             offset,
         });
-        self.fields.borrow_mut().insert((module, token.0), found.clone());
+        self.fields.borrow_mut().insert(cache_key, found.clone());
         Ok(found)
     }
 
     fn field_address(&self, method: &Loaded, token: Token, target: V) -> Run<(u64, Ty)> {
-        let field = self.field_ref(method.key.module, token)?;
+        let field = self.field_ref(method.key.module, token, &method.ctx)?;
         if field.is_static {
-            self.ensure_initialized(field.owner)?;
+            self.ensure_initialized_gen(&field.owner)?;
             let state = runtime::state();
+            let generic = !field.owner.arguments().is_empty();
             let address = if field.has_rva {
                 map(runtime::rva_data(self.model.set, field.module, field.row))?
+            } else if generic {
+                let id = self.types.id(&field.owner);
+                match &field.ty {
+                    Ty::Prim(var) => state.exact_static(
+                        id,
+                        field.module,
+                        field.row,
+                        8,
+                        if *var == VarType::Ref { &[0] } else { &[] },
+                    ),
+                    Ty::Struct(layout) => {
+                        state.exact_static(id, field.module, field.row, layout.size, &layout.references)
+                    }
+                }
             } else {
                 match &field.ty {
                     Ty::Prim(var) => state.static_slot(self.model, field.module, field.row, *var == VarType::Ref),
@@ -1890,98 +2887,20 @@ impl<'s> Interpreter<'s> {
         Ok((base + field.offset, field.ty.clone()))
     }
 
-    fn type_ty(&self, module: usize, token: Token) -> Run<(Ty, Option<TypeHandle>)> {
-        match token.table() {
-            Some(TableId::TypeSpec) => {
-                let metadata = &self.model.set.modules[module].metadata;
-                let sig = metadata
-                    .cell(TableId::TypeSpec, token.row(), 0)
-                    .and_then(|b| metadata.blob(b))
-                    .and_then(Signature::parse_type)
-                    .map_err(|e| Fault::Unsupported(e.to_string()))?;
-                Ok((self.ty_of(module, &sig)?, None))
-            }
-            _ => {
-                let handle = self
-                    .model
-                    .set
-                    .resolve_type_token(module, token)
-                    .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
-                Ok((self.value_ty(handle)?, Some(handle)))
-            }
-        }
+    fn type_ty(&self, module: usize, token: Token, ctx: &Ctx) -> Run<(Ty, Gen)> {
+        let exact = map(self.types.resolve_token(module, token, ctx))?;
+        Ok((self.gen_ty(&exact)?, exact))
     }
 
-    fn array_type(&self, module: usize, token: Token) -> Run<(RuntimeType, Ty, u32)> {
-        if let Ok(kind) = self.model.element_kind(module, token) {
-            return Ok((RuntimeType::Array(kind), Ty::Prim(kind.var()), kind.size()));
-        }
-        match self.type_ty(module, token)? {
-            (Ty::Struct(layout), _) => Ok((
-                RuntimeType::ValueArray(layout.handle),
-                Ty::Struct(layout.clone()),
-                layout.size,
-            )),
-            _ => unsupported("array element type"),
-        }
+    fn array_type(&self, module: usize, token: Token, ctx: &Ctx) -> Run<(u64, Ty, u32)> {
+        let element = map(self.types.resolve_token(module, token, ctx))?;
+        let (ty, size) = self.element_size(&element)?;
+        Ok((self.array_record(&element)?, ty, size))
     }
 
-    fn cast_target(&self, module: usize, token: Token) -> Run<CastTarget> {
-        if token.table() == Some(TableId::TypeSpec) {
-            let metadata = &self.model.set.modules[module].metadata;
-            let sig = metadata
-                .cell(TableId::TypeSpec, token.row(), 0)
-                .and_then(|b| metadata.blob(b))
-                .and_then(Signature::parse_type)
-                .map_err(|e| Fault::Unsupported(e.to_string()))?;
-            return match sig {
-                TypeSig::SzArray(inner) => {
-                    let kind = match self.model.var_type(module, &inner) {
-                        Ok(Some(var)) => ElementKind::from_var(var),
-                        _ => None,
-                    };
-                    match kind {
-                        Some(kind) => Ok(CastTarget::Array(kind)),
-                        None => unsupported("cast to a struct array"),
-                    }
-                }
-                _ => unsupported("cast to a generic instantiation"),
-            };
-        }
-        let handle = self
-            .model
-            .set
-            .resolve_type_token(module, token)
-            .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
-        Ok(CastTarget::Type(handle))
-    }
 
-    fn matches_cast(&self, object: u64, target: &CastTarget) -> Run<bool> {
-        Ok(match target {
-            CastTarget::Type(handle) => {
-                let name = self.type_name(*handle);
-                let record = unsafe { *(object as *const u64) } & !1;
-                let flags = unsafe { *((record + 8) as *const u64) };
-                if flags & runtime::FLAG_ARRAY != 0 {
-                    matches!(
-                        name.as_str(),
-                        "System.Object"
-                            | "System.Array"
-                            | "System.ICloneable"
-                            | "System.Collections.IList"
-                            | "System.Collections.ICollection"
-                            | "System.Collections.IEnumerable"
-                    )
-                } else {
-                    self.is_assignable(object, *handle)
-                }
-            }
-            CastTarget::Array(kind) => {
-                let record = unsafe { *(object as *const u64) } & !1;
-                record == self.record(RuntimeType::Array(*kind))?
-            }
-        })
-    }
+
+
 
     fn step_block(
         &self,
@@ -2200,13 +3119,13 @@ impl<'s> Interpreter<'s> {
                     let Argument::Token(token) = argument else {
                         return unsupported("call token");
                     };
-                    let key = self.method_token(module, token)?;
-                    let callee = self.load(&key)?;
+                    let (key, call_ctx) = self.method_inst(module, token, &method.ctx)?;
+                    let callee = self.load_ctx(&key, &call_ctx)?;
                     if opcode == 0x73 {
                         self.construct(frame, &callee)?;
                     } else {
-                        if callee.is_static {
-                            self.ensure_initialized(callee.owner)?;
+                        if callee.is_static && callee.native.is_none() {
+                            self.ensure_initialized_gen(&callee.owner_gen)?;
                         }
                         let count = callee.parameters.len();
                         if frame.stack.len() < count {
@@ -2214,17 +3133,38 @@ impl<'s> Interpreter<'s> {
                         }
                         let mut arguments: Vec<V> = frame.stack.split_off(frame.stack.len() - count);
                         let _pin = Pin::new(&arguments);
-                        let mut target = key.clone();
+                        let mut target = (key.clone(), call_ctx.clone());
+                        let mut resolved = false;
                         if let Some(prefix) = constrained.take() {
-                            let (ty, handle) = self.type_ty(module, prefix)?;
-                            if matches!(ty, Ty::Prim(VarType::Ref)) {
+                            let (ty, exact) = self.type_ty(module, prefix, &method.ctx)?;
+                            if callee.is_static {
+                                target = match self.find_value_override(&exact, &key, &call_ctx, false)? {
+                                    Some(found) => found,
+                                    None if !callee.is_abstract => (key.clone(), call_ctx.clone()),
+                                    None => {
+                                        let name = self.model.set.modules[key.module]
+                                            .metadata
+                                            .string_cell(TableId::MethodDef, key.row, 3)
+                                            .unwrap_or("?");
+                                        return unsupported(format!(
+                                            "static virtual {}::{name} has no implementation on {}",
+                                            self.types.full_name(&callee.owner_gen),
+                                            self.types.full_name(&exact)
+                                        ));
+                                    }
+                                };
+                                resolved = true;
+                            } else if matches!(ty, Ty::Prim(VarType::Ref)) {
                                 arguments[0] = V::O(read(arguments[0].address(), VarType::Ref).address());
-                            } else if let Some(handle) = handle {
-                                match self.find_value_override(handle, &key)? {
-                                    Some(found) => target = found,
+                            } else {
+                                match self.find_value_override(&exact, &key, &call_ctx, true)? {
+                                    Some(found) => {
+                                        target = found;
+                                        resolved = true;
+                                    }
                                     None => {
                                         let value = self.read_value(arguments[0].address(), &ty, &[])?;
-                                        let boxed = self.box_any(handle, &ty, value)?;
+                                        let boxed = self.box_any(&exact, &ty, value)?;
                                         arguments[0] = V::O(boxed);
                                     }
                                 }
@@ -2232,16 +3172,17 @@ impl<'s> Interpreter<'s> {
                         }
                         if opcode == 0x6F
                             && !callee.is_static
+                            && !resolved
                             && let V::O(this) = arguments[0]
                         {
                             if this == 0 {
                                 return self.throw("NullReferenceException");
                             }
-                            if callee.is_virtual && target == key {
-                                target = self.resolve_virtual(&key, this)?;
+                            if callee.is_virtual {
+                                target = self.resolve_virtual(&key, &call_ctx, this)?;
                             }
                         }
-                        let result = self.invoke(&target, &arguments)?;
+                        let result = self.invoke_ctx(&target.0, &target.1, &arguments)?;
                         if let Some(value) = result {
                             frame.stack.push(value);
                         }
@@ -2255,8 +3196,8 @@ impl<'s> Interpreter<'s> {
                     };
                     let value = pop!();
                     let object = value.address();
-                    let target = self.cast_target(module, token)?;
-                    let ok = object == 0 || self.matches_cast(object, &target)?;
+                    let target = map(self.types.resolve_token(module, token, &method.ctx))?;
+                    let ok = object == 0 || self.is_assignable(object, &target);
                     if ok {
                         frame.stack.push(V::O(object));
                     } else if opcode == 0x75 {
@@ -2307,8 +3248,9 @@ impl<'s> Interpreter<'s> {
                     let Argument::Token(token) = argument else {
                         return unsupported("type token");
                     };
-                    let (ty, handle) = self.type_ty(module, token)?;
+                    let (ty, exact) = self.type_ty(module, token, &method.ctx)?;
                     let is_reference = matches!(ty, Ty::Prim(VarType::Ref));
+                    let nullable = self.nullable_argument(&exact);
                     match opcode {
                         0x71 => {
                             let address = pop!().address();
@@ -2345,9 +3287,11 @@ impl<'s> Interpreter<'s> {
                             let value = pop!();
                             if is_reference {
                                 frame.stack.push(value);
+                            } else if let Some(inner) = &nullable {
+                                let boxed = self.box_nullable(&exact, inner, value)?;
+                                frame.stack.push(V::O(boxed));
                             } else {
-                                let handle = handle.ok_or_else(|| Fault::Unsupported("box of a generic instantiation".into()))?;
-                                let boxed = self.box_any(handle, &ty, value)?;
+                                let boxed = self.box_any(&exact, &ty, value)?;
                                 frame.stack.push(V::O(boxed));
                             }
                         }
@@ -2357,17 +3301,20 @@ impl<'s> Interpreter<'s> {
                                 if opcode == 0x79 {
                                     return unsupported("unbox of a reference type");
                                 }
-                                let target = self.cast_target(module, token)?;
-                                if object != 0 && !self.matches_cast(object, &target)? {
+                                if object != 0 && !self.is_assignable(object, &exact) {
                                     return self.throw("InvalidCastException");
                                 }
                                 frame.stack.push(V::O(object));
+                            } else if let Some(inner) = &nullable
+                                && opcode == 0xA5
+                            {
+                                let value = self.unbox_nullable(&exact, inner, object)?;
+                                frame.stack.push(value);
                             } else {
                                 if object == 0 {
                                     return self.throw("NullReferenceException");
                                 }
-                                let handle = handle.ok_or_else(|| Fault::Unsupported("unbox of a generic instantiation".into()))?;
-                                if !self.unbox_compatible(object, handle)? {
+                                if !self.unbox_compatible(object, &exact)? {
                                     return self.throw("InvalidCastException");
                                 }
                                 let value = if opcode == 0x79 {
@@ -2384,12 +3331,11 @@ impl<'s> Interpreter<'s> {
                     let Argument::Token(token) = argument else {
                         return unsupported("array token");
                     };
-                    let (kind, _, _) = self.array_type(module, token)?;
+                    let (record, _, _) = self.array_type(module, token, &method.ctx)?;
                     let count = pop!().int();
                     if count < 0 {
                         return self.throw("OverflowException");
                     }
-                    let record = self.record(kind)?;
                     let array = runtime::allocate_managed(record, count as u64);
                     if array == 0 {
                         return self.throw("OutOfMemoryException");
@@ -2422,7 +3368,7 @@ impl<'s> Interpreter<'s> {
                             let Argument::Token(token) = argument else {
                                 return unsupported("element token");
                             };
-                            let (_, ty, size) = self.array_type(module, token)?;
+                            let (_, ty, size) = self.array_type(module, token, &method.ctx)?;
                             (ty, size)
                         }
                     };
@@ -2453,7 +3399,7 @@ impl<'s> Interpreter<'s> {
                             let Argument::Token(token) = argument else {
                                 return unsupported("element token");
                             };
-                            let (_, ty, size) = self.array_type(module, token)?;
+                            let (_, ty, size) = self.array_type(module, token, &method.ctx)?;
                             (ty, size)
                         }
                     };
@@ -2468,11 +3414,20 @@ impl<'s> Interpreter<'s> {
                         return unsupported("token");
                     };
                     match token.table() {
-                        Some(TableId::Field) | Some(TableId::MemberRef) => {
-                            let field = self.field_ref(module, token)?;
+                        Some(TableId::TypeDef) | Some(TableId::TypeRef) | Some(TableId::TypeSpec) => {
+                            let exact = map(self.types.resolve_token(module, token, &method.ctx))?;
+                            let handle = self.type_handle_value(&exact)?;
+                            frame.stack.push(handle);
+                        }
+                        Some(TableId::Field) | Some(TableId::MemberRef)
+                            if self.field_ref(module, token, &method.ctx).is_ok() =>
+                        {
+                            let field = self.field_ref(module, token, &method.ctx)?;
                             if !field.has_rva {
                                 return unsupported("field handles");
                             }
+                            let address = map(runtime::rva_data(self.model.set, field.module, field.row))?;
+                            self.rva_sizes.borrow_mut().insert(address, field.ty.size());
                             frame.stack.push(V::P(map(runtime::rva_data(self.model.set, field.module, field.row))?));
                         }
                         _ => return unsupported("type and method handles"),
@@ -2482,18 +3437,19 @@ impl<'s> Interpreter<'s> {
                     let Argument::Token(token) = argument else {
                         return unsupported("function token");
                     };
-                    let mut key = self.method_token(module, token)?;
+                    let (mut key, mut call_ctx) = self.method_inst(module, token, &method.ctx)?;
                     if opcode == 0xFE07 {
                         let this = pop!().address();
                         if this == 0 {
                             return self.throw("NullReferenceException");
                         }
-                        let callee = self.load(&key)?;
+                        let callee = self.load_ctx(&key, &call_ctx)?;
                         if callee.is_virtual {
-                            key = self.resolve_virtual(&key, this)?;
+                            (key, call_ctx) = self.resolve_virtual(&key, &call_ctx, this)?;
                         }
                     }
-                    frame.stack.push(V::I8(encode_function(&key) as i64));
+                    let encoded = self.encode_function(&key, &call_ctx);
+                    frame.stack.push(V::I8(encoded as i64));
                 }
                 0xDC => return Ok(Exit::EndFinally),
                 0xFE11 => {
@@ -2537,17 +3493,18 @@ impl<'s> Interpreter<'s> {
     }
 
     fn construct(&self, frame: &mut Frame, callee: &Loaded) -> Run<()> {
-        let owner = callee.owner;
+        let owner = callee.owner_gen.clone();
         let set = self.model.set;
-        if set.is_value_type(owner).unwrap_or(false) {
-            let count = callee.parameters.len() - 1;
-            if frame.stack.len() < count {
-                return unsupported("evaluation stack underflow");
-            }
-            let ty = self.value_ty(owner)?;
+        let count = callee.parameters.len() - 1;
+        if frame.stack.len() < count {
+            return unsupported("evaluation stack underflow");
+        }
+        self.ensure_initialized_gen(&owner)?;
+        if set.is_value_type(callee.owner).unwrap_or(false) {
+            let ty = self.gen_ty(&owner)?;
             let (storage, value) = match &ty {
                 Ty::Struct(_) => {
-                    let boxed = self.allocate_box(owner)?;
+                    let boxed = self.allocate_box(&owner)?;
                     (boxed + 8, Some(V::S(boxed)))
                 }
                 Ty::Prim(_) => {
@@ -2562,26 +3519,52 @@ impl<'s> Interpreter<'s> {
             if let Some(value) = value {
                 frame.stack.push(value);
             }
-            self.invoke(&callee.key, &arguments)?;
+            self.invoke_ctx(&callee.key, &callee.ctx, &arguments)?;
             if let Ty::Prim(var) = ty {
                 frame.stack.push(read(storage, var));
             }
             return Ok(());
         }
-        let name = self.type_name(owner);
+        let name = self.type_name(callee.owner);
         if name == "System.String" {
-            return unsupported("string constructors");
+            let wanted = self
+                .parameter_gens(&callee.key, &callee.ctx)
+                .ok_or_else(|| Fault::Unsupported("string constructor signature".into()))?;
+            let metadata = &set.modules[callee.owner.module].metadata;
+            let range = metadata
+                .method_range(callee.owner.row)
+                .map_err(|e| Fault::Unsupported(e.to_string()))?;
+            for row in range {
+                if metadata.string_cell(TableId::MethodDef, row, 3).ok() != Some("Ctor") {
+                    continue;
+                }
+                let candidate = MethodKey { module: callee.owner.module, row };
+                let Some(found) = self.parameter_gens(&candidate, &Ctx::default()) else {
+                    continue;
+                };
+                if found.len() != wanted.len() || found[1..] != wanted[1..] {
+                    continue;
+                }
+                let helper = self.load(&candidate)?;
+                let mut arguments: Vec<V> = Vec::new();
+                if !helper.is_static {
+                    arguments.push(V::O(0));
+                }
+                arguments.extend(frame.stack.split_off(frame.stack.len() - count));
+                let result = self.invoke(&candidate, &arguments)?;
+                frame.stack.push(result.unwrap_or(V::O(0)));
+                return Ok(());
+            }
+            return unsupported("string constructor without a helper");
         }
-        self.ensure_initialized(owner)?;
-        let info = map(self.model.class(owner))?;
-        if info.is_abstract || info.is_interface {
+        let flags = set.modules[callee.owner.module]
+            .metadata
+            .cell(TableId::TypeDef, callee.owner.row, 0)
+            .unwrap_or(0);
+        if flags & 0xA0 != 0 {
             return unsupported("construction of an abstract type");
         }
-        let record = self.record(RuntimeType::Class(owner))?;
-        let count = callee.parameters.len() - 1;
-        if frame.stack.len() < count {
-            return unsupported("evaluation stack underflow");
-        }
+        let record = self.record_of(&owner)?;
         let object = runtime::allocate_managed(record, 0);
         if object == 0 {
             return self.throw("OutOfMemoryException");
@@ -2590,16 +3573,213 @@ impl<'s> Interpreter<'s> {
         frame.stack.insert(at, V::O(object));
         let arguments: Vec<V> = frame.stack[at..].to_vec();
         frame.stack.truncate(at + 1);
-        self.invoke(&callee.key, &arguments)?;
+        self.invoke_ctx(&callee.key, &callee.ctx, &arguments)?;
         Ok(())
     }
 
-    fn find_value_override(&self, handle: TypeHandle, key: &MethodKey) -> Run<Option<MethodKey>> {
+    fn construct_default(&self, exact: &Gen) -> Run<u64> {
+        let handle = exact
+            .handle()
+            .ok_or_else(|| Fault::Unsupported("construction of a non class".into()))?;
+        self.ensure_initialized_gen(exact)?;
+        let record = self.record_of(exact)?;
+        let object = runtime::allocate_managed(record, 0);
+        if object == 0 {
+            return self.throw("OutOfMemoryException");
+        }
+        let metadata = &self.model.set.modules[handle.module].metadata;
+        if let Ok(range) = metadata.method_range(handle.row) {
+            for row in range {
+                let key = MethodKey { module: handle.module, row };
+                if metadata.string_cell(TableId::MethodDef, row, 3).ok() == Some(".ctor")
+                    && self.model.method_sig(&key).is_ok_and(|sig| sig.parameters.is_empty() && sig.has_this)
+                {
+                    let _pin = Pin::new(&[V::O(object)]);
+                    self.invoke_ctx(&key, &exact.context(), &[V::O(object)])?;
+                    return Ok(object);
+                }
+            }
+        }
+        unsupported("type has no parameterless constructor")
+    }
+
+    fn default_comparer(&self, argument: &Gen, equality: bool) -> Run<u64> {
+        let nullable = self.nullable_argument(argument);
+        let interface = map(self.types.core_handle(if equality {
+            "System.IEquatable`1"
+        } else {
+            "System.IComparable`1"
+        }))?;
+        let implements = self.types.all_interfaces(argument).iter().any(|g| {
+            g.handle() == Some(interface) && g.arguments().first() == Some(argument)
+        });
+        let is_enum = argument
+            .handle()
+            .is_some_and(|h| self.model.set.is_enum(h).unwrap_or(false));
+        let string = argument
+            .handle()
+            .is_some_and(|h| self.type_name(h) == "System.String");
+        let (name, inner): (&'static str, Gen) = match (&nullable, equality) {
+            (Some(inner), true) => ("System.Collections.Generic.NullableEqualityComparer`1", inner.clone()),
+            (Some(inner), false) => ("System.Collections.Generic.NullableComparer`1", inner.clone()),
+            (None, true) if is_enum => ("System.Collections.Generic.EnumEqualityComparer`1", argument.clone()),
+            (None, false) if is_enum => ("System.Collections.Generic.EnumComparer`1", argument.clone()),
+            (None, true) if implements || string => {
+                ("System.Collections.Generic.GenericEqualityComparer`1", argument.clone())
+            }
+            (None, false) if implements || string => ("System.Collections.Generic.GenericComparer`1", argument.clone()),
+            (None, true) => ("System.Collections.Generic.ObjectEqualityComparer`1", argument.clone()),
+            (None, false) => ("System.Collections.Generic.ObjectComparer`1", argument.clone()),
+        };
+        let handle = map(self.types.core_handle(name))?;
+        let exact = Gen::Named(handle, Rc::from(vec![inner]));
+        let record = self.record_of(&exact)?;
+        match runtime::allocate_managed(record, 0) {
+            0 => self.throw("OutOfMemoryException"),
+            object => Ok(object),
+        }
+    }
+
+    fn nullable_argument(&self, exact: &Gen) -> Option<Gen> {
+        let Gen::Named(handle, arguments) = exact else {
+            return None;
+        };
+        (arguments.len() == 1 && self.type_name(*handle) == "System.Nullable`1").then(|| arguments[0].clone())
+    }
+
+    fn nullable_fields(&self, exact: &Gen) -> Run<(u64, u64)> {
+        let layout = self.layout_of(exact)?;
+        let handle = layout.handle;
+        let metadata = &self.model.set.modules[handle.module].metadata;
+        let mut has_value = None;
+        let mut value = None;
+        for (row, offset) in &layout.fields {
+            match metadata.string_cell(TableId::Field, *row, 1).ok() {
+                Some("hasValue") => has_value = Some(u64::from(*offset)),
+                Some("value") => value = Some(u64::from(*offset)),
+                _ => {}
+            }
+        }
+        match (has_value, value) {
+            (Some(a), Some(b)) => Ok((a, b)),
+            _ => unsupported("nullable layout"),
+        }
+    }
+
+    fn box_nullable(&self, exact: &Gen, inner: &Gen, value: V) -> Run<u64> {
+        let (has_value, offset) = self.nullable_fields(exact)?;
+        let V::S(boxed) = value else {
+            return unsupported("a nullable value was expected");
+        };
+        if unsafe { *((boxed + 8 + has_value) as *const u8) } == 0 {
+            return Ok(0);
+        }
+        let _pin = Pin::new(&[value]);
+        let ty = self.gen_ty(inner)?;
+        let inner_value = self.read_value(boxed + 8 + offset, &ty, &[value])?;
+        self.box_any(inner, &ty, inner_value)
+    }
+
+    fn unbox_nullable(&self, exact: &Gen, inner: &Gen, object: u64) -> Run<V> {
+        let (has_value, offset) = self.nullable_fields(exact)?;
+        let _pin = Pin::new(&[V::O(object)]);
+        let boxed = self.allocate_box(exact)?;
+        if object != 0 {
+            if !self.unbox_compatible(object, inner)? {
+                return self.throw("InvalidCastException");
+            }
+            let ty = self.gen_ty(inner)?;
+            let size = ty.size() as usize;
+            unsafe {
+                *((boxed + 8 + has_value) as *mut u8) = 1;
+                std::ptr::copy((object + 8) as *const u8, (boxed + 8 + offset) as *mut u8, size);
+            }
+        }
+        Ok(V::S(boxed))
+    }
+
+    fn type_object(&self, exact: &Gen) -> Run<u64> {
+        if let Some(found) = self.type_objects.borrow().get(exact) {
+            return Ok(*found);
+        }
+        let handle = self.corelib_type("System", "RuntimeType")?;
+        let record = self.record(RuntimeType::Class(handle))?;
+        let object = runtime::allocate_managed(record, 0);
+        if object == 0 {
+            return self.throw("OutOfMemoryException");
+        }
+        type_roots().push(object);
+        self.type_objects.borrow_mut().insert(exact.clone(), object);
+        self.object_types.borrow_mut().insert(object, exact.clone());
+        Ok(object)
+    }
+
+    fn type_handle_value(&self, exact: &Gen) -> Run<V> {
+        let object = self.type_object(exact)?;
+        let handle = Gen::Named(self.corelib_type("System", "RuntimeTypeHandle")?, Rc::from(Vec::new()));
+        let boxed = self.allocate_box(&handle)?;
+        unsafe { *((boxed + 8) as *mut u64) = object };
+        Ok(V::S(boxed))
+    }
+
+    fn encode_function(&self, key: &MethodKey, ctx: &Ctx) -> u64 {
+        let mut functions = self.functions.borrow_mut();
+        let index = match functions.iter().position(|(k, c)| k == key && c == ctx) {
+            Some(index) => index,
+            None => {
+                functions.push((key.clone(), ctx.clone()));
+                functions.len() - 1
+            }
+        };
+        FUNCTION_TAG | index as u64
+    }
+
+    fn decode_function(&self, value: u64) -> Option<(MethodKey, Ctx)> {
+        if value & 0xFF00_0000_0000_0000 != FUNCTION_TAG {
+            return None;
+        }
+        self.functions
+            .borrow()
+            .get((value & 0x00FF_FFFF_FFFF_FFFF) as usize)
+            .cloned()
+    }
+
+    fn find_value_override(
+        &self,
+        exact: &Gen,
+        key: &MethodKey,
+        ctx: &Ctx,
+        instance: bool,
+    ) -> Run<Option<(MethodKey, Ctx)>> {
+        let Some(handle) = exact.handle() else {
+            return Ok(None);
+        };
         let set = self.model.set;
-        let metadata = &set.modules[key.module].metadata;
-        let name = metadata.string_cell(TableId::MethodDef, key.row, 3).unwrap_or("");
-        let sig = map(self.model.method_sig(key))?;
         let target_metadata = &set.modules[handle.module].metadata;
+        let type_ctx = Ctx { types: exact.arguments(), methods: ctx.methods.clone() };
+        for row in 1..=target_metadata.rows(TableId::MethodImpl) {
+            if target_metadata.cell(TableId::MethodImpl, row, 0).ok() != Some(handle.row) {
+                continue;
+            }
+            let (Ok(Some(body)), Ok(Some(declaration))) = (
+                target_metadata.coded(TableId::MethodImpl, row, 1),
+                target_metadata.coded(TableId::MethodImpl, row, 2),
+            ) else {
+                continue;
+            };
+            let Ok((declared, declared_ctx)) = self.method_inst(handle.module, declaration, &type_ctx) else {
+                continue;
+            };
+            if &declared == key && (ctx.types.is_empty() || declared_ctx.types == ctx.types)
+                && let Ok((body, _)) = self.method_inst(handle.module, body, &type_ctx)
+            {
+                return Ok(Some((body, type_ctx)));
+            }
+        }
+        let name = set.modules[key.module]
+            .metadata
+            .string_cell(TableId::MethodDef, key.row, 3)
+            .unwrap_or("");
         let Ok(range) = target_metadata.method_range(handle.row) else {
             return Ok(None);
         };
@@ -2607,38 +3787,31 @@ impl<'s> Interpreter<'s> {
             if target_metadata.string_cell(TableId::MethodDef, row, 3).ok() != Some(name) {
                 continue;
             }
-            let candidate = MethodKey {
-                module: handle.module,
-                row,
-            };
+            let candidate = MethodKey { module: handle.module, row };
             let Ok(candidate_sig) = self.model.method_sig(&candidate) else {
                 continue;
             };
-            if candidate_sig.has_this
-                && set
-                    .methods_equal(handle.module, &candidate_sig, key.module, &sig)
-                    .unwrap_or(false)
-            {
-                return Ok(Some(candidate));
+            if candidate_sig.has_this == instance && self.signatures_match(&candidate, &type_ctx, key, ctx) {
+                return Ok(Some((candidate, type_ctx)));
             }
         }
         Ok(None)
     }
 
-    fn box_any(&self, handle: TypeHandle, ty: &Ty, value: V) -> Run<u64> {
+    fn box_any(&self, exact: &Gen, ty: &Ty, value: V) -> Run<u64> {
         match ty {
-            Ty::Prim(var) => self.box_value(handle, *var, value),
+            Ty::Prim(var) => self.box_value(exact, *var, value),
             Ty::Struct(_) => {
                 let _pin = Pin::new(&[value]);
-                let boxed = self.allocate_box(handle)?;
+                let boxed = self.allocate_box(exact)?;
                 self.write_value(boxed + 8, ty, value)?;
                 Ok(boxed)
             }
         }
     }
 
-    fn box_value(&self, handle: TypeHandle, var: VarType, value: V) -> Run<u64> {
-        let record = self.record(RuntimeType::Class(handle))?;
+    fn box_value(&self, exact: &Gen, var: VarType, value: V) -> Run<u64> {
+        let record = self.record_of(exact)?;
         let object = runtime::allocate_managed(record, 0);
         if object == 0 {
             return unsupported("out of memory");
@@ -2647,11 +3820,14 @@ impl<'s> Interpreter<'s> {
         Ok(object)
     }
 
-    fn unbox_compatible(&self, object: u64, handle: TypeHandle) -> Run<bool> {
-        let class = self.object_class(object)?;
-        if class == handle {
+    fn unbox_compatible(&self, object: u64, target: &Gen) -> Run<bool> {
+        let exact = self.object_gen(object)?;
+        if &exact == target {
             return Ok(true);
         }
+        let (Some(class), Some(handle)) = (exact.handle(), target.handle()) else {
+            return Ok(false);
+        };
         let set = self.model.set;
         let underlying = |h: TypeHandle| -> Option<u32> {
             if set.is_enum(h).unwrap_or(false) {
@@ -2693,6 +3869,21 @@ impl<'s> Interpreter<'s> {
         match self.load(key) {
             Ok(_) => None,
             Err(Fault::Unsupported(reason)) if reason == "abstract method" => None,
+            Err(Fault::Unsupported(reason)) if reason == "open generic method" => {
+                let object = self.types.core("Object").ok()?;
+                let owner = self.model.method_owner(key).ok()?;
+                let count = self.types.parameter_count(TableId::TypeDef, owner.row, owner.module);
+                let methods = self.model.method_sig(key).ok()?.generic_parameters as usize;
+                let ctx = Ctx {
+                    types: Rc::from(vec![object.clone(); count]),
+                    methods: Rc::from(vec![object; methods]),
+                };
+                match self.load_ctx(key, &ctx) {
+                    Ok(_) => None,
+                    Err(Fault::Unsupported(reason)) => Some(reason),
+                    Err(Fault::Exception(_)) => Some("exception while loading".into()),
+                }
+            }
             Err(Fault::Unsupported(reason)) => Some(reason),
             Err(Fault::Exception(_)) => Some("exception while loading".into()),
         }
@@ -2708,7 +3899,9 @@ impl<'s> Interpreter<'s> {
             let Ok(loaded) = self.load(&current) else {
                 continue;
             };
-            if matches!(loaded.native, Some(Native::Intrinsic(Intrinsic::False))) {
+            if matches!(loaded.native, Some(Native::Intrinsic(Intrinsic::False)))
+                || self.type_name(loaded.owner).starts_with("System.Numerics.Vector")
+            {
                 return true;
             }
             let body = crate::il::MethodBody {
@@ -2731,19 +3924,20 @@ impl<'s> Interpreter<'s> {
     }
 
     pub fn reachable_natives(&self, key: &MethodKey, limit: usize) -> Result<usize, String> {
-        let mut seen: HashSet<MethodKey> = HashSet::new();
-        let mut pending = vec![key.clone()];
-        while let Some(current) = pending.pop() {
-            if !seen.insert(current.clone()) {
+        let describe = |fault: Fault| match fault {
+            Fault::Unsupported(reason) => reason,
+            Fault::Exception(_) => "exception while loading".to_owned(),
+        };
+        let mut seen: HashSet<InstKey> = HashSet::new();
+        let mut pending = vec![(key.clone(), Ctx::default())];
+        while let Some((current, ctx)) = pending.pop() {
+            if !seen.insert(self.inst_key(&current, &ctx)) {
                 continue;
             }
             if seen.len() > limit {
                 return Err("call graph is too large to check".into());
             }
-            let loaded = self.load(&current).map_err(|fault| match fault {
-                Fault::Unsupported(reason) => reason,
-                Fault::Exception(_) => "exception while loading".into(),
-            })?;
+            let loaded = self.load_ctx(&current, &ctx).map_err(describe)?;
             if loaded.native.is_some() {
                 continue;
             }
@@ -2756,46 +3950,44 @@ impl<'s> Interpreter<'s> {
             };
             for instruction in body.instructions() {
                 let instruction = instruction.map_err(|e| e.to_string())?;
-                let (0x28 | 0x6F | 0x73 | 0xFE06..=0xFE07) = instruction.opcode.value else {
-                    if matches!(instruction.opcode.value, 0x7E..=0x80)
-                        && let Argument::Token(token) = instruction.argument
-                        && let Ok(field) = self.field_ref(current.module, token)
-                    {
-                        let metadata = &self.model.set.modules[field.owner.module].metadata;
-                        if let Ok(range) = metadata.method_range(field.owner.row) {
-                            for row in range {
-                                if metadata.string_cell(TableId::MethodDef, row, 3).ok() == Some(".cctor") {
-                                    pending.push(MethodKey { module: field.owner.module, row });
+                let Argument::Token(token) = instruction.argument else {
+                    continue;
+                };
+                match instruction.opcode.value {
+                    0x28 | 0x6F | 0x73 | 0xFE06..=0xFE07 => {
+                        let (target, target_ctx) =
+                            self.method_inst(current.module, token, &ctx).map_err(describe)?;
+                        let flags = self.model.set.modules[target.module]
+                            .metadata
+                            .cell(TableId::MethodDef, target.row, 2)
+                            .unwrap_or(0);
+                        if flags & ABSTRACT == 0 {
+                            pending.push((target, target_ctx));
+                        }
+                    }
+                    0x7E..=0x80 => {
+                        if let Ok(field) = self.field_ref(current.module, token, &ctx)
+                            && let Gen::Named(owner, _) = &field.owner
+                        {
+                            let metadata = &self.model.set.modules[owner.module].metadata;
+                            if let Ok(range) = metadata.method_range(owner.row) {
+                                for row in range {
+                                    if metadata.string_cell(TableId::MethodDef, row, 3).ok() == Some(".cctor") {
+                                        pending.push((
+                                            MethodKey { module: owner.module, row },
+                                            field.owner.context(),
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
-                    continue;
-                };
-                let Argument::Token(token) = instruction.argument else {
-                    continue;
-                };
-                let target = self.method_token(current.module, token).map_err(|fault| match fault {
-                    Fault::Unsupported(reason) => reason,
-                    Fault::Exception(_) => "exception".into(),
-                })?;
-                let flags = self.model.set.modules[target.module]
-                    .metadata
-                    .cell(TableId::MethodDef, target.row, 2)
-                    .unwrap_or(0);
-                if flags & ABSTRACT != 0 {
-                    continue;
+                    _ => {}
                 }
-                pending.push(target);
             }
         }
         Ok(seen.len())
     }
-}
-
-enum CastTarget {
-    Type(TypeHandle),
-    Array(ElementKind),
 }
 
 fn decode_at(code: &[u8], at: usize) -> Run<(crate::il::Instruction<'_>, usize)> {
@@ -3195,20 +4387,6 @@ fn string_units<'a>(string: u64) -> &'a [u16] {
     }
 }
 
-fn encode_function(key: &MethodKey) -> u64 {
-    FUNCTION_TAG | ((key.module as u64) << 32) | u64::from(key.row)
-}
-
-fn decode_function(value: u64) -> Option<MethodKey> {
-    if value & 0xFF00_0000_0000_0000 != FUNCTION_TAG {
-        return None;
-    }
-    Some(MethodKey {
-        module: ((value >> 32) & 0xFF_FFFF) as usize,
-        row: value as u32,
-    })
-}
-
 pub fn result_raw(var: Option<VarType>, value: Option<V>) -> [u64; 2] {
     match (var, value) {
         (Some(VarType::F32), Some(v)) => [0, u64::from((v.float() as f32).to_bits())],
@@ -3322,4 +4500,9 @@ fn reciprocal_single(value: f32) -> f32 {
 fn reciprocal_sqrt_single(value: f32) -> f32 {
     use std::arch::x86_64::{_mm_cvtss_f32, _mm_rsqrt_ss, _mm_set_ss};
     unsafe { _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(value))) }
+}
+
+fn array_component(array: u64) -> u64 {
+    let record = unsafe { *(array as *const u64) } & !1;
+    unsafe { *(record as *const u64) >> 32 }
 }

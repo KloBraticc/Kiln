@@ -71,11 +71,14 @@ pub enum RuntimeType {
     Array(ElementKind),
     ValueArray(TypeHandle),
     String,
+    Exact(u32),
+    ExactArray(u32),
 }
 
 #[derive(Debug)]
 pub struct StructLayout {
     pub handle: TypeHandle,
+    pub instance: Option<u32>,
     pub size: u32,
     pub references: Vec<u32>,
     pub fields: HashMap<u32, u32>,
@@ -210,6 +213,7 @@ impl<'s> ObjectModel<'s> {
         }
         let built = Rc::new(StructLayout {
             handle,
+            instance: None,
             size: layout.size,
             references,
             fields,

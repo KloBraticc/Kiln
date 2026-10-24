@@ -182,6 +182,8 @@ pub struct RuntimeState {
     pub strings: HashMap<(usize, u32), u64>,
     pub reference_statics: Vec<usize>,
     struct_statics: HashMap<(usize, u32), Box<[u64]>>,
+    exact_statics: HashMap<(u32, usize, u32), Box<[u64]>>,
+    pub kinds: HashMap<u64, RuntimeType>,
     pub string_type: u64,
     pub empty_string: u64,
     frozen: Vec<Box<[u64]>>,
@@ -216,6 +218,8 @@ pub fn install() -> &'static mut RuntimeState {
         strings: HashMap::new(),
         reference_statics: Vec::new(),
         struct_statics: HashMap::new(),
+        exact_statics: HashMap::new(),
+        kinds: HashMap::new(),
         string_type: 0,
         empty_string: 0,
         frozen: Vec::new(),
@@ -288,6 +292,9 @@ impl RuntimeState {
                 )
             }
             RuntimeType::String => (u64::from(STRING_DATA) + 2, 2, FLAG_STRING, 0, Vec::new(), 0),
+            RuntimeType::Exact(_) | RuntimeType::ExactArray(_) => {
+                return Err("exact types are registered by the fallback".into());
+            }
         };
         let offsets: Box<[u32]> = offsets.into_boxed_slice();
         let mut words = vec![0u64; 7 + vtable_length].into_boxed_slice();
@@ -319,6 +326,7 @@ impl RuntimeState {
         }
         let address = words.as_ptr() as u64;
         self.types.insert(kind, TypeRecord { words, offsets });
+        self.kinds.insert(address, kind);
         Ok(address)
     }
 
@@ -344,6 +352,53 @@ impl RuntimeState {
         if reference && !self.reference_statics.contains(&(address as usize)) {
             self.reference_statics.push(address as usize);
         }
+        address
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn custom_record(
+        &mut self,
+        kind: RuntimeType,
+        base: u64,
+        component: u64,
+        flags: u64,
+        parent: u64,
+        offsets: Vec<u32>,
+        identity: u64,
+    ) -> u64 {
+        if let Some(record) = self.types.get(&kind) {
+            return record.words.as_ptr() as u64;
+        }
+        let offsets: Box<[u32]> = offsets.into_boxed_slice();
+        let mut words = vec![0u64; 7].into_boxed_slice();
+        words[0] = base | (component << 32);
+        words[1] = flags;
+        words[2] = parent;
+        words[3] = offsets.as_ptr() as u64;
+        words[4] = offsets.len() as u64;
+        words[5] = identity;
+        let address = words.as_ptr() as u64;
+        self.types.insert(kind, TypeRecord { words, offsets });
+        self.kinds.insert(address, kind);
+        address
+    }
+
+    pub fn record_offsets(&self, record: u64) -> Vec<u32> {
+        let words = record as *const u64;
+        let (offsets, count) = unsafe { (*words.add(3) as *const u32, *words.add(4) as usize) };
+        (0..count).map(|i| unsafe { *offsets.add(i) }).collect()
+    }
+
+    pub fn exact_static(&mut self, owner: u32, module: usize, row: u32, size: u32, references: &[u32]) -> u64 {
+        if let Some(block) = self.exact_statics.get(&(owner, module, row)) {
+            return block.as_ptr() as u64;
+        }
+        let block = vec![0u64; (size as usize).div_ceil(8).max(1)].into_boxed_slice();
+        let address = block.as_ptr() as u64;
+        for offset in references {
+            self.reference_statics.push(address as usize + *offset as usize);
+        }
+        self.exact_statics.insert((owner, module, row), block);
         address
     }
 

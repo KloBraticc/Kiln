@@ -1,6 +1,7 @@
 pub mod baml;
 pub mod codegen;
 pub mod error;
+pub mod generics;
 pub mod il;
 pub mod interpreter;
 pub mod ir;

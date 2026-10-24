@@ -265,6 +265,22 @@ impl AssemblySet {
         self.value_detail(handle, &[], 0)
     }
 
+    pub fn value_type_fields_with(
+        &self,
+        handle: TypeHandle,
+        arguments: &[(usize, TypeSig)],
+    ) -> Outcome<(Layout, Vec<FieldPlacement>)> {
+        self.value_detail(handle, arguments, 0)
+    }
+
+    pub fn class_fields_with(
+        &self,
+        handle: TypeHandle,
+        arguments: &[(usize, TypeSig)],
+    ) -> Outcome<(u32, Vec<FieldPlacement>)> {
+        self.class_detail(handle, arguments, 0)
+    }
+
     pub fn class_fields(&self, handle: TypeHandle) -> Outcome<(u32, Vec<FieldPlacement>)> {
         let (size, placements) = self.class_detail(handle, &[], 0)?;
         Ok((size, placements))
