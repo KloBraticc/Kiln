@@ -34,6 +34,8 @@ The fallback runs code that is not compiled ahead of time:
 - An IL interpreter that shares the heap, type records, statics, string literals and garbage collector with compiled code
 - Exception handling with catch, filter, finally and fault clauses, virtual and interface dispatch, delegates, boxing and static constructors
 - Struct values in locals, arguments, fields, statics, arrays and boxes, with exact CoreCLR layouts and garbage collector reference maps for embedded references
+- Generic classes, structs, interfaces and methods, with exact layouts, statics, static constructors and virtual tables per instantiation, including static abstract interface members
+- Platform invoke into any Windows library, with primitives, pointers, byrefs, `bool`, Unicode and ANSI strings, blittable arrays and structs by value, `SetLastError`, and native versions of the runtime QCalls ordinary code reaches
 - Native versions of runtime intrinsics, such as math through the Windows C runtime, interlocked operations and string resources read from each assembly
 - Compiled code and the fallback call each other freely: calls to methods that are not compiled go through generated stubs, and a fault or exception unwinds compiled frames back to the fallback
 - Compiled code checks array bounds, casts, overflow and null receivers, and turns hardware faults into the matching .NET exceptions
