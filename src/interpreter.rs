@@ -173,6 +173,11 @@ enum Intrinsic {
     LastError,
     SetLastError,
     ClearMemory,
+    LockTaken,
+    Nothing,
+    True,
+    CanCastTo,
+    AnotherGenericParameter,
     ProcessorCount,
     SpinWait,
 }
@@ -760,17 +765,7 @@ impl<'s> Interpreter<'s> {
         let kind = runtime::state().kinds.get(&record).copied();
         let element = match kind {
             Some(RuntimeType::String) => return map(self.types.core("String")),
-            Some(RuntimeType::Array(kind)) => map(self.types.core(match kind {
-                ElementKind::I8 => "SByte",
-                ElementKind::U8 => "Byte",
-                ElementKind::I16 => "Int16",
-                ElementKind::U16 => "UInt16",
-                ElementKind::I32 => "Int32",
-                ElementKind::I64 => "Int64",
-                ElementKind::F32 => "Single",
-                ElementKind::F64 => "Double",
-                ElementKind::Reference => "Object",
-            }))?,
+            Some(RuntimeType::Array(kind)) => map(self.types.core(element_core_name(kind)))?,
             Some(RuntimeType::ValueArray(handle)) => Gen::Named(handle, Rc::from(Vec::new())),
             Some(RuntimeType::ExactArray(id)) => self
                 .types
@@ -996,7 +991,23 @@ impl<'s> Interpreter<'s> {
         match self.gen_ty(element)? {
             Ty::Prim(var) => {
                 let kind = ElementKind::from_var(var).unwrap_or(ElementKind::I64);
-                self.record(RuntimeType::Array(kind))
+                if map(self.types.core(element_core_name(kind)))? == *element {
+                    return self.record(RuntimeType::Array(kind));
+                }
+                let references = if kind == ElementKind::Reference {
+                    runtime::FLAG_REFERENCE_ELEMENTS
+                } else {
+                    0
+                };
+                Ok(runtime::state().custom_record(
+                    RuntimeType::ExactArray(self.types.id(element)),
+                    u64::from(ARRAY_DATA),
+                    u64::from(kind.size()),
+                    runtime::FLAG_ARRAY | references,
+                    0,
+                    Vec::new(),
+                    u64::MAX,
+                ))
             }
             Ty::Struct(layout) => match layout.instance {
                 None => self.record(RuntimeType::ValueArray(layout.handle)),
@@ -1310,6 +1321,21 @@ impl<'s> Interpreter<'s> {
             ("System.Buffer", "BlockCopy") if parameters.len() == 5 => Intrinsic::BlockCopy,
             ("Interop+BCrypt", "BCryptGenRandom") if parameters.len() == 4 => Intrinsic::RandomBytes,
             ("System.Environment", "get_CurrentManagedThreadId") => Intrinsic::ThreadId,
+            ("System.Threading.Monitor", "ReliableEnter" | "ReliableEnterTimeout")
+                if parameters.last() == Some(&VarType::Pointer) =>
+            {
+                Intrinsic::LockTaken
+            }
+            ("System.Threading.Monitor", "Exit" | "Enter") if parameters.len() == 1 => Intrinsic::Nothing,
+            ("System.Threading.Monitor", "IsEnteredNative") => Intrinsic::True,
+            ("System.RuntimeTypeHandle", "CanCastTo") if parameters.len() == 2 => Intrinsic::CanCastTo,
+            ("System.RuntimeTypeHandle", "CreateInstanceForAnotherGenericParameter")
+                if (2..=3).contains(&parameters.len())
+                    && parameters.iter().all(|p| *p == VarType::Ref)
+                    && returns == Some(VarType::Ref) =>
+            {
+                Intrinsic::AnotherGenericParameter
+            }
             ("System.Runtime.InteropServices.Marshal", "GetLastPInvokeError" | "GetLastWin32Error")
                 if parameters.is_empty() =>
             {
@@ -1382,6 +1408,13 @@ impl<'s> Interpreter<'s> {
                 _ => return unsupported(format!("runtime QCall {entry}")),
             };
             return Ok(Native::Intrinsic(intrinsic));
+        }
+        if import.library.trim_start_matches("lib") == "System.Globalization.Native" {
+            let entry = if import.entry.is_empty() { name } else { import.entry };
+            return match entry {
+                "GlobalizationNative_LoadICU" => Ok(Native::Intrinsic(Intrinsic::False)),
+                _ => unsupported(format!("globalization entry {entry} without ICU")),
+            };
         }
         let unicode = import.unicode();
         let passes = sig
@@ -1887,6 +1920,19 @@ impl<'s> Interpreter<'s> {
             Intrinsic::Unsafe(operation) => return self.run_unsafe(operation, a, ctx),
             Intrinsic::ArrayData => V::P(self.non_null(a[0])? + u64::from(ARRAY_DATA)),
             Intrinsic::ThreadId => V::I4(1),
+            Intrinsic::LockTaken => {
+                unsafe { *(a[a.len() - 1].address() as *mut u8) = 1 };
+                return Ok(None);
+            }
+            Intrinsic::Nothing => return Ok(None),
+            Intrinsic::True => V::I4(1),
+            Intrinsic::CanCastTo => {
+                let types = self.object_types.borrow();
+                match (types.get(&a[0].address()), types.get(&a[1].address())) {
+                    (Some(source), Some(target)) => V::I4(i32::from(self.gen_assignable(source, target))),
+                    _ => return unsupported("CanCastTo on a type the fallback did not create"),
+                }
+            }
             Intrinsic::ClearMemory => {
                 unsafe { std::ptr::write_bytes(a[0].address() as *mut u8, 0, a[1].bits() as usize) };
                 return Ok(None);
@@ -2056,6 +2102,22 @@ impl<'s> Interpreter<'s> {
                     Ty::Prim(var) => load_raw(var, 0),
                     Ty::Struct(_) => V::S(self.allocate_box(&target)?),
                 }
+            }
+            Intrinsic::AnotherGenericParameter => {
+                let exact = {
+                    let types = self.object_types.borrow();
+                    let handle = types
+                        .get(&a[0].address())
+                        .and_then(Gen::handle)
+                        .ok_or_else(|| Fault::Unsupported("generic type object from outside the fallback".into()))?;
+                    let arguments = a[1..]
+                        .iter()
+                        .map(|t| types.get(&t.address()).cloned())
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| Fault::Unsupported("type argument from outside the fallback".into()))?;
+                    Gen::Named(handle, Rc::from(arguments))
+                };
+                V::O(self.construct_default(&exact)?)
             }
             Intrinsic::GetType => {
                 let object = self.non_null(a[0])?;
@@ -4583,6 +4645,20 @@ fn store_raw(var: VarType, value: V) -> u64 {
         VarType::F32 => u64::from((value.float() as f32).to_bits()),
         VarType::F64 => value.float().to_bits(),
         _ => value.bits(),
+    }
+}
+
+fn element_core_name(kind: ElementKind) -> &'static str {
+    match kind {
+        ElementKind::I8 => "SByte",
+        ElementKind::U8 => "Byte",
+        ElementKind::I16 => "Int16",
+        ElementKind::U16 => "UInt16",
+        ElementKind::I32 => "Int32",
+        ElementKind::I64 => "Int64",
+        ElementKind::F32 => "Single",
+        ElementKind::F64 => "Double",
+        ElementKind::Reference => "Object",
     }
 }
 
