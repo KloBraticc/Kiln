@@ -10,12 +10,16 @@ fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match arguments.first().map(String::as_str) {
         Some("inspect") if arguments.len() > 1 => inspect(&arguments[1..]),
+        Some("resolve") if arguments.len() > 1 => resolve(&arguments[1..]),
         Some("--version") => {
             println!("kiln {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: kiln inspect <assembly or folder>...");
+            eprintln!(
+                "usage: kiln inspect <assembly or folder>...
+       kiln resolve <assembly or folder>..."
+            );
             ExitCode::from(2)
         }
     }
@@ -116,6 +120,61 @@ fn inspect(arguments: &[String]) -> ExitCode {
         elapsed
     );
     if broken == 0 && failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn resolve(arguments: &[String]) -> ExitCode {
+    let mut files = Vec::new();
+    for argument in arguments {
+        let mut found = Vec::new();
+        collect(Path::new(argument), &mut found);
+        found.sort();
+        files.extend(found);
+    }
+
+    let started = Instant::now();
+    let mut set = kiln::loader::AssemblySet::default();
+    let mut unreadable = 0usize;
+    for file in &files {
+        if let Err(error) = set.add(file) {
+            unreadable += 1;
+            println!("{}  ERROR {error}", file.display());
+        }
+    }
+    let loaded = started.elapsed();
+
+    let mut resolved = 0u64;
+    let mut missing_assemblies: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut failures = 0u64;
+    for (index, module) in set.modules.iter().enumerate() {
+        for row in 1..=module.metadata.rows(kiln::metadata::TableId::TypeRef) {
+            match set.resolve_type_ref(index, row) {
+                Ok(_) => resolved += 1,
+                Err(kiln::loader::ResolveError::MissingAssembly(name)) => {
+                    *missing_assemblies.entry(name).or_default() += 1
+                }
+                Err(error) => {
+                    failures += 1;
+                    println!("  FAIL {} TypeRef {row}: {error:?}", module.name);
+                }
+            }
+        }
+    }
+
+    for (name, count) in &missing_assemblies {
+        println!("  not in the set: {name} ({count} references)");
+    }
+    println!(
+        "{} assemblies loaded in {:.2?}, {unreadable} unreadable, {resolved} type references resolved, {} point outside the set, {failures} failures, total {:.2?}",
+        set.modules.len(),
+        loaded,
+        missing_assemblies.values().sum::<u64>(),
+        started.elapsed()
+    );
+    if failures == 0 && unreadable == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

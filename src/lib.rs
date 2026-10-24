@@ -1,5 +1,6 @@
 pub mod error;
 pub mod il;
+pub mod loader;
 pub mod metadata;
 pub mod pe;
 pub mod reader;
