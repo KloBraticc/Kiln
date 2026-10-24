@@ -103,6 +103,9 @@ pub fn run_main(interpreter: &Interpreter<'_>, entry: &MethodKey, arguments: &[S
         Vec::new()
     };
     interpreter.budget.set(u64::MAX);
+    if interpreter.has_attribute(entry, "STAThreadAttribute") {
+        crate::pinvoke::enter_apartment(0);
+    }
     match interpreter.invoke(entry, &values) {
         Ok(Some(value)) => value.int() as i32,
         Ok(None) => 0,
@@ -186,6 +189,7 @@ pub fn default_properties(base_directory: &str) -> Vec<(String, String)> {
         ("APP_CONTEXT_BASE_DIRECTORY".into(), base_directory.into()),
         ("System.Diagnostics.Tracing.EventSource.IsSupported".into(), "false".into()),
         ("System.Diagnostics.Debugger.IsSupported".into(), "false".into()),
+        ("System.Runtime.CompilerServices.RuntimeFeature.IsDynamicCodeSupported".into(), "false".into()),
     ]
 }
 
@@ -242,6 +246,7 @@ pub fn launch(
     start(&model);
     let interpreter = Interpreter::new(&model, None);
     interpreter.install_bridge();
+    interpreter.set_entry_module(application);
     let methods = methods(&interpreter);
     let image = match crate::jit::Image::link_with_fallback(
         &methods,

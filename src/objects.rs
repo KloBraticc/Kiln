@@ -449,7 +449,7 @@ impl<'s> ObjectModel<'s> {
             base_size = (layout.size + OBJECT_HEADER).next_multiple_of(8).max(16);
         }
         let mut vtable = match parent {
-            Some(parent) if !is_value_type => self.class(parent)?.vtable.clone(),
+            Some(parent) => self.class(parent)?.vtable.clone(),
             _ => Vec::new(),
         };
         let mut cctor = None;

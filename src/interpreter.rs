@@ -122,7 +122,16 @@ enum Pass {
     Copy(u32),
     Field(u32),
     SafeHandle(u32),
+    SafeHandleOut(Gen, u32),
     Delegate,
+    Formatted(Rc<marshal::NativeLayout>, bool),
+    FormattedRef(Rc<marshal::NativeLayout>),
+    FormattedValue(Rc<marshal::NativeLayout>),
+    AsAny(bool),
+    Builder(bool),
+    Com(Gen),
+    ComOut,
+    Unknown,
 }
 
 enum Back {
@@ -150,6 +159,10 @@ unsafe fn callback_handler(context: usize, slot: usize, integers: *const u64, fl
 #[derive(Clone, Copy)]
 enum Intrinsic {
     False,
+    Intern(bool),
+    LoadLibrary(bool),
+    LibrarySymbol,
+    FreeLibrary,
     Math1(fn(f64) -> f64),
     MathF1(fn(f32) -> f32),
     Math2(fn(f64, f64) -> f64),
@@ -192,6 +205,7 @@ enum Intrinsic {
     SetLastError,
     ClearMemory,
     LockTaken,
+    Reflect(reflection::Reflect),
     EnumHash,
     EnumEquals,
     CurrentThread,
@@ -458,6 +472,17 @@ pub struct Interpreter<'s> {
     unmanaged_stubs: RefCell<HashMap<MethodKey, u64>>,
     delegate_stubs: RefCell<HashMap<u64, u64>>,
     thread: Cell<u64>,
+    assemblies: RefCell<HashMap<usize, u64>>,
+    entry_module: Cell<usize>,
+    module_objects: RefCell<HashMap<usize, u64>>,
+    frames: RefCell<Vec<usize>>,
+    method_tables: RefCell<HashMap<u32, u64>>,
+    method_table_types: RefCell<HashMap<u64, Gen>>,
+    native_layouts: RefCell<HashMap<u32, Rc<marshal::NativeLayout>>>,
+    handles: RefCell<members::Handles>,
+    native_delegates: RefCell<HashMap<u64, (usize, u64)>>,
+    indirect_platforms: RefCell<HashMap<(usize, u32, u64), usize>>,
+    wrappers: RefCell<com::Wrappers>,
 }
 
 enum Pending {
@@ -495,6 +520,11 @@ extern "system" fn hardware_fault(pointers: *mut [usize; 2]) -> i32 {
         return CONTINUE_SEARCH;
     };
     let interpreter = unsafe { &*(*bridge).interpreter };
+    if interpreter.trace_calls {
+        let fault = unsafe { *((record + 0x28) as *const u64) };
+        let method = state.method_containing(rip).map(|(offset, name)| format!("{name}+{offset:#x}")).unwrap_or_default();
+        eprintln!("hardware fault {name} in compiled {method} reading {fault:#x}");
+    }
     interpreter
         .pending
         .borrow_mut()
@@ -519,10 +549,11 @@ pub extern "win64" fn compiled_throw(kind: u64, frame: u64) -> u64 {
     if bridge.is_null() {
         runtime::trap();
     } else {
-        unsafe { &*(*bridge).interpreter }
-            .pending
-            .borrow_mut()
-            .get_or_insert(Pending::Throw(name));
+        let interpreter = unsafe { &*(*bridge).interpreter };
+        if interpreter.trace_calls {
+            eprintln!("compiled code raised {name}");
+        }
+        interpreter.pending.borrow_mut().get_or_insert(Pending::Throw(name));
     }
     let Some(routine) = crate::jit::abort_routine() else {
         std::process::abort();
@@ -592,8 +623,14 @@ fn outermost_compiled(frame: u64) -> u64 {
 
 struct Bridge {
     interpreter: *const Interpreter<'static>,
-    keys: RefCell<Vec<MethodKey>>,
-    stubs: RefCell<HashMap<MethodKey, u64>>,
+    keys: RefCell<Vec<(MethodKey, Ctx)>>,
+    stubs: RefCell<HashMap<InstKey, u64>>,
+}
+
+fn record_vtable(record: u64) -> Vec<u64> {
+    let words = record as *const u64;
+    let length = unsafe { *words.add(6) } as usize;
+    (0..length).map(|slot| unsafe { *words.add(7 + slot) }).collect()
 }
 
 fn resolve_stub(key: &MethodKey) -> Option<u64> {
@@ -615,12 +652,12 @@ pub(crate) unsafe extern "win64" fn fallback_entry(index: u64, arguments: *const
     }
     let bridge = unsafe { &*bridge };
     let interpreter = unsafe { &*bridge.interpreter };
-    let Some(key) = bridge.keys.borrow().get(index as usize).cloned() else {
+    let Some((key, ctx)) = bridge.keys.borrow().get(index as usize).cloned() else {
         runtime::trap();
         return 0;
     };
     let key = &key;
-    let loaded = match interpreter.load(key) {
+    let loaded = match interpreter.load_ctx(key, &ctx) {
         Ok(loaded) => loaded,
         Err(fault) => abort_compiled(interpreter, frame, fault),
     };
@@ -633,7 +670,7 @@ pub(crate) unsafe extern "win64" fn fallback_entry(index: u64, arguments: *const
         .map(|(position, var)| load_raw(*var, unsafe { *arguments.add(position) }))
         .collect();
     runtime::state().transitions.push((frame, stack));
-    let outcome = interpreter.invoke(key, &values);
+    let outcome = interpreter.invoke_ctx(key, &ctx, &values);
     runtime::state().transitions.pop();
     match outcome {
         Ok(value) => {
@@ -706,6 +743,17 @@ impl<'s> Interpreter<'s> {
             unmanaged_stubs: RefCell::new(HashMap::new()),
             delegate_stubs: RefCell::new(HashMap::new()),
             thread: Cell::new(0),
+            assemblies: RefCell::new(HashMap::new()),
+            entry_module: Cell::new(0),
+            module_objects: RefCell::new(HashMap::new()),
+            frames: RefCell::new(Vec::new()),
+            method_tables: RefCell::new(HashMap::new()),
+            method_table_types: RefCell::new(HashMap::new()),
+            native_layouts: RefCell::new(HashMap::new()),
+            handles: RefCell::new(members::Handles::default()),
+            native_delegates: RefCell::new(HashMap::new()),
+            indirect_platforms: RefCell::new(HashMap::new()),
+            wrappers: RefCell::new(com::Wrappers::default()),
         }
     }
 
@@ -733,19 +781,24 @@ impl<'s> Interpreter<'s> {
     }
 
     pub fn stub_for(&self, key: &MethodKey) -> Option<u64> {
+        self.stub_for_ctx(key, &Ctx::default())
+    }
+
+    fn stub_for_ctx(&self, key: &MethodKey, ctx: &Ctx) -> Option<u64> {
         let bridge = BRIDGE.load(std::sync::atomic::Ordering::Acquire);
         if bridge.is_null() {
             return None;
         }
         let bridge = unsafe { &*bridge };
-        if let Some(address) = bridge.stubs.borrow().get(key) {
+        let inst = self.inst_key(key, ctx);
+        if let Some(address) = bridge.stubs.borrow().get(&inst) {
             return Some(*address);
         }
-        let loaded = self.load(key).ok()?;
+        let loaded = self.load_ctx(key, ctx).ok()?;
         let index = bridge.keys.borrow().len() as u64;
         let address = crate::jit::emit_fallback_stub(&prims(&loaded.parameters)?, index)?;
-        bridge.keys.borrow_mut().push(key.clone());
-        bridge.stubs.borrow_mut().insert(key.clone(), address);
+        bridge.keys.borrow_mut().push((key.clone(), ctx.clone()));
+        bridge.stubs.borrow_mut().insert(inst, address);
         Some(address)
     }
 
@@ -781,7 +834,13 @@ impl<'s> Interpreter<'s> {
     }
 
     fn throw<T>(&self, name: &str) -> Run<T> {
-        let handle = self.corelib_type("System", name)?;
+        if self.trace_calls {
+            eprintln!("{}throw {name}", " ".repeat(self.depth.get().min(60)));
+        }
+        let handle = match self.corelib_type("System", name) {
+            Ok(handle) => handle,
+            Err(_) => self.corelib_type("System.IO", name)?,
+        };
         let record = self.record(RuntimeType::Class(handle))?;
         let object = runtime::allocate_managed(record, 0);
         if object == 0 {
@@ -916,18 +975,16 @@ impl<'s> Interpreter<'s> {
         let Gen::Named(handle, arguments) = exact else {
             return unsupported("layout of a non struct");
         };
-        if arguments.is_empty() {
-            return map(self.model.struct_layout(*handle));
+        if arguments.is_empty()
+            && let Ok(layout) = self.model.struct_layout(*handle)
+        {
+            return Ok(layout);
         }
         let id = self.types.id(exact);
         if let Some(found) = self.exact_layouts.borrow().get(&id) {
             return Ok(found.clone());
         }
-        let layout_arguments = arguments
-            .iter()
-            .map(|a| self.types.layout_argument(a))
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(Fault::Unsupported)?;
+        let layout_arguments = self.types.layout_arguments(arguments).map_err(Fault::Unsupported)?;
         let (layout, placements) = self
             .model
             .set
@@ -988,6 +1045,7 @@ impl<'s> Interpreter<'s> {
                 if set.is_value_type(*handle).unwrap_or(false) {
                     let layout = self.layout_of(exact)?;
                     let offsets: Vec<u32> = layout.references.iter().map(|r| r + 8).collect();
+                    let vtable = self.exact_vtable(exact);
                     return Ok(runtime::state().custom_record(
                         RuntimeType::Exact(id),
                         u64::from((layout.size + 8).next_multiple_of(8).max(16)),
@@ -996,13 +1054,10 @@ impl<'s> Interpreter<'s> {
                         0,
                         offsets,
                         EXACT_TAG | u64::from(id),
+                        vtable,
                     ));
                 }
-                let layout_arguments = arguments
-                    .iter()
-                    .map(|a| self.types.layout_argument(a))
-                    .collect::<Result<Vec<_>, String>>()
-                    .map_err(Fault::Unsupported)?;
+                let layout_arguments = self.types.layout_arguments(arguments).map_err(Fault::Unsupported)?;
                 let (end, placements) = set
                     .class_fields_with(*handle, &layout_arguments)
                     .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
@@ -1029,6 +1084,7 @@ impl<'s> Interpreter<'s> {
                         Ty::Prim(_) => {}
                     }
                 }
+                let vtable = self.exact_vtable(exact);
                 Ok(runtime::state().custom_record(
                     RuntimeType::Exact(id),
                     u64::from((end + 8).next_multiple_of(8).max(16)),
@@ -1037,11 +1093,35 @@ impl<'s> Interpreter<'s> {
                     parent,
                     offsets,
                     EXACT_TAG | u64::from(id),
+                    vtable,
                 ))
             }
             Gen::SzArray(element) => self.array_record(element),
             _ => unsupported(format!("objects of type {}", self.types.full_name(exact))),
         }
+    }
+
+    fn exact_vtable(&self, exact: &Gen) -> Vec<u64> {
+        let state = runtime::state();
+        let trap = state.trap_address;
+        let Ok(table) = self.vtable_of(exact) else {
+            return Vec::new();
+        };
+        table
+            .slots
+            .iter()
+            .map(|slot| {
+                let Some((key, declaring)) = slot else {
+                    return trap;
+                };
+                let Ok(owner) = self.model.method_owner(key) else {
+                    return trap;
+                };
+                let ctx = self.owner_context(declaring, owner, &Rc::from(Vec::new()));
+                let compiled = if ctx.is_empty() { runtime::state().code_addresses.get(key).copied() } else { None };
+                compiled.or_else(|| self.stub_for_ctx(key, &ctx)).unwrap_or(trap)
+            })
+            .collect()
     }
 
     fn array_record(&self, element: &Gen) -> Run<u64> {
@@ -1057,6 +1137,7 @@ impl<'s> Interpreter<'s> {
                 } else {
                     0
                 };
+                let vtable = record_vtable(shared);
                 Ok(runtime::state().custom_record(
                     RuntimeType::ExactArray(self.types.id(element)),
                     u64::from(ARRAY_DATA),
@@ -1065,19 +1146,24 @@ impl<'s> Interpreter<'s> {
                     shared,
                     Vec::new(),
                     u64::MAX,
+                    vtable,
                 ))
             }
             Ty::Struct(layout) => match layout.instance {
                 None => self.record(RuntimeType::ValueArray(layout.handle)),
-                Some(id) => Ok(runtime::state().custom_record(
-                    RuntimeType::ExactArray(id),
-                    u64::from(ARRAY_DATA),
-                    u64::from(layout.size),
-                    runtime::FLAG_ARRAY | runtime::FLAG_STRUCT_ELEMENTS,
-                    0,
-                    layout.references.clone(),
-                    u64::MAX,
-                )),
+                Some(id) => {
+                    let vtable = record_vtable(self.record(RuntimeType::Array(ElementKind::Reference))?);
+                    Ok(runtime::state().custom_record(
+                        RuntimeType::ExactArray(id),
+                        u64::from(ARRAY_DATA),
+                        u64::from(layout.size),
+                        runtime::FLAG_ARRAY | runtime::FLAG_STRUCT_ELEMENTS,
+                        0,
+                        layout.references.clone(),
+                        u64::MAX,
+                        vtable,
+                    ))
+                }
             },
         }
     }
@@ -1181,6 +1267,9 @@ impl<'s> Interpreter<'s> {
         let native = match (prims(&parameters), primitive_returns) {
             _ if name == ".ctor" && self.type_name(owner) == "System.String" => {
                 Some(Native::StringConstructor)
+            }
+            _ if reflection::internal(&self.type_name(owner), name, parameters.len()).is_some() => {
+                reflection::internal(&self.type_name(owner), name, parameters.len()).map(|r| Native::Intrinsic(Intrinsic::Reflect(r)))
             }
             _ if self.generic_native(owner, name, ctx).is_some() => {
                 self.generic_native(owner, name, ctx)
@@ -1321,6 +1410,9 @@ impl<'s> Interpreter<'s> {
         returns: Option<VarType>,
     ) -> Option<Native> {
         let type_name = self.type_name(owner);
+        if let Some(operation) = reflection::internal(&type_name, name, parameters.len()) {
+            return Some(Native::Intrinsic(Intrinsic::Reflect(operation)));
+        }
         let float = parameters.first() == Some(&VarType::F32);
         if let Some(native) = self.delegate_native(owner, name) {
             return Some(native);
@@ -1401,6 +1493,7 @@ impl<'s> Interpreter<'s> {
             ("System.Runtime.DependentHandle", "InternalGetDependent") if parameters.len() == 1 => Intrinsic::DependentSecond,
             ("System.Runtime.DependentHandle", "InternalGetTarget") if parameters.len() == 1 => Intrinsic::DependentTarget,
             ("System.Runtime.DependentHandle", "InternalAlloc") if parameters.len() == 2 => Intrinsic::DependentAlloc,
+            ("System.Runtime.CompilerServices.RuntimeHelpers", "PrepareDelegate" | "PrepareMethod" | "PrepareContractedDelegate" | "ProbeForSufficientStack") => Intrinsic::Nothing,
             ("System.Runtime.CompilerServices.RuntimeHelpers", "GetHashCode" | "TryGetHashCode" | "InternalGetHashCode") if parameters.len() == 1 => Intrinsic::IdentityHash,
             ("System.Runtime.InteropServices.GCHandle", "_InternalAlloc" | "InternalAlloc") if parameters.len() == 2 => {
                 Intrinsic::HandleAlloc
@@ -1498,11 +1591,21 @@ impl<'s> Interpreter<'s> {
             let entry = if import.entry.is_empty() { name } else { import.entry };
             let intrinsic = match (entry, parameters.len()) {
                 ("Buffer_Clear", 2) => Intrinsic::ClearMemory,
+                ("String_Intern", 1) => Intrinsic::Intern(false),
+                ("NativeLibrary_LoadByName", 5) => Intrinsic::LoadLibrary(false),
+                ("NativeLibrary_LoadFromPath", 2) => Intrinsic::LoadLibrary(true),
+                ("NativeLibrary_GetSymbol", 3) => Intrinsic::LibrarySymbol,
+                ("NativeLibrary_FreeLib", 1) => Intrinsic::FreeLibrary,
+                ("String_IsInterned", 1) => Intrinsic::Intern(true),
                 ("Environment_GetProcessorCount", 0) => Intrinsic::ProcessorCount,
                 ("ThreadNative_SpinWait", 1) => Intrinsic::SpinWait,
-                ("MarshalNative_IsBuiltInComSupported", 0) => Intrinsic::False,
+                ("MarshalNative_IsBuiltInComSupported", 0) => Intrinsic::True,
                 ("GCInterface_AddMemoryPressure" | "GCInterface_RemoveMemoryPressure", 1) => Intrinsic::Nothing,
                 ("QCall_GetGCHandleForTypeHandle", 2) => Intrinsic::NewHandle,
+                ("Monitor_Pulse" | "Monitor_PulseAll", 1) => Intrinsic::Nothing,
+                (entry, count) if reflection::qcall(entry, count).is_some() => {
+                    Intrinsic::Reflect(reflection::qcall(entry, count).unwrap_or(reflection::Reflect::EntryAssembly))
+                }
                 _ => return unsupported(format!("runtime QCall {entry}")),
             };
             return Ok(Native::Intrinsic(intrinsic));
@@ -1521,32 +1624,11 @@ impl<'s> Interpreter<'s> {
             .zip(parameters)
             .enumerate()
             .map(|(index, (parameter, ty))| {
-                self.platform_pass(key.module, unmodified(parameter), ty, unicode, native_of(index as u32 + 1), ctx)
+                let outward = pinvoke::parameter_flags(metadata, key.row, index as u32 + 1) & 0x2 != 0;
+                self.platform_pass(key.module, unmodified(parameter), ty, unicode, native_of(index as u32 + 1), ctx, outward)
             })
             .collect::<Run<Vec<_>>>()?;
-        let declared = unmodified(&sig.return_type);
-        let back = match (returns, declared) {
-            (None, _) => Back::Nothing,
-            (Some(_), TypeSig::Boolean) => match native_of(0) {
-                None | Some(0x02) => Back::Bool(0xFFFF_FFFF),
-                Some(0x03 | 0x04) => Back::Bool(0xFF),
-                Some(other) => return unsupported(format!("platform invoke MarshalAs return type 0x{other:02x}")),
-            },
-            (Some(Ty::Prim(VarType::Ref)), TypeSig::Class(token)) => {
-                let exact = map(self.types.resolve_token(key.module, *token, ctx))?;
-                if !self.is_safe_handle(&exact)? {
-                    return unsupported("platform invoke returning an object");
-                }
-                Back::SafeHandle(exact, self.safe_handle_offset()?)
-            }
-            (Some(Ty::Prim(VarType::Ref)), _) => return unsupported("platform invoke returning an object"),
-            (Some(Ty::Prim(var)), _) => Back::Raw(*var),
-            (Some(Ty::Struct(layout)), _) if !layout.references.is_empty() => {
-                return unsupported("platform invoke returning a struct with references");
-            }
-            (Some(Ty::Struct(layout)), _) if matches!(layout.size, 1 | 2 | 4 | 8) => Back::Value(layout.clone()),
-            (Some(Ty::Struct(layout)), _) => Back::Buffer(layout.clone()),
-        };
+        let back = self.platform_back(key.module, sig, returns, native_of(0), ctx)?;
         let directory = module.path.parent().unwrap_or(std::path::Path::new("."));
         let function = map(pinvoke::resolve(directory, &import, name))?;
         let mut platforms = self.platforms.borrow_mut();
@@ -1559,6 +1641,111 @@ impl<'s> Interpreter<'s> {
         Ok(Native::PlatformInvoke(platforms.len() - 1))
     }
 
+    fn platform_back(
+        &self,
+        module: usize,
+        sig: &crate::signature::MethodSig,
+        returns: &Option<Ty>,
+        native: Option<u8>,
+        ctx: &Ctx,
+    ) -> Run<Back> {
+        let declared = unmodified(&sig.return_type);
+        Ok(match (returns, declared) {
+            (None, _) => Back::Nothing,
+            (Some(_), TypeSig::Boolean) => match native {
+                None | Some(0x02) => Back::Bool(0xFFFF_FFFF),
+                Some(0x03 | 0x04) => Back::Bool(0xFF),
+                Some(other) => return unsupported(format!("platform invoke MarshalAs return type 0x{other:02x}")),
+            },
+            (Some(Ty::Prim(VarType::Ref)), TypeSig::Class(token)) => {
+                let exact = map(self.types.resolve_token(module, *token, ctx))?;
+                if !self.is_safe_handle(&exact)? {
+                    return unsupported("platform invoke returning an object");
+                }
+                Back::SafeHandle(exact, self.safe_handle_offset()?)
+            }
+            (Some(Ty::Prim(VarType::Ref)), _) => return unsupported("platform invoke returning an object"),
+            (Some(Ty::Prim(var)), _) => Back::Raw(*var),
+            (Some(Ty::Struct(layout)), _) if !layout.references.is_empty() => {
+                return unsupported("platform invoke returning a struct with references");
+            }
+            (Some(Ty::Struct(layout)), _) if matches!(layout.size, 1 | 2 | 4 | 8) => Back::Value(layout.clone()),
+            (Some(Ty::Struct(layout)), _) => Back::Buffer(layout.clone()),
+        })
+    }
+
+    fn indirect_platform(&self, module: usize, row: u32, function: u64, sig: &crate::signature::MethodSig, ctx: &Ctx) -> Run<usize> {
+        if let Some(index) = self.indirect_platforms.borrow().get(&(module, row, function)) {
+            return Ok(*index);
+        }
+        if sig.convention == CallingConvention::Default || sig.has_this {
+            return unsupported("calli on a managed signature without a managed target");
+        }
+        let passes = sig
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let ty = self.ty_of(module, unmodified(parameter), ctx)?;
+                self.platform_pass(module, unmodified(parameter), &ty, true, None, ctx, false)
+            })
+            .collect::<Run<Vec<_>>>()?;
+        let returns = match unmodified(&sig.return_type) {
+            TypeSig::Void => None,
+            other => Some(self.ty_of(module, other, ctx)?),
+        };
+        let back = self.platform_back(module, sig, &returns, None, ctx)?;
+        let index = {
+            let mut platforms = self.platforms.borrow_mut();
+            platforms.push(Rc::new(Platform {
+                function: function as usize,
+                passes,
+                back,
+                last_error: false,
+            }));
+            platforms.len() - 1
+        };
+        self.indirect_platforms.borrow_mut().insert((module, row, function), index);
+        Ok(index)
+    }
+
+    fn native_delegate(&self, function: u64, exact: &Gen) -> Run<u64> {
+        let handle = exact.handle().ok_or_else(|| Fault::Unsupported("delegate without a type".into()))?;
+        let metadata = &self.model.set.modules[handle.module].metadata;
+        let row = metadata
+            .method_range(handle.row)
+            .ok()
+            .and_then(|mut range| range.find(|&row| metadata.string_cell(TableId::MethodDef, row, 3).ok() == Some("Invoke")))
+            .ok_or_else(|| Fault::Unsupported("delegate without Invoke".into()))?;
+        let key = MethodKey { module: handle.module, row };
+        let ctx = exact.context();
+        let loaded = self.load_ctx(&key, &ctx)?;
+        let sig = map(self.model.method_sig(&key))?;
+        let passes = sig
+            .parameters
+            .iter()
+            .zip(&loaded.parameters[1..])
+            .map(|(parameter, ty)| self.platform_pass(key.module, unmodified(parameter), ty, false, None, &ctx, false))
+            .collect::<Run<Vec<_>>>()?;
+        let back = self.platform_back(key.module, &sig, &loaded.returns, None, &ctx)?;
+        let index = {
+            let mut platforms = self.platforms.borrow_mut();
+            platforms.push(Rc::new(Platform {
+                function: function as usize,
+                passes,
+                back,
+                last_error: false,
+            }));
+            platforms.len() - 1
+        };
+        let object = runtime::allocate_managed(self.record_of(exact)?, 0);
+        if object == 0 {
+            return self.throw("OutOfMemoryException");
+        }
+        type_roots().push(object);
+        self.native_delegates.borrow_mut().insert(object, (index, function));
+        Ok(object)
+    }
+
     fn platform_pass(
         &self,
         module: usize,
@@ -1567,6 +1754,7 @@ impl<'s> Interpreter<'s> {
         unicode: bool,
         native: Option<u8>,
         ctx: &Ctx,
+        outward: bool,
     ) -> Run<Pass> {
         let declared = match sig {
             TypeSig::Class(token) | TypeSig::ValueType(token) => Some(map(self.types.resolve_token(module, *token, ctx))?),
@@ -1585,6 +1773,12 @@ impl<'s> Interpreter<'s> {
                 (TypeSig::String, 0x30) => Pass::Utf8,
                 (TypeSig::SzArray(element), 0x2A) if blittable(element, unicode) => Pass::Array,
                 (_, 0x26) if is_delegate => Pass::Delegate,
+                (_, 0x28) => Pass::AsAny(unicode),
+                (TypeSig::ByRef(_), 0x19 | 0x1C) => Pass::ComOut,
+                (_, 0x19 | 0x1C) if declared.as_ref().is_some_and(|g| self.is_com_interface(g)) => {
+                    Pass::Com(declared.clone().unwrap_or(Gen::FunctionPointer))
+                }
+                (_, 0x19 | 0x1C) => Pass::Unknown,
                 (
                     TypeSig::I1
                     | TypeSig::U1
@@ -1612,20 +1806,99 @@ impl<'s> Interpreter<'s> {
             (TypeSig::String, _) if unicode => Pass::Wide,
             (TypeSig::String, _) => Pass::Ansi,
             (TypeSig::SzArray(element), _) if blittable(element, unicode) => Pass::Array,
+            (TypeSig::SzArray(element), _) if self.blittable_struct(module, unmodified(element), ctx)? => Pass::Array,
             (_, Ty::Prim(VarType::Ref)) if is_delegate => Pass::Delegate,
             (_, Ty::Prim(VarType::Ref)) => match &declared {
+                Some(exact) if exact.handle().is_some_and(|h| self.type_name(h) == "System.Text.StringBuilder") => {
+                    Pass::Builder(unicode)
+                }
                 Some(exact) if self.is_safe_handle(exact)? => Pass::SafeHandle(self.safe_handle_offset()?),
-                _ => return unsupported("platform invoke object marshaling"),
+                Some(exact) if self.is_com_interface(exact) => Pass::Com(exact.clone()),
+                Some(exact) if self.has_layout(exact) => Pass::Formatted(self.native_layout(exact)?, outward),
+                _ => {
+                    return unsupported(format!(
+                        "platform invoke marshaling of {}",
+                        declared.as_ref().map(|g| self.types.full_name(g)).unwrap_or_else(|| format!("{sig:?}"))
+                    ));
+                }
             },
+            (TypeSig::ByRef(inner), Ty::Prim(VarType::Pointer))
+                if matches!(unmodified(inner), TypeSig::Class(_) | TypeSig::GenericInst { .. })
+                    && self.is_com_interface(&map(self.types.resolve(module, unmodified(inner), ctx))?) =>
+            {
+                Pass::ComOut
+            }
+            (TypeSig::ByRef(inner), Ty::Prim(VarType::Pointer))
+                if matches!(unmodified(inner), TypeSig::Class(_) | TypeSig::GenericInst { .. })
+                    && self.is_safe_handle(&map(self.types.resolve(module, unmodified(inner), ctx))?)? =>
+            {
+                Pass::SafeHandleOut(map(self.types.resolve(module, unmodified(inner), ctx))?, self.safe_handle_offset()?)
+            }
+            (TypeSig::ByRef(inner), Ty::Prim(VarType::Pointer)) if matches!(unmodified(inner), TypeSig::ValueType(_) | TypeSig::GenericInst { .. }) => {
+                let exact = map(self.types.resolve(module, unmodified(inner), ctx))?;
+                match self.gen_ty(&exact)? {
+                    Ty::Struct(_) => {
+                        let layout = self.native_layout(&exact)?;
+                        if layout.blittable { Pass::Raw(VarType::Pointer) } else { Pass::FormattedRef(layout) }
+                    }
+                    _ => Pass::Raw(VarType::Pointer),
+                }
+            }
             (_, Ty::Prim(var)) => Pass::Raw(*var),
             (_, Ty::Struct(layout)) if self.type_name(layout.handle) == "System.Runtime.InteropServices.HandleRef" => {
                 Pass::Field(self.struct_field_offset(layout, "_handle")?)
             }
             (_, Ty::Struct(layout)) if !layout.references.is_empty() => {
-                return unsupported("platform invoke struct with references");
+                let native = self.native_layout(&self.layout_gen(layout))?;
+                if matches!(native.size, 1 | 2 | 4 | 8) { Pass::FormattedValue(native) } else { Pass::Formatted(native, false) }
             }
             (_, Ty::Struct(layout)) if matches!(layout.size, 1 | 2 | 4 | 8) => Pass::Value(layout.size),
             (_, Ty::Struct(layout)) => Pass::Copy(layout.size),
+        })
+    }
+
+    fn builder_call(&self, builder: u64, name: &str, argument: Option<V>) -> Run<V> {
+        let owner = self.object_gen(builder)?.handle().ok_or_else(|| Fault::Unsupported("builder without a type".into()))?;
+        let metadata = &self.model.set.modules[owner.module].metadata;
+        let key = metadata
+            .method_range(owner.row)
+            .map_err(|e| Fault::Unsupported(e.to_string()))?
+            .map(|row| MethodKey { module: owner.module, row })
+            .find(|key| {
+                metadata.string_cell(TableId::MethodDef, key.row, 3).ok() == Some(name)
+                    && self.model.method_sig(key).is_ok_and(|sig| {
+                        sig.has_this
+                            && match argument {
+                                None => sig.parameters.is_empty(),
+                                Some(_) => sig.parameters.len() == 1 && sig.parameters[0] == TypeSig::String,
+                            }
+                    })
+            })
+            .ok_or_else(|| Fault::Unsupported(format!("StringBuilder has no {name}")))?;
+        let mut arguments = vec![V::O(builder)];
+        arguments.extend(argument);
+        Ok(self.invoke(&key, &arguments)?.unwrap_or(V::O(0)))
+    }
+
+    fn blittable_struct(&self, module: usize, sig: &TypeSig, ctx: &Ctx) -> Run<bool> {
+        if !matches!(sig, TypeSig::ValueType(_) | TypeSig::GenericInst { value_type: true, .. }) {
+            return Ok(false);
+        }
+        let exact = map(self.types.resolve(module, sig, ctx))?;
+        match self.gen_ty(&exact)? {
+            Ty::Struct(_) => Ok(self.native_layout(&exact)?.blittable),
+            Ty::Prim(var) => Ok(var != VarType::Ref),
+        }
+    }
+
+    fn has_layout(&self, exact: &Gen) -> bool {
+        exact.handle().is_some_and(|handle| {
+            self.model.set.modules[handle.module]
+                .metadata
+                .cell(TableId::TypeDef, handle.row, 0)
+                .unwrap_or(0)
+                & 0x18
+                != 0
         })
     }
 
@@ -1675,6 +1948,10 @@ impl<'s> Interpreter<'s> {
             _ => Vec::new(),
         };
         let _pin = Pin::new(&buffer);
+        let mut copy_back: Vec<(Rc<marshal::NativeLayout>, u64, u64)> = Vec::new();
+        let mut builders: Vec<(u64, u64, bool)> = Vec::new();
+        let mut com_outs: Vec<(u64, u64)> = Vec::new();
+        let mut handle_outs: Vec<(u64, u64, Gen, u32)> = Vec::new();
         for (pass, value) in platform.passes.iter().zip(arguments) {
             let data = match value {
                 V::S(boxed) | V::O(boxed) if *boxed != 0 => boxed + 8,
@@ -1721,9 +1998,155 @@ impl<'s> Interpreter<'s> {
                     0 => 0,
                     object => self.delegate_stub(object)?,
                 },
+                Pass::Formatted(layout, outward) => match value {
+                    V::O(0) | V::S(0) => 0,
+                    V::O(object) => {
+                        buffers.push(vec![0u64; (layout.size as usize).div_ceil(8)]);
+                        let native = buffers[buffers.len() - 1].as_ptr() as u64;
+                        self.marshal_out(layout, *object, native, &mut buffers)?;
+                        if *outward {
+                            copy_back.push((layout.clone(), native, *object));
+                        }
+                        native
+                    }
+                    other => {
+                        buffers.push(vec![0u64; (layout.size as usize).div_ceil(8)]);
+                        let native = buffers[buffers.len() - 1].as_ptr() as u64;
+                        self.marshal_out(layout, data, native, &mut buffers)?;
+                        let _ = other;
+                        native
+                    }
+                },
+                Pass::FormattedRef(layout) => match value.address() {
+                    0 => 0,
+                    managed => {
+                        buffers.push(vec![0u64; (layout.size as usize).div_ceil(8)]);
+                        let native = buffers[buffers.len() - 1].as_ptr() as u64;
+                        self.marshal_out(layout, managed, native, &mut buffers)?;
+                        copy_back.push((layout.clone(), native, managed));
+                        native
+                    }
+                },
+                Pass::Com(interface) => match value.address() {
+                    0 => 0,
+                    object => match self.rcw_interface(object, interface)? {
+                        Some(pointer) => pointer,
+                        None => self.com_wrapper(object, interface)?,
+                    },
+                },
+                Pass::Unknown => match value.address() {
+                    0 => 0,
+                    object => match self.rcw_pointer(object) {
+                        Some(pointer) => pointer,
+                        None => {
+                            let exact = self.object_gen(object)?;
+                            let interface = self
+                                .types
+                                .all_interfaces(&exact)
+                                .into_iter()
+                                .find(|candidate| self.is_com_interface(candidate))
+                                .ok_or_else(|| Fault::Unsupported("passing a managed object without a COM interface as IUnknown".into()))?;
+                            self.com_wrapper(object, &interface)?
+                        }
+                    },
+                },
+                Pass::SafeHandleOut(exact, offset) => {
+                    let target = value.address();
+                    let current = match target {
+                        0 => 0,
+                        _ => match unsafe { *(target as *const u64) } {
+                            0 => 0,
+                            object => unsafe { *((object + u64::from(*offset)) as *const u64) },
+                        },
+                    };
+                    buffers.push(vec![current; 1]);
+                    let slot = buffers[buffers.len() - 1].as_ptr() as u64;
+                    handle_outs.push((slot, target, exact.clone(), *offset));
+                    slot
+                }
+                Pass::ComOut => {
+                    buffers.push(vec![0u64; 1]);
+                    let slot = buffers[buffers.len() - 1].as_ptr() as u64;
+                    com_outs.push((slot, value.address()));
+                    slot
+                }
+                Pass::Builder(unicode) => match value.address() {
+                    0 => 0,
+                    builder => {
+                        let capacity = self.builder_call(builder, "get_Capacity", None)?.int().max(0) as usize;
+                        let text = self.builder_call(builder, "ToString", None)?.address();
+                        let units: Vec<u16> = if text == 0 { Vec::new() } else { string_units(text).to_vec() };
+                        let mut bytes: Vec<u8> = if *unicode {
+                            units.iter().flat_map(|u| u.to_le_bytes()).collect()
+                        } else {
+                            pinvoke::ansi(&units)
+                        };
+                        let unit = if *unicode { 2 } else { 1 };
+                        bytes.resize((capacity + 2) * unit, 0);
+                        buffers.push(words(&bytes));
+                        let native = buffers[buffers.len() - 1].as_ptr() as u64;
+                        builders.push((builder, native, *unicode));
+                        native
+                    }
+                },
+                Pass::AsAny(unicode) => match value.address() {
+                    0 => 0,
+                    object => {
+                        let exact = self.object_gen(object)?;
+                        let is_string = exact.handle().is_some_and(|h| self.type_name(h) == "System.String");
+                        if is_string {
+                            let units = string_units(object);
+                            let bytes: Vec<u8> = if *unicode {
+                                units.iter().chain(&[0]).flat_map(|u| u.to_le_bytes()).collect()
+                            } else {
+                                pinvoke::ansi(units)
+                            };
+                            buffers.push(words(&bytes));
+                            buffers[buffers.len() - 1].as_ptr() as u64
+                        } else if matches!(exact, Gen::SzArray(_)) {
+                            object + u64::from(ARRAY_DATA)
+                        } else {
+                            let layout = self.native_layout(&exact)?;
+                            buffers.push(vec![0u64; (layout.size as usize).div_ceil(8)]);
+                            let native = buffers[buffers.len() - 1].as_ptr() as u64;
+                            let managed = if self.types.is_value_type(&exact) { object + 8 } else { object };
+                            self.marshal_out(&layout, managed, native, &mut buffers)?;
+                            copy_back.push((layout, native, managed));
+                            native
+                        }
+                    }
+                },
+                Pass::FormattedValue(layout) => {
+                    let mut scratch = vec![0u64; 1];
+                    let native = scratch.as_mut_ptr() as u64;
+                    self.marshal_out(layout, data, native, &mut buffers)?;
+                    scratch[0]
+                }
             });
         }
         let (integer, float) = unsafe { pinvoke::call(platform.function, &raw, platform.last_error) };
+        for (layout, native, managed) in copy_back {
+            self.marshal_in(&layout, native, managed)?;
+        }
+        for (slot, target, exact, offset) in handle_outs {
+            let object = self.construct_default(&exact)?;
+            unsafe { *((object + u64::from(offset)) as *mut u64) = *(slot as *const u64) };
+            if target != 0 {
+                unsafe { *(target as *mut u64) = object };
+            }
+        }
+        for (slot, target) in com_outs {
+            let object = self.rcw_for(unsafe { *(slot as *const u64) })?;
+            if target != 0 {
+                unsafe { *(target as *mut u64) = object };
+            }
+        }
+        for (builder, native, unicode) in builders {
+            let units = if unicode { reflection::wide_units(native) } else { reflection::ansi_units(native) };
+            let text = runtime::new_string(&units);
+            self.builder_call(builder, "Clear", None)?;
+            self.builder_call(builder, "Append", Some(V::O(text)))?;
+        }
         Ok(match &platform.back {
             Back::Nothing => None,
             Back::Bool(mask) => Some(V::I4(i32::from(integer & mask != 0))),
@@ -1805,6 +2228,9 @@ impl<'s> Interpreter<'s> {
     }
 
     fn delegate_stub(&self, object: u64) -> Run<u64> {
+        if let Some((_, function)) = self.native_delegates.borrow().get(&object) {
+            return Ok(*function);
+        }
         if let Some(stub) = self.delegate_stubs.borrow().get(&object) {
             return Ok(*stub);
         }
@@ -2191,7 +2617,22 @@ impl<'s> Interpreter<'s> {
                     self.types.full_name(&loaded.owner_gen)
                 );
             }
-            return self.run_native(&loaded, native, arguments);
+            let result = self.run_native(&loaded, native, arguments)?;
+            return match (&loaded.returns, result) {
+                (Some(Ty::Struct(layout)), Some(value @ (V::P(_) | V::I8(_) | V::I4(_)))) => {
+                    let boxed = self.allocate_box(&self.layout_gen(layout))?;
+                    let bits = value.bits();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (&raw const bits).cast::<u8>(),
+                            (boxed + 8) as *mut u8,
+                            (layout.size as usize).min(8),
+                        )
+                    };
+                    Ok(Some(V::S(boxed)))
+                }
+                (_, result) => Ok(result),
+            };
         }
         let image = self.image.get();
         if !image.is_null()
@@ -2240,6 +2681,26 @@ impl<'s> Interpreter<'s> {
                 let this = arguments[0].address();
                 if this == 0 {
                     return self.throw("NullReferenceException");
+                }
+                if let (Ok(list), Ok(count)) = (
+                    self.class_field_offset("System", "MulticastDelegate", "_invocationList"),
+                    self.class_field_offset("System", "MulticastDelegate", "_invocationCount"),
+                ) {
+                    let invocations = unsafe { *((this + u64::from(list)) as *const u64) };
+                    let total = unsafe { *((this + u64::from(count)) as *const i64) };
+                    if invocations != 0 && total > 0 && matches!(self.object_gen(invocations), Ok(Gen::SzArray(_))) {
+                        let mut last = None;
+                        for index in 0..total as u64 {
+                            let item = unsafe { *((invocations + u64::from(ARRAY_DATA) + 8 * index) as *const u64) };
+                            let mut forwarded = arguments.to_vec();
+                            forwarded[0] = V::O(item);
+                            last = self.run_native(loaded, Native::DelegateInvoke, &forwarded)?;
+                        }
+                        return Ok(last);
+                    }
+                }
+                if let Some((index, _)) = self.native_delegates.borrow().get(&this).copied() {
+                    return self.platform_call(index, &arguments[1..]);
                 }
                 let (target, function) = self.delegate_fields()?;
                 let (target, function) = unsafe {
@@ -2296,6 +2757,7 @@ impl<'s> Interpreter<'s> {
                 return Ok(None);
             }
             Intrinsic::Nothing => return Ok(None),
+            Intrinsic::Reflect(operation) => return self.reflect(operation, a, ctx),
             Intrinsic::EnumHash => {
                 let (var, bits) = self.enum_value(a[0])?;
                 V::I4(match var {
@@ -2329,6 +2791,9 @@ impl<'s> Interpreter<'s> {
                     .get(&self.non_null(a[0])?)
                     .cloned()
                     .ok_or_else(|| Fault::Unsupported("type object from outside the fallback".into()))?;
+                if self.nullable_argument(&exact).is_some() {
+                    return Ok(Some(V::O(0)));
+                }
                 match self.gen_ty(&exact)? {
                     Ty::Prim(VarType::Ref) => V::O(self.construct_default(&exact)?),
                     Ty::Prim(var) => {
@@ -2378,6 +2843,48 @@ impl<'s> Interpreter<'s> {
                     (Some(source), Some(target)) => V::I4(i32::from(self.gen_assignable(source, target))),
                     _ => return unsupported("CanCastTo on a type the fallback did not create"),
                 }
+            }
+            Intrinsic::Intern(lookup) => {
+                let slot = unsafe { *(Self::struct_data(a[0]) as *const u64) };
+                let string = if slot == 0 { 0 } else { unsafe { *(slot as *const u64) } };
+                if string != 0 {
+                    let units = string_units(string);
+                    let state = runtime::state();
+                    let result = if lookup {
+                        if units.is_empty() { state.empty_string } else { state.interned.get(units).copied().unwrap_or(0) }
+                    } else {
+                        state.intern(units)
+                    };
+                    unsafe { *(slot as *mut u64) = result };
+                }
+                return Ok(None);
+            }
+            Intrinsic::LoadLibrary(from_path) => {
+                let name = String::from_utf16_lossy(&reflection::wide_units(a[0].address()));
+                let handle = if from_path {
+                    pinvoke::load_path(&name)
+                } else {
+                    let module = self.qcall_assembly(a[1])?;
+                    let path = &self.model.set.modules[module].path;
+                    pinvoke::load_named(path.parent().unwrap_or(std::path::Path::new(".")), &name)
+                };
+                let throw_on_error = a[if from_path { 1 } else { 4 }].int() != 0;
+                if handle == 0 && throw_on_error {
+                    return self.throw("DllNotFoundException");
+                }
+                V::I8(handle as i64)
+            }
+            Intrinsic::LibrarySymbol => {
+                let name = String::from_utf16_lossy(&reflection::wide_units(a[1].address()));
+                let function = pinvoke::symbol(a[0].bits() as usize, &name);
+                if function == 0 && a[2].int() != 0 {
+                    return self.throw("EntryPointNotFoundException");
+                }
+                V::I8(function as i64)
+            }
+            Intrinsic::FreeLibrary => {
+                pinvoke::free_library(a[0].bits() as usize);
+                return Ok(None);
             }
             Intrinsic::ClearMemory => {
                 unsafe { std::ptr::write_bytes(a[0].address() as *mut u8, 0, a[1].bits() as usize) };
@@ -2799,7 +3306,20 @@ impl<'s> Interpreter<'s> {
             return unsupported("copies between multi dimensional arrays");
         };
         if self.types.is_value_type(&from) || self.types.is_value_type(&to) {
-            return self.throw("ArrayTypeMismatchException");
+            let compatible = self.types.is_value_type(&from)
+                && self.types.is_value_type(&to)
+                && matches!((self.gen_ty(&from)?, self.gen_ty(&to)?), (Ty::Prim(_), Ty::Prim(_)))
+                && self.primitive_element_kind(&from) == self.primitive_element_kind(&to);
+            if !compatible {
+                if self.trace_calls {
+                    eprintln!("array copy from {} to {} is not compatible", self.types.full_name(&from), self.types.full_name(&to));
+                }
+                return self.throw("ArrayTypeMismatchException");
+            }
+            unsafe {
+                std::ptr::copy(source_data as *const u8, destination_data as *mut u8, (length as u64 * component) as usize);
+            }
+            return Ok(());
         }
         let items: Vec<u64> = (0..length as u64)
             .map(|i| unsafe { *((source_data + 8 * i) as *const u64) })
@@ -2877,6 +3397,9 @@ impl<'s> Interpreter<'s> {
     }
 
     fn ensure_initialized(&self, owner: TypeHandle) -> Run<()> {
+        if owner.row != 1 {
+            self.ensure_initialized(TypeHandle { module: owner.module, row: 1 })?;
+        }
         if let Some(reason) = self.failed_types.borrow().get(&owner) {
             return match reason {
                 Some(reason) => unsupported(reason.clone()),
@@ -2906,9 +3429,10 @@ impl<'s> Interpreter<'s> {
                 Err(Fault::Exception(object)) => {
                     if self.trace_calls {
                         eprintln!(
-                            "static constructor of {} threw {}",
+                            "static constructor of {} threw {}: {}",
                             self.type_name(owner),
-                            self.exception_type(object)
+                            self.exception_type(object),
+                            self.exception_message(object).unwrap_or_default()
                         );
                     }
                     unsafe { *flag = 0 };
@@ -2965,7 +3489,9 @@ impl<'s> Interpreter<'s> {
             }
         }
         let registered = Registered::new(&frame);
+        self.frames.borrow_mut().push(loaded.key.module);
         let result = self.execute(loaded, &mut frame, 0);
+        self.frames.borrow_mut().pop();
         drop(registered);
         self.depth.set(depth);
         match result? {
@@ -3103,6 +3629,9 @@ impl<'s> Interpreter<'s> {
     }
 
     fn is_assignable(&self, object: u64, target: &Gen) -> bool {
+        if self.rcw_pointer(object).is_some() && self.is_com_interface(target) {
+            return self.rcw_supports(object, target);
+        }
         let Ok(exact) = self.object_gen(object) else {
             return false;
         };
@@ -3370,6 +3899,20 @@ impl<'s> Interpreter<'s> {
         }
         let exact = self.object_gen(this)?;
         let owner = map(self.model.method_owner(key))?;
+        if let Gen::SzArray(element) = &exact
+            && matches!(
+                self.type_name(owner).as_str(),
+                "System.Collections.Generic.IList`1"
+                    | "System.Collections.Generic.ICollection`1"
+                    | "System.Collections.Generic.IEnumerable`1"
+                    | "System.Collections.Generic.IReadOnlyList`1"
+                    | "System.Collections.Generic.IReadOnlyCollection`1"
+            )
+            && let Some(found) = self.array_helper(key, element)?
+        {
+            self.implementations.borrow_mut().insert((record, inst), found.clone());
+            return Ok(found);
+        }
         let owner_flags = self.model.set.modules[owner.module]
             .metadata
             .cell(TableId::TypeDef, owner.row, 0)
@@ -3409,6 +3952,74 @@ impl<'s> Interpreter<'s> {
             .borrow_mut()
             .insert((record, inst), found.clone());
         Ok(found)
+    }
+
+    fn variant_interface(&self, class: &Gen, key: &MethodKey, ctx: &Ctx) -> Run<Option<Ctx>> {
+        let owner = map(self.model.method_owner(key))?;
+        let metadata = &self.model.set.modules[owner.module].metadata;
+        let variance: Vec<u32> = (0..ctx.types.len() as u32)
+            .map(|number| {
+                (1..=metadata.rows(TableId::GenericParam))
+                    .find(|&g| {
+                        metadata.cell(TableId::GenericParam, g, 0).ok() == Some(number)
+                            && metadata
+                                .coded(TableId::GenericParam, g, 2)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|t| t.table() == Some(TableId::TypeDef) && t.row() == owner.row)
+                    })
+                    .and_then(|g| metadata.cell(TableId::GenericParam, g, 1).ok())
+                    .unwrap_or(0)
+                    & 3
+            })
+            .collect();
+        if variance.iter().all(|v| *v == 0) {
+            return Ok(None);
+        }
+        for interface in self.types.all_interfaces(class) {
+            let Gen::Named(handle, arguments) = &interface else { continue };
+            if *handle != owner || arguments.len() != ctx.types.len() || **arguments == *ctx.types {
+                continue;
+            }
+            let compatible = arguments.iter().zip(ctx.types.iter()).zip(&variance).all(|((implemented, requested), v)| match v {
+                0 => implemented == requested,
+                1 => !self.types.is_value_type(implemented) && self.gen_assignable(implemented, requested),
+                _ => !self.types.is_value_type(requested) && self.gen_assignable(requested, implemented),
+            });
+            if compatible {
+                return Ok(Some(Ctx {
+                    types: arguments.clone(),
+                    methods: ctx.methods.clone(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn array_helper(&self, key: &MethodKey, element: &Gen) -> Run<Option<(MethodKey, Ctx)>> {
+        let helper = self.corelib_type("System", "SZArrayHelper")?;
+        let metadata = &self.model.set.modules[key.module].metadata;
+        let name = metadata.string_cell(TableId::MethodDef, key.row, 3).unwrap_or("");
+        let short = name.rsplit('.').next().unwrap_or(name);
+        let parameters = map(self.model.method_sig(key))?.parameters.len();
+        let helper_metadata = &self.model.set.modules[helper.module].metadata;
+        let found = helper_metadata
+            .method_range(helper.row)
+            .map_err(|e| Fault::Unsupported(e.to_string()))?
+            .map(|row| MethodKey { module: helper.module, row })
+            .find(|candidate| {
+                helper_metadata.string_cell(TableId::MethodDef, candidate.row, 3).ok() == Some(short)
+                    && self.model.method_sig(candidate).is_ok_and(|sig| sig.parameters.len() == parameters && sig.generic_parameters == 1)
+            });
+        Ok(found.map(|key| {
+            (
+                key,
+                Ctx {
+                    types: Rc::from(Vec::new()),
+                    methods: Rc::from(vec![element.clone()]),
+                },
+            )
+        }))
     }
 
     fn find_interface_implementation(&self, class: &Gen, key: &MethodKey, ctx: &Ctx) -> Run<(MethodKey, Ctx)> {
@@ -3465,6 +4076,9 @@ impl<'s> Interpreter<'s> {
                 }
             }
         }
+        if let Some(variant) = self.variant_interface(class, key, ctx)? {
+            return self.find_interface_implementation(class, key, &variant);
+        }
         let flags = set.modules[key.module]
             .metadata
             .cell(TableId::MethodDef, key.row, 2)
@@ -3472,7 +4086,15 @@ impl<'s> Interpreter<'s> {
         if flags & ABSTRACT == 0 {
             return Ok((key.clone(), ctx.clone()));
         }
-        unsupported("interface method has no implementation")
+        let name = set.modules[key.module]
+            .metadata
+            .string_cell(TableId::MethodDef, key.row, 3)
+            .unwrap_or("?");
+        unsupported(format!(
+            "interface method {}::{name} has no implementation on {}",
+            self.type_name(map(self.model.method_owner(key))?),
+            self.types.full_name(class)
+        ))
     }
 
     fn field_ref(&self, module: usize, token: Token, ctx: &Ctx) -> Run<Rc<FieldRef>> {
@@ -3542,12 +4164,7 @@ impl<'s> Interpreter<'s> {
                     .ok_or_else(|| Fault::Unsupported("value type field".into()))?,
             )
         } else {
-            let arguments = owner
-                .arguments()
-                .iter()
-                .map(|a| self.types.layout_argument(a))
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(Fault::Unsupported)?;
+            let arguments = self.types.layout_arguments(&owner.arguments()).map_err(Fault::Unsupported)?;
             let (_, placements) = set
                 .class_fields_with(handle, &arguments)
                 .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
@@ -3574,7 +4191,11 @@ impl<'s> Interpreter<'s> {
     }
 
     fn field_address(&self, method: &Loaded, token: Token, target: V) -> Run<(u64, Ty)> {
-        let field = self.field_ref(method.key.module, token, &method.ctx)?;
+        self.field_address_in(method.key.module, token, &method.ctx, target)
+    }
+
+    fn field_address_in(&self, module: usize, token: Token, ctx: &Ctx, target: V) -> Run<(u64, Ty)> {
+        let field = self.field_ref(module, token, ctx)?;
         if field.is_static {
             self.ensure_initialized_gen(&field.owner)?;
             let state = runtime::state();
@@ -3912,6 +4533,12 @@ impl<'s> Interpreter<'s> {
                             if this == 0 {
                                 return self.throw("NullReferenceException");
                             }
+                            if callee.is_virtual && self.rcw_pointer(this).is_some() && callee.is_abstract {
+                                if let Some(value) = self.rcw_call(&key, &call_ctx, &arguments)? {
+                                    frame.stack.push(value);
+                                }
+                                continue;
+                            }
                             if callee.is_virtual {
                                 target = self.resolve_virtual(&key, &call_ctx, this)?;
                             }
@@ -3922,7 +4549,46 @@ impl<'s> Interpreter<'s> {
                         }
                     }
                 }
-                0x29 => return unsupported("calli"),
+                0x29 => {
+                    let Argument::Token(token) = argument else {
+                        return unsupported("calli token");
+                    };
+                    let metadata = &self.model.set.modules[module].metadata;
+                    let blob = metadata
+                        .cell(TableId::StandAloneSig, token.row(), 0)
+                        .and_then(|b| metadata.blob(b))
+                        .map_err(|e| Fault::Unsupported(e.to_string()))?;
+                    let Ok(Signature::Method(sig)) = Signature::parse(blob) else {
+                        return unsupported("calli signature does not parse");
+                    };
+                    let function = pop!().bits();
+                    let count = sig.parameters.len() + usize::from(sig.has_this && !sig.explicit_this);
+                    if frame.stack.len() < count {
+                        return unsupported("evaluation stack underflow");
+                    }
+                    let arguments: Vec<V> = frame.stack.split_off(frame.stack.len() - count);
+                    let _pin = Pin::new(&arguments);
+                    let result = if let Some((key, call_ctx)) = self.decode_function(function) {
+                        match (self.invoke_ctx(&key, &call_ctx, &arguments)?, unmodified(&sig.return_type)) {
+                            (None, TypeSig::Void) => None,
+                            (None, TypeSig::R4) => Some(V::F4(0.0)),
+                            (None, TypeSig::R8) => Some(V::F8(0.0)),
+                            (None, TypeSig::I8 | TypeSig::U8) => Some(V::I8(0)),
+                            (None, TypeSig::Pointer(_) | TypeSig::FunctionPointer(_) | TypeSig::IntPtr | TypeSig::UIntPtr) => Some(V::P(0)),
+                            (None, _) => Some(V::I4(0)),
+                            (result, _) => result,
+                        }
+                    } else {
+                        if function == 0 {
+                            return self.throw("NullReferenceException");
+                        }
+                        let index = self.indirect_platform(module, token.row(), function, &sig, &method.ctx)?;
+                        self.platform_call(index, &arguments)?
+                    };
+                    if let Some(value) = result {
+                        frame.stack.push(value);
+                    }
+                }
                 0x27 => return unsupported("jmp"),
                 0x74 | 0x75 => {
                     let Argument::Token(token) = argument else {
@@ -4449,6 +5115,10 @@ impl<'s> Interpreter<'s> {
         type_roots().push(object);
         self.type_objects.borrow_mut().insert(exact.clone(), object);
         self.object_types.borrow_mut().insert(object, exact.clone());
+        if let Ok(offset) = self.class_field_offset("System", "RuntimeType", "m_handle") {
+            let table = self.method_table(exact)?;
+            unsafe { *((object + u64::from(offset)) as *mut u64) = table };
+        }
         Ok(object)
     }
 
@@ -4537,6 +5207,11 @@ impl<'s> Interpreter<'s> {
     }
 
     fn box_any(&self, exact: &Gen, ty: &Ty, value: V) -> Run<u64> {
+        if let Some(inner) = self.nullable_argument(exact)
+            && matches!(value, V::S(_))
+        {
+            return self.box_nullable(exact, &inner, value);
+        }
         match ty {
             Ty::Prim(var) => self.box_value(exact, *var, value),
             Ty::Struct(_) => {
@@ -4608,6 +5283,41 @@ impl<'s> Interpreter<'s> {
                 && self.model.method_sig(&key).is_ok_and(|sig| sig.parameters.len() == parameters))
             .then_some(key)
         })
+    }
+
+    pub fn has_attribute(&self, key: &MethodKey, attribute: &str) -> bool {
+        let set = self.model.set;
+        let metadata = &set.modules[key.module].metadata;
+        (1..=metadata.rows(TableId::CustomAttribute)).any(|row| {
+            let (Ok(Some(owner)), Ok(Some(constructor))) = (
+                metadata.coded(TableId::CustomAttribute, row, 0),
+                metadata.coded(TableId::CustomAttribute, row, 1),
+            ) else {
+                return false;
+            };
+            if owner.table() != Some(TableId::MethodDef) || owner.row() != key.row {
+                return false;
+            }
+            let name = match constructor.table() {
+                Some(TableId::MemberRef) => metadata
+                    .coded(TableId::MemberRef, constructor.row(), 0)
+                    .ok()
+                    .flatten()
+                    .filter(|parent| parent.table() == Some(TableId::TypeRef))
+                    .and_then(|parent| metadata.string_cell(TableId::TypeRef, parent.row(), 1).ok()),
+                Some(TableId::MethodDef) => set.modules[key.module]
+                    .method_owner(constructor.row())
+                    .ok()
+                    .flatten()
+                    .and_then(|owner| metadata.string_cell(TableId::TypeDef, owner, 1).ok()),
+                _ => None,
+            };
+            name == Some(attribute)
+        })
+    }
+
+    pub fn set_entry_module(&self, module: usize) {
+        self.entry_module.set(module);
     }
 
     pub fn parameter_count(&self, key: &MethodKey) -> Option<usize> {
@@ -5289,6 +5999,12 @@ pub fn result_raw(var: Option<VarType>, value: Option<V>) -> [u64; 2] {
 pub fn method_returns(interpreter: &Interpreter<'_>, key: &MethodKey) -> Option<VarType> {
     interpreter.load(key).ok().and_then(|l| l.returns.as_ref().and_then(Ty::prim))
 }
+
+mod attributes;
+mod com;
+mod marshal;
+mod members;
+mod reflection;
 
 mod crt {
     use std::sync::OnceLock;

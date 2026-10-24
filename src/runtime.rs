@@ -180,6 +180,7 @@ pub struct RuntimeState {
     pub statics: HashMap<(usize, u32), Box<u64>>,
     pub flags: HashMap<TypeHandle, Box<u8>>,
     pub strings: HashMap<(usize, u32), u64>,
+    pub interned: HashMap<Vec<u16>, u64>,
     pub reference_statics: Vec<usize>,
     handle_blocks: Vec<Box<[u64]>>,
     free_handles: Vec<usize>,
@@ -218,6 +219,7 @@ pub fn install() -> &'static mut RuntimeState {
         statics: HashMap::new(),
         flags: HashMap::new(),
         strings: HashMap::new(),
+        interned: HashMap::new(),
         reference_statics: Vec::new(),
         handle_blocks: Vec::new(),
         free_handles: Vec::new(),
@@ -300,6 +302,12 @@ impl RuntimeState {
                 return Err("exact types are registered by the fallback".into());
             }
         };
+        let source = vtable_source(model, kind);
+        let vtable_length = match (kind, source) {
+            (RuntimeType::Class(_), _) => vtable_length,
+            (_, Some(handle)) => model.class(handle)?.vtable.len(),
+            _ => vtable_length,
+        };
         let offsets: Box<[u32]> = offsets.into_boxed_slice();
         let mut words = vec![0u64; 7 + vtable_length].into_boxed_slice();
         words[0] = base | (component << 32);
@@ -312,7 +320,7 @@ impl RuntimeState {
             _ => u64::MAX,
         };
         words[6] = vtable_length as u64;
-        if let RuntimeType::Class(handle) = kind
+        if let Some(handle) = source
             && self.trap_address != 0
         {
             let info = model.class(handle)?;
@@ -359,7 +367,6 @@ impl RuntimeState {
         address
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn custom_record(
         &mut self,
         kind: RuntimeType,
@@ -369,12 +376,15 @@ impl RuntimeState {
         parent: u64,
         offsets: Vec<u32>,
         identity: u64,
+        vtable: Vec<u64>,
     ) -> u64 {
         if let Some(record) = self.types.get(&kind) {
             return record.words.as_ptr() as u64;
         }
         let offsets: Box<[u32]> = offsets.into_boxed_slice();
-        let mut words = vec![0u64; 7].into_boxed_slice();
+        let mut words = vec![0u64; 7 + vtable.len()].into_boxed_slice();
+        words[6] = vtable.len() as u64;
+        words[7..].copy_from_slice(&vtable);
         words[0] = base | (component << 32);
         words[1] = flags;
         words[2] = parent;
@@ -475,7 +485,7 @@ impl RuntimeState {
             self.empty_string(model)
         } else {
             self.ensure_string_type(model)?;
-            self.frozen_string(&units)
+            self.intern(&units)
         };
         self.strings.insert((module, offset), address);
         Ok(address)
@@ -494,6 +504,18 @@ impl RuntimeState {
             self.empty_string = self.frozen_string(&[]);
         }
         self.empty_string
+    }
+
+    pub fn intern(&mut self, units: &[u16]) -> u64 {
+        if units.is_empty() && self.empty_string != 0 {
+            return self.empty_string;
+        }
+        if let Some(existing) = self.interned.get(units) {
+            return *existing;
+        }
+        let address = self.frozen_string(units);
+        self.interned.insert(units.to_vec(), address);
+        address
     }
 
     fn frozen_string(&mut self, units: &[u16]) -> u64 {
@@ -662,6 +684,16 @@ pub extern "win64" fn allocate(type_record: u64, count: u64, frame: u64, stack: 
         }
     }
     object as u64
+}
+
+pub fn vtable_source(model: &ObjectModel<'_>, kind: RuntimeType) -> Option<crate::loader::TypeHandle> {
+    let core = || model.set.find_assembly("System.Private.CoreLib");
+    match kind {
+        RuntimeType::Class(handle) => Some(handle),
+        RuntimeType::Array(_) | RuntimeType::ValueArray(_) => core().and_then(|m| model.set.find_type_by_name(m, "System", "Array")),
+        RuntimeType::String => core().and_then(|m| model.set.find_type_by_name(m, "System", "String")),
+        _ => None,
+    }
 }
 
 pub fn allocate_managed(type_record: u64, count: u64) -> u64 {

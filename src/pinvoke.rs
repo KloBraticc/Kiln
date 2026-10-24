@@ -40,6 +40,19 @@ pub fn find_import<'a>(metadata: &Metadata<'a>, method_row: u32) -> Option<Impor
     })
 }
 
+pub fn parameter_flags(metadata: &Metadata<'_>, method_row: u32, sequence: u32) -> u32 {
+    let first = metadata.cell(TableId::MethodDef, method_row, 5).unwrap_or(0);
+    let end = if method_row < metadata.rows(TableId::MethodDef) {
+        metadata.cell(TableId::MethodDef, method_row + 1, 5).unwrap_or(first)
+    } else {
+        metadata.rows(TableId::Param) + 1
+    };
+    (first..end)
+        .find(|&row| metadata.cell(TableId::Param, row, 1).ok() == Some(sequence))
+        .and_then(|row| metadata.cell(TableId::Param, row, 0).ok())
+        .unwrap_or(0)
+}
+
 pub fn marshals(metadata: &Metadata<'_>, method_row: u32) -> Vec<(u32, u8)> {
     let first = metadata.cell(TableId::MethodDef, method_row, 5).unwrap_or(0);
     let end = if method_row < metadata.rows(TableId::MethodDef) {
@@ -67,11 +80,22 @@ pub fn marshals(metadata: &Metadata<'_>, method_row: u32) -> Vec<(u32, u8)> {
         .collect()
 }
 
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoInitializeEx(reserved: *const u8, model: u32) -> i32;
+    fn CoGetApartmentType(kind: *mut i32, qualifier: *mut i32) -> i32;
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LoadLibraryW(name: *const u16) -> usize;
+    fn FreeLibrary(module: usize) -> i32;
     fn GetProcAddress(module: usize, name: *const u8) -> usize;
     fn GetLastError() -> u32;
+    fn GetModuleHandleW(name: *const u16) -> usize;
+    fn GetCurrentThreadId() -> u32;
+    fn GetTickCount64() -> u64;
+    fn WaitForSingleObjectEx(handle: usize, milliseconds: u32, alertable: i32) -> u32;
     fn SetLastError(code: u32);
     fn WideCharToMultiByte(
         page: u32,
@@ -127,6 +151,22 @@ fn export(library: usize, name: &str) -> usize {
     unsafe { GetProcAddress(library, bytes.as_ptr()) }
 }
 
+pub fn load_named(directory: &Path, library: &str) -> usize {
+    load_library(directory, library).unwrap_or(0)
+}
+
+pub fn load_path(path: &str) -> usize {
+    unsafe { LoadLibraryW(wide(path).as_ptr()) }
+}
+
+pub fn symbol(library: usize, name: &str) -> usize {
+    export(library, name)
+}
+
+pub fn free_library(library: usize) {
+    unsafe { FreeLibrary(library) };
+}
+
 pub fn resolve(directory: &Path, import: &Import<'_>, method_name: &str) -> Result<usize, String> {
     let library = load_library(directory, import.library)
         .ok_or_else(|| format!("platform invoke library {} is not available", import.library))?;
@@ -148,6 +188,46 @@ pub fn resolve(directory: &Path, import: &Import<'_>, method_name: &str) -> Resu
 
 thread_local! {
     static LAST_ERROR: Cell<u32> = const { Cell::new(0) };
+}
+
+pub fn apartment_state() -> i32 {
+    let (mut kind, mut qualifier) = (0i32, 0i32);
+    if unsafe { CoGetApartmentType(&raw mut kind, &raw mut qualifier) } < 0 {
+        return 2;
+    }
+    match kind {
+        0 | 3 => 0,
+        1 => 1,
+        _ => 2,
+    }
+}
+
+pub fn enter_apartment(state: i32) -> i32 {
+    let model = if state == 0 { 2 } else { 0 };
+    unsafe { CoInitializeEx(std::ptr::null(), model) };
+    apartment_state()
+}
+
+pub fn tick_count() -> u64 {
+    unsafe { GetTickCount64() }
+}
+
+pub fn current_thread_id() -> u32 {
+    unsafe { GetCurrentThreadId() }
+}
+
+pub fn wait_one(handle: u64, milliseconds: i32) -> i32 {
+    match unsafe { WaitForSingleObjectEx(handle as usize, milliseconds as u32, 1) } {
+        0 => 0,
+        0x80 => 0x80,
+        0x102 => 0x102,
+        0xC0 => -1,
+        _ => -1,
+    }
+}
+
+pub fn process_module() -> u64 {
+    unsafe { GetModuleHandleW(std::ptr::null()) as u64 }
 }
 
 pub fn last_error() -> u32 {

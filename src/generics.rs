@@ -365,15 +365,27 @@ impl<'s> Types<'s> {
             .find(|g| g.handle() == Some(definition))
     }
 
-    pub fn layout_argument(&self, exact: &Gen) -> Outcome<(usize, TypeSig)> {
-        let module = match exact {
-            Gen::Named(handle, _) => handle.module,
-            _ => self.core.ok_or("System.Private.CoreLib is not loaded")?,
-        };
-        Ok((module, self.layout_sig(exact, module)?))
+    pub fn layout_arguments(&self, arguments: &[Gen]) -> Outcome<Vec<(usize, TypeSig)>> {
+        let mut list = Vec::with_capacity(arguments.len());
+        let mut extras = Vec::new();
+        for exact in arguments {
+            let module = match exact {
+                Gen::Named(handle, _) => handle.module,
+                _ => self.core.ok_or("System.Private.CoreLib is not loaded")?,
+            };
+            let sig = self.layout_sig(exact, module, Some((&mut extras, arguments.len())))?;
+            list.push((module, sig));
+        }
+        list.extend(extras);
+        Ok(list)
     }
 
-    fn layout_sig(&self, exact: &Gen, module: usize) -> Outcome<TypeSig> {
+    fn layout_sig(
+        &self,
+        exact: &Gen,
+        module: usize,
+        mut extras: Option<(&mut Vec<(usize, TypeSig)>, usize)>,
+    ) -> Outcome<TypeSig> {
         match exact {
             Gen::Named(handle, arguments) => {
                 let name = self.set.full_type_name(*handle).map_err(|e| format!("{e:?}"))?;
@@ -397,7 +409,12 @@ impl<'s> Types<'s> {
                     });
                 }
                 if handle.module != module {
-                    return Err("a struct argument from another assembly is nested inside a generic struct".into());
+                    let Some((list, base)) = extras else {
+                        return Err("a struct argument from another assembly is nested inside a generic struct".into());
+                    };
+                    let foreign = self.layout_sig(exact, handle.module, None)?;
+                    list.push((handle.module, foreign));
+                    return Ok(TypeSig::TypeVar((base + list.len() - 1) as u32));
                 }
                 let definition = Token::new(TableId::TypeDef, handle.row);
                 if arguments.is_empty() {
@@ -408,7 +425,9 @@ impl<'s> Types<'s> {
                     definition,
                     arguments: arguments
                         .iter()
-                        .map(|argument| self.layout_sig(argument, module))
+                        .map(|argument| {
+                            self.layout_sig(argument, module, extras.as_mut().map(|(list, base)| (&mut **list, *base)))
+                        })
                         .collect::<Outcome<Vec<_>>>()?,
                 })
             }

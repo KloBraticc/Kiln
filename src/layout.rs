@@ -676,9 +676,14 @@ impl AssemblySet {
                 arguments,
             } => {
                 let handle = self.resolve_type_token(context.module, *definition)?;
+                let shift = arguments.len() as u32;
                 let substituted: Vec<(usize, TypeSig)> = arguments
                     .iter()
-                    .map(|a| self.substitute(context, a))
+                    .map(|a| {
+                        let (module, sig) = self.substitute(context, a);
+                        (module, shift_type_vars(&sig, shift))
+                    })
+                    .chain(context.arguments.iter().cloned())
                     .collect();
                 self.classify_value(handle, &substituted, depth)?
             }
@@ -690,7 +695,7 @@ impl AssemblySet {
                 self.classify(
                     &Context {
                         module: *module,
-                        arguments: &[],
+                        arguments: context.arguments,
                     },
                     argument,
                     depth + 1,
@@ -809,5 +814,21 @@ impl AssemblySet {
             }
         }
         Ok(found)
+    }
+}
+
+fn shift_type_vars(sig: &TypeSig, shift: u32) -> TypeSig {
+    match sig {
+        TypeSig::TypeVar(index) => TypeSig::TypeVar(index + shift),
+        TypeSig::GenericInst {
+            value_type,
+            definition,
+            arguments,
+        } => TypeSig::GenericInst {
+            value_type: *value_type,
+            definition: *definition,
+            arguments: arguments.iter().map(|a| shift_type_vars(a, shift)).collect(),
+        },
+        _ => sig.clone(),
     }
 }

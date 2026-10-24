@@ -224,15 +224,12 @@ impl Image {
                 .insert((*key).clone(), memory.address(offsets[*key]));
         }
         state.trap_address = trap;
-        let handles: Vec<crate::loader::TypeHandle> = state
+        let kinds: Vec<(crate::objects::RuntimeType, crate::loader::TypeHandle)> = state
             .types
             .keys()
-            .filter_map(|kind| match kind {
-                crate::objects::RuntimeType::Class(handle) => Some(*handle),
-                _ => None,
-            })
+            .filter_map(|kind| crate::runtime::vtable_source(model, *kind).map(|handle| (*kind, handle)))
             .collect();
-        for handle in handles {
+        for (kind, handle) in kinds {
             let info = model.class(handle)?;
             let addresses: Vec<u64> = info
                 .vtable
@@ -247,7 +244,9 @@ impl Image {
                     None => trap,
                 })
                 .collect();
-            if let Some(record) = state.types.get_mut(&crate::objects::RuntimeType::Class(handle)) {
+            if let Some(record) = state.types.get_mut(&kind)
+                && record.words.len() >= 7 + addresses.len()
+            {
                 record.words[7..7 + addresses.len()].copy_from_slice(&addresses);
             }
         }
