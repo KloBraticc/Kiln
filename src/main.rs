@@ -12,6 +12,7 @@ fn main() -> ExitCode {
         Some("inspect") if arguments.len() > 1 => inspect(&arguments[1..]),
         Some("resolve") if arguments.len() > 1 => resolve(&arguments[1..]),
         Some("layout") if arguments.len() > 1 => layout(&arguments[1..]),
+        Some("offsets") if arguments.len() > 1 => offsets(&arguments[1..]),
         Some("--version") => {
             println!("kiln {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -256,5 +257,51 @@ fn layout(arguments: &[String]) -> ExitCode {
         println!("{line}");
     }
     eprintln!("{} value types laid out, {failures} failures", lines.len());
+    ExitCode::SUCCESS
+}
+
+fn offsets(arguments: &[String]) -> ExitCode {
+    let set = load_set(arguments);
+    let mut lines = Vec::new();
+    let mut failures = 0u64;
+    for (index, module) in set.modules.iter().enumerate() {
+        let Ok(generic) = set.generic_definitions(index) else {
+            failures += 1;
+            continue;
+        };
+        for row in 1..=module.metadata.rows(kiln::metadata::TableId::TypeDef) {
+            let flags = module
+                .metadata
+                .cell(kiln::metadata::TableId::TypeDef, row, 0)
+                .unwrap_or(0);
+            if generic.contains(&row) || flags & 0x20 != 0 {
+                continue;
+            }
+            let handle = kiln::loader::TypeHandle { module: index, row };
+            if !matches!(set.is_value_type(handle), Ok(false)) {
+                continue;
+            }
+            let name = set.full_type_name(handle).unwrap_or_default();
+            match set.class_fields(handle) {
+                Ok((_, placements)) => {
+                    for placement in placements {
+                        lines.push(format!(
+                            "{}|{name}|04{:06x}|{}",
+                            module.name, placement.field, placement.offset
+                        ));
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    eprintln!("  FAIL {}|{name}: {error:?}", module.name);
+                }
+            }
+        }
+    }
+    lines.sort();
+    for line in &lines {
+        println!("{line}");
+    }
+    eprintln!("{} class fields placed, {failures} failures", lines.len());
     ExitCode::SUCCESS
 }

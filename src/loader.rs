@@ -11,6 +11,7 @@ pub struct Module {
     pub path: PathBuf,
     pub name: &'static str,
     pub metadata: Metadata<'static>,
+    pub ready_to_run: bool,
     top_level: HashMap<(&'static str, &'static str), u32>,
     nested: HashMap<(u32, &'static str), u32>,
     exported: HashMap<(&'static str, &'static str), u32>,
@@ -27,6 +28,7 @@ impl Module {
         let data: &'static [u8] = Box::leak(bytes.into_boxed_slice());
         let image = PeImage::parse(data)?;
         let metadata = Metadata::parse(image.metadata()?)?;
+        let ready_to_run = image.cli.is_ready_to_run();
 
         let name = if metadata.rows(TableId::Assembly) > 0 {
             metadata.string_cell(TableId::Assembly, 1, 7)?
@@ -89,6 +91,7 @@ impl Module {
             path: path.to_path_buf(),
             name,
             metadata,
+            ready_to_run,
             top_level,
             nested,
             exported,
