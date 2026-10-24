@@ -205,3 +205,60 @@ pub fn configure(interpreter: &Interpreter<'_>, properties: &[(String, String)])
     }
     Ok(())
 }
+
+pub fn closure(set: &AssemblySet, application: usize) -> Vec<usize> {
+    let mut order = vec![application];
+    let mut seen: HashSet<usize> = order.iter().copied().collect();
+    let mut index = 0;
+    while index < order.len() {
+        let metadata = &set.modules[order[index]].metadata;
+        for row in 1..=metadata.rows(TableId::AssemblyRef) {
+            let Ok(name) = metadata.string_cell(TableId::AssemblyRef, row, 6) else {
+                continue;
+            };
+            if let Some(found) = set.find_assembly(name)
+                && seen.insert(found)
+            {
+                order.push(found);
+            }
+        }
+        index += 1;
+    }
+    order
+}
+
+pub fn launch(
+    set: &AssemblySet,
+    application: usize,
+    properties: &[(String, String)],
+    arguments: &[String],
+    methods: impl FnOnce(&Interpreter<'_>) -> HashMap<MethodKey, CompiledMethod>,
+) -> i32 {
+    let Some(entry) = entry_point(set, application) else {
+        eprintln!("{} has no entry point", set.modules[application].name);
+        return 2;
+    };
+    let model = ObjectModel::new(set);
+    start(&model);
+    let interpreter = Interpreter::new(&model, None);
+    interpreter.install_bridge();
+    let methods = methods(&interpreter);
+    let image = match crate::jit::Image::link_with_fallback(
+        &methods,
+        &model,
+        &|key| interpreter.stub_for(key),
+        &|module, token| interpreter.array_record_for(module, token),
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("Kiln could not link the application: {error}");
+            return 134;
+        }
+    };
+    interpreter.attach(&image);
+    if let Err(error) = configure(&interpreter, properties) {
+        eprintln!("Kiln could not configure the application: {error}");
+        return 134;
+    }
+    run_main(&interpreter, &entry, arguments)
+}

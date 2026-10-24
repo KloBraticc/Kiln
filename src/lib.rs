@@ -12,6 +12,7 @@ pub mod loader;
 pub mod members;
 pub mod metadata;
 pub mod objects;
+pub mod package;
 pub mod pinvoke;
 pub mod pe;
 pub mod reachability;

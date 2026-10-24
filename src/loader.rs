@@ -26,7 +26,10 @@ impl Module {
     fn load(path: &Path) -> Result<Self> {
         let bytes =
             std::fs::read(path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
-        let data: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        Self::from_bytes(path, Box::leak(bytes.into_boxed_slice()))
+    }
+
+    fn from_bytes(path: &Path, data: &'static [u8]) -> Result<Self> {
         let image = PeImage::parse(data)?;
         let metadata = Metadata::parse(image.metadata()?)?;
         let ready_to_run = image.cli.is_ready_to_run();
@@ -258,7 +261,15 @@ pub struct AssemblySet {
 
 impl AssemblySet {
     pub fn add(&mut self, path: &Path) -> Result<Option<usize>> {
-        let module = match Module::load(path) {
+        self.insert(Module::load(path))
+    }
+
+    pub fn add_bytes(&mut self, path: &Path, data: &'static [u8]) -> Result<Option<usize>> {
+        self.insert(Module::from_bytes(path, data))
+    }
+
+    fn insert(&mut self, module: Result<Module>) -> Result<Option<usize>> {
+        let module = match module {
             Ok(module) => module,
             Err(Error::NotManaged) => return Ok(None),
             Err(error) => return Err(error),

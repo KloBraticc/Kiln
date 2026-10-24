@@ -19,6 +19,14 @@ fn main() -> ExitCode {
         Some("baml") if arguments.len() > 1 => reach(&arguments[1..], Listing::Baml),
         Some("fallback-report") if arguments.len() > 1 => reach(&arguments[1..], Listing::Fallback),
         Some("disasm") => disasm(&arguments[1..]),
+        Some("publish") if arguments.len() > 1 => {
+            let rest = arguments[1..].to_vec();
+            std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn(move || publish(&rest))
+                .map(|worker| worker.join().unwrap_or(ExitCode::from(101)))
+                .unwrap_or(ExitCode::from(101))
+        }
         Some("run") if arguments.len() > 1 => {
             let rest = arguments[1..].to_vec();
             std::thread::Builder::new()
@@ -56,7 +64,8 @@ fn main() -> ExitCode {
        kiln reach <application> <folder>...
        kiln reach-methods <application> <folder>...
        kiln baml <application> <folder>...
-       kiln run <application> <folder>... [-- arguments]"
+       kiln run <application> <folder>... [-- arguments]
+       kiln publish <application> <folder>... -o <output.exe>"
             );
             ExitCode::from(2)
         }
@@ -1271,18 +1280,65 @@ fn run_application(arguments: &[String]) -> ExitCode {
     let split = arguments.iter().position(|a| a == "--").unwrap_or(arguments.len());
     let (inputs, forwarded) = (&arguments[..split], arguments.get(split + 1..).unwrap_or(&[]));
     let set = load_set(inputs);
-    let application = Path::new(&inputs[0])
+    let Some(application) = application_index(&set, &inputs[0]) else {
+        return ExitCode::from(2);
+    };
+    let application_path = Path::new(&inputs[0]);
+    let directory = application_path.parent().unwrap_or(Path::new("."));
+    let mut properties = kiln::host::default_properties(&format!("{}\\", directory.display()));
+    if let Ok(text) = std::fs::read_to_string(application_path.with_extension("runtimeconfig.json")) {
+        properties.extend(kiln::host::config_properties(&text));
+    }
+    let helpers = kiln::jit::helpers();
+    let code = kiln::host::launch(&set, application, &properties, forwarded, |interpreter| {
+        kiln::host::compile(&set, &helpers, interpreter, &kiln::host::reachable(&set, application))
+    });
+    ExitCode::from(code as u8)
+}
+
+fn application_index(set: &kiln::loader::AssemblySet, path: &str) -> Option<usize> {
+    let found = Path::new(path)
         .file_stem()
         .and_then(|stem| stem.to_str())
         .and_then(|stem| set.find_assembly(stem));
-    let Some(application) = application else {
-        eprintln!("{} is not a managed assembly", inputs[0]);
+    if found.is_none() {
+        eprintln!("{path} is not a managed assembly");
+    }
+    found
+}
+
+fn publish(arguments: &[String]) -> ExitCode {
+    let Some(flag) = arguments.iter().position(|a| a == "-o") else {
+        eprintln!("usage: kiln publish <application> <folder>... -o <output.exe>");
         return ExitCode::from(2);
     };
-    let Some(entry) = kiln::host::entry_point(&set, application) else {
-        eprintln!("{} has no entry point", inputs[0]);
+    let Some(output) = arguments.get(flag + 1) else {
+        eprintln!("-o needs an output path");
         return ExitCode::from(2);
     };
+    let inputs: Vec<String> = arguments[..flag].iter().chain(&arguments[flag + 2..]).cloned().collect();
+    let started = Instant::now();
+    let everything = load_set(&inputs);
+    let Some(application) = application_index(&everything, &inputs[0]) else {
+        return ExitCode::from(2);
+    };
+    let mut set = kiln::loader::AssemblySet::default();
+    let mut modules = Vec::new();
+    for index in kiln::host::closure(&everything, application) {
+        let module = &everything.modules[index];
+        let data = module.image.data();
+        if let Err(error) = set.add_bytes(&module.path, data) {
+            eprintln!("{}: {error}", module.path.display());
+            return ExitCode::from(1);
+        }
+        let name = module
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        modules.push((name, data.to_vec()));
+    }
+    let application = 0;
     let helpers = kiln::jit::helpers();
     let model = kiln::objects::ObjectModel::new(&set);
     kiln::host::start(&model);
@@ -1290,29 +1346,51 @@ fn run_application(arguments: &[String]) -> ExitCode {
     interpreter.install_bridge();
     let wanted = kiln::host::reachable(&set, application);
     let methods = kiln::host::compile(&set, &helpers, &interpreter, &wanted);
-    let image = match kiln::jit::Image::link_with_fallback(
-        &methods,
-        &model,
-        &|key| interpreter.stub_for(key),
-        &|module, token| interpreter.array_record_for(module, token),
-    ) {
-        Ok(image) => image,
+    let compiled = methods.len();
+    let mut properties = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(Path::new(&inputs[0]).with_extension("runtimeconfig.json")) {
+        properties.extend(kiln::host::config_properties(&text));
+    }
+    let payload = kiln::package::Payload {
+        application,
+        modules,
+        properties,
+        methods,
+    };
+    let encoded = match kiln::package::encode(&payload, &helpers) {
+        Ok(encoded) => encoded,
         Err(error) => {
-            eprintln!("linking failed: {error}");
+            eprintln!("packaging failed: {error}");
             return ExitCode::from(1);
         }
     };
-    interpreter.attach(&image);
-    let application_path = Path::new(&inputs[0]);
-    let directory = application_path.parent().unwrap_or(Path::new("."));
-    let mut properties = kiln::host::default_properties(&format!("{}\\", directory.display()));
-    if let Ok(text) = std::fs::read_to_string(application_path.with_extension("runtimeconfig.json")) {
-        properties.extend(kiln::host::config_properties(&text));
+    let host_path = std::env::current_exe()
+        .map(|exe| exe.with_file_name("kiln-host.exe"))
+        .unwrap_or_default();
+    let mut executable = match std::fs::read(&host_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("{}: {error}", host_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let subsystem = kiln::package::subsystem_of(set.modules[application].image.data()).unwrap_or(3);
+    if let Err(error) = kiln::package::set_subsystem(&mut executable, subsystem) {
+        eprintln!("packaging failed: {error}");
+        return ExitCode::from(1);
     }
-    if let Err(error) = kiln::host::configure(&interpreter, &properties) {
-        eprintln!("Kiln could not configure the application: {error}");
-        return ExitCode::from(134);
+    executable.extend_from_slice(&encoded);
+    if let Err(error) = std::fs::write(output, &executable) {
+        eprintln!("{output}: {error}");
+        return ExitCode::from(1);
     }
-    let code = kiln::host::run_main(&interpreter, &entry, forwarded);
-    ExitCode::from(code as u8)
+    println!(
+        "{output}: {} assemblies, {} of {} reachable methods compiled to x64, {} MB, {:.2?}",
+        payload.modules.len(),
+        compiled,
+        wanted.len(),
+        executable.len() / (1024 * 1024),
+        started.elapsed()
+    );
+    ExitCode::SUCCESS
 }
