@@ -120,10 +120,12 @@ fn load_library(directory: &Path, library: &str) -> Option<usize> {
     if let Some((_, handle)) = libraries.iter().find(|(name, _)| *name == cache_key) {
         return Some(*handle);
     }
-    let has_extension = Path::new(library).extension().is_some();
+    let has_dll = Path::new(library)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("dll") || e.eq_ignore_ascii_case("exe"));
     let mut candidates = Vec::new();
     for name in [library.to_owned(), format!("{library}.dll")] {
-        if name != library && has_extension {
+        if name != library && has_dll {
             continue;
         }
         candidates.push(directory.join(&name).display().to_string());
