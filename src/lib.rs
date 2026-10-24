@@ -1,3 +1,4 @@
+pub mod baml;
 pub mod codegen;
 pub mod error;
 pub mod il;
@@ -9,7 +10,9 @@ pub mod members;
 pub mod metadata;
 pub mod objects;
 pub mod pe;
+pub mod reachability;
 pub mod reader;
+pub mod resources;
 pub mod runtime;
 pub mod signature;
 

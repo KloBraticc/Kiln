@@ -20,6 +20,15 @@ The assembly reader is complete:
 
 `kiln inspect <assembly or folder>...` decodes and verifies every method body it finds.
 
+The reachability analysis understands WPF:
+
+- Reads embedded `.g.resources` files and decodes every BAML record, including WPF's built in known types, which are read from PresentationFramework itself
+- Follows calls, constructions, fields, generic instantiations, interfaces, virtual overrides, custom attributes and module initializers from the entry point, and into the BAML of every library it reaches
+- Keeps types used through reflection: everything named by BAML, `typeof` and type name strings passed to reflection APIs, and types activated through generic methods such as dependency injection registration
+- Reports the methods whose reflection cannot be resolved ahead of time, which are left to the fallback
+
+`kiln reach <application> <folder>...` prints the result, `kiln reach-methods` lists every reachable method and `kiln baml` lists the types each BAML document creates.
+
 ## Roadmap
 
 1. Type system: signatures, generics, type layout and member resolution across assemblies

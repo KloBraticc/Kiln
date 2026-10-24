@@ -342,6 +342,14 @@ impl AssemblySet {
         }
     }
 
+    pub fn find_named(&self, module: usize, namespace: &str, name: &str) -> Option<TypeHandle> {
+        self.find(module, namespace, name, 0).ok()
+    }
+
+    pub fn find_nested(&self, outer: TypeHandle, name: &str) -> Option<TypeHandle> {
+        self.nested(outer, name).ok()
+    }
+
     fn assembly_ref(&self, module: usize, row: u32) -> std::result::Result<usize, ResolveError> {
         let name = self.modules[module]
             .metadata

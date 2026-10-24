@@ -14,6 +14,9 @@ fn main() -> ExitCode {
         Some("layout") if arguments.len() > 1 => layout(&arguments[1..]),
         Some("offsets") if arguments.len() > 1 => offsets(&arguments[1..]),
         Some("ir") if arguments.len() > 1 => ir(&arguments[1..]),
+        Some("reach") if arguments.len() > 1 => reach(&arguments[1..], Listing::Summary),
+        Some("reach-methods") if arguments.len() > 1 => reach(&arguments[1..], Listing::Methods),
+        Some("baml") if arguments.len() > 1 => reach(&arguments[1..], Listing::Baml),
         Some("disasm") => disasm(&arguments[1..]),
         Some("jit-cases") if arguments.len() > 2 => jit_cases(&arguments[1..]),
         Some("jit-check") if arguments.len() > 2 => {
@@ -31,10 +34,110 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: kiln inspect <assembly or folder>...
-       kiln resolve <assembly or folder>..."
+       kiln resolve <assembly or folder>...
+       kiln reach <application> <folder>...
+       kiln reach-methods <application> <folder>...
+       kiln baml <application> <folder>..."
             );
             ExitCode::from(2)
         }
+    }
+}
+
+#[derive(PartialEq)]
+enum Listing {
+    Summary,
+    Methods,
+    Baml,
+}
+
+fn reach(arguments: &[String], listing: Listing) -> ExitCode {
+    let started = Instant::now();
+    let set = load_set(arguments);
+    let application = Path::new(&arguments[0])
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| set.find_assembly(stem));
+    let Some(application) = application else {
+        eprintln!("{} is not a managed assembly", arguments[0]);
+        return ExitCode::from(2);
+    };
+    let mut analysis = kiln::reachability::Reachability::new(&set);
+    analysis.add_application(application);
+    analysis.run();
+    if listing == Listing::Methods {
+        let mut lines: Vec<String> = analysis
+            .methods
+            .iter()
+            .filter_map(|method| {
+                let module = &set.modules[method.module];
+                let owner = module.method_owner(method.row).ok().flatten()?;
+                let name = module
+                    .metadata
+                    .string_cell(kiln::metadata::TableId::MethodDef, method.row, 3)
+                    .ok()?;
+                let owner = set
+                    .full_type_name(kiln::loader::TypeHandle {
+                        module: method.module,
+                        row: owner,
+                    })
+                    .ok()?;
+                Some(format!("{}	{owner}:{name}", module.name))
+            })
+            .collect();
+        lines.sort();
+        lines.dedup();
+        for line in lines {
+            println!("{line}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if listing == Listing::Baml {
+        for document in &analysis.baml {
+            let mut elements = document.elements.clone();
+            elements.sort();
+            elements.dedup();
+            println!("{}	{}", document.resource, elements.join(";"));
+            for missing in &document.unresolved {
+                println!("  UNRESOLVED {missing}");
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    let total_types: u32 = set
+        .modules
+        .iter()
+        .map(|m| m.metadata.rows(kiln::metadata::TableId::TypeDef))
+        .sum();
+    let total_methods: u32 = set
+        .modules
+        .iter()
+        .map(|m| m.metadata.rows(kiln::metadata::TableId::MethodDef))
+        .sum();
+    let unresolved_baml: usize = analysis.baml.iter().map(|d| d.unresolved.len()).sum();
+    let records: usize = analysis.baml.iter().map(|d| d.records).sum();
+    for (reason, count) in &analysis.unresolved {
+        println!("  {count} {reason}");
+    }
+    println!(
+        "{} BAML documents decoded ({records} records, {} WPF known types), {} types named by BAML, {unresolved_baml} BAML type references unresolved",
+        analysis.baml.len(),
+        analysis.known_types(),
+        analysis.baml_types.len()
+    );
+    println!(
+        "{} of {total_types} types reachable, {} constructed, {} kept for reflection, {} of {total_methods} methods reachable, {} methods use reflection the analysis cannot see through, {:.2?}",
+        analysis.types.len(),
+        analysis.constructed.len(),
+        analysis.dynamic.len(),
+        analysis.methods.len(),
+        analysis.open_reflection.len(),
+        started.elapsed()
+    );
+    if unresolved_baml == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
