@@ -164,11 +164,29 @@ fn resolve(arguments: &[String]) -> ExitCode {
         }
     }
 
+    let mut members = 0u64;
+    let mut array_members = 0u64;
+    for (index, module) in set.modules.iter().enumerate() {
+        for row in 1..=module.metadata.rows(kiln::metadata::TableId::MemberRef) {
+            match set.resolve_member_ref(index, row) {
+                Ok(kiln::members::Member::ArrayMethod) => array_members += 1,
+                Ok(_) => members += 1,
+                Err(kiln::loader::ResolveError::MissingAssembly(name)) => {
+                    *missing_assemblies.entry(name).or_default() += 1
+                }
+                Err(error) => {
+                    failures += 1;
+                    println!("  FAIL {} MemberRef {row}: {error:?}", module.name);
+                }
+            }
+        }
+    }
+
     for (name, count) in &missing_assemblies {
         println!("  not in the set: {name} ({count} references)");
     }
     println!(
-        "{} assemblies loaded in {:.2?}, {unreadable} unreadable, {resolved} type references resolved, {} point outside the set, {failures} failures, total {:.2?}",
+        "{} assemblies loaded in {:.2?}, {unreadable} unreadable, {resolved} type references and {members} member references resolved, {array_members} array methods, {} point outside the set, {failures} failures, total {:.2?}",
         set.modules.len(),
         loaded,
         missing_assemblies.values().sum::<u64>(),
