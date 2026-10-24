@@ -1,6 +1,8 @@
+pub mod codegen;
 pub mod error;
 pub mod il;
 pub mod ir;
+pub mod jit;
 pub mod layout;
 pub mod loader;
 pub mod members;

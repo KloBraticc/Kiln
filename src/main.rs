@@ -15,6 +15,15 @@ fn main() -> ExitCode {
         Some("offsets") if arguments.len() > 1 => offsets(&arguments[1..]),
         Some("ir") if arguments.len() > 1 => ir(&arguments[1..]),
         Some("disasm") => disasm(&arguments[1..]),
+        Some("jit-cases") if arguments.len() > 2 => jit_cases(&arguments[1..]),
+        Some("jit-check") if arguments.len() > 2 => {
+            let rest = arguments[1..].to_vec();
+            std::thread::Builder::new()
+                .stack_size(512 * 1024 * 1024)
+                .spawn(move || jit_check(&rest))
+                .map(|worker| worker.join().unwrap_or(ExitCode::from(101)))
+                .unwrap_or(ExitCode::from(101))
+        }
         Some("--version") => {
             println!("kiln {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -463,4 +472,279 @@ fn disasm(arguments: &[String]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+const CASES_PER_METHOD: u64 = 24;
+
+struct Eligible {
+    methods: std::collections::HashMap<kiln::codegen::MethodKey, kiln::codegen::CompiledMethod>,
+    reasons: std::collections::BTreeMap<String, u64>,
+    examined: u64,
+}
+
+fn compile_eligible(set: &kiln::loader::AssemblySet, helpers: &kiln::codegen::Helpers) -> Eligible {
+    use kiln::codegen::{CompileError, MethodKey};
+    use kiln::metadata::TableId;
+    let compiler = kiln::codegen::Compiler::new(set, helpers);
+    let mut methods = std::collections::HashMap::new();
+    let mut reasons: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut examined = 0u64;
+    for (index, module) in set.modules.iter().enumerate() {
+        for row in 1..=module.metadata.rows(TableId::MethodDef) {
+            let rva = module
+                .metadata
+                .cell(TableId::MethodDef, row, 0)
+                .unwrap_or(0);
+            let implementation = module
+                .metadata
+                .cell(TableId::MethodDef, row, 1)
+                .unwrap_or(0);
+            if rva == 0 || implementation & 0x3 != 0 {
+                continue;
+            }
+            let key = MethodKey { module: index, row };
+            if kiln::codegen::method_types(set, &key).is_err() {
+                continue;
+            }
+            examined += 1;
+            match compiler.compile(&key) {
+                Ok(method) => {
+                    methods.insert(key, method);
+                }
+                Err(CompileError::Unsupported(reason)) | Err(CompileError::Translate(reason)) => {
+                    let reason = reason.split(" at IL").next().unwrap_or("").to_owned();
+                    *reasons.entry(reason).or_default() += 1;
+                }
+            }
+        }
+    }
+    loop {
+        let missing: Vec<MethodKey> = methods
+            .iter()
+            .filter(|(_, m)| m.callees.iter().any(|c| !methods.contains_key(c)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        for key in missing {
+            methods.remove(&key);
+            *reasons
+                .entry("calls a method that is not compiled".into())
+                .or_default() += 1;
+        }
+    }
+    Eligible {
+        methods,
+        reasons,
+        examined,
+    }
+}
+
+fn method_signature(
+    set: &kiln::loader::AssemblySet,
+    key: &kiln::codegen::MethodKey,
+) -> Option<kiln::signature::MethodSig> {
+    let metadata = &set.modules[key.module].metadata;
+    let blob = metadata
+        .cell(kiln::metadata::TableId::MethodDef, key.row, 4)
+        .ok()?;
+    match kiln::signature::Signature::parse(metadata.blob(blob).ok()?).ok()? {
+        kiln::signature::Signature::Method(sig) => Some(sig),
+        _ => None,
+    }
+}
+
+fn jit_cases(arguments: &[String]) -> ExitCode {
+    let Some((output, folders)) = arguments.split_first() else {
+        return ExitCode::from(2);
+    };
+    let started = Instant::now();
+    let set = load_set(folders);
+    let helpers = kiln::jit::helpers();
+    let eligible = compile_eligible(&set, &helpers);
+    let mut lines = Vec::new();
+    let mut testable = 0u64;
+    let mut keys: Vec<&kiln::codegen::MethodKey> = eligible.methods.keys().collect();
+    keys.sort_by_key(|k| (k.module, k.row));
+    for key in keys {
+        let Some(sig) = method_signature(&set, key) else {
+            continue;
+        };
+        let Some(returns) = kiln::jit::ValueKind::from_sig(&sig.return_type) else {
+            continue;
+        };
+        let Some(parameters) = sig
+            .parameters
+            .iter()
+            .map(kiln::jit::ValueKind::from_sig)
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        testable += 1;
+        let module = &set.modules[key.module];
+        for case in 0..CASES_PER_METHOD {
+            let values: Vec<String> = parameters
+                .iter()
+                .enumerate()
+                .map(|(position, kind)| {
+                    let seed = (u64::from(key.row) << 24)
+                        ^ (case << 8)
+                        ^ position as u64
+                        ^ (key.module as u64) << 48;
+                    format!("{:x}", kiln::jit::generate_argument(*kind, seed))
+                })
+                .collect();
+            lines.push(format!(
+                "{}\t{:08x}\t{case}\t{}\t{}\t{}",
+                module.path.display(),
+                0x0600_0000 | key.row,
+                values.join(","),
+                parameters
+                    .iter()
+                    .map(|k| k.name())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                returns.name()
+            ));
+        }
+    }
+    if let Err(error) = std::fs::write(output, lines.join("\n") + "\n") {
+        eprintln!("could not write {output}: {error}");
+        return ExitCode::from(1);
+    }
+    let mut reasons: Vec<(&String, &u64)> = eligible.reasons.iter().collect();
+    reasons.sort_by(|a, b| b.1.cmp(a.1));
+    for (reason, count) in reasons.iter().take(15) {
+        println!("  not yet compiled: {count} {reason}");
+    }
+    println!(
+        "{} methods with primitive signatures examined, {} compiled to x64, {testable} testable with a return value, {} cases written in {:.2?}",
+        eligible.examined,
+        eligible.methods.len(),
+        lines.len(),
+        started.elapsed()
+    );
+    ExitCode::SUCCESS
+}
+
+fn jit_check(arguments: &[String]) -> ExitCode {
+    let Some((results, folders)) = arguments.split_first() else {
+        return ExitCode::from(2);
+    };
+    let started = Instant::now();
+    let set = load_set(folders);
+    let helpers = kiln::jit::helpers();
+    let eligible = compile_eligible(&set, &helpers);
+    let image = match kiln::jit::Image::link(&eligible.methods) {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("linking failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let compiled_bytes: usize = eligible.methods.values().map(|m| m.code.len()).sum();
+    let linked = started.elapsed();
+    let modules: std::collections::HashMap<String, usize> = set
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.path.display().to_string(), i))
+        .collect();
+    let Ok(text) = std::fs::read_to_string(results) else {
+        eprintln!("could not read {results}");
+        return ExitCode::from(1);
+    };
+    let (mut compared, mut matched, mut skipped) = (0u64, 0u64, 0u64);
+    let trace = std::env::var_os("KILN_TRACE").is_some();
+    let mut mismatched_methods: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut examples = Vec::new();
+    let mut methods_seen = std::collections::HashSet::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let (path, token, case, values, returns, result) = (
+            fields[0], fields[1], fields[2], fields[3], fields[5], fields[6],
+        );
+        let Ok(result) = u64::from_str_radix(result, 16) else {
+            skipped += 1;
+            continue;
+        };
+        let (Some(&module), Ok(token)) = (modules.get(path), u32::from_str_radix(token, 16)) else {
+            skipped += 1;
+            continue;
+        };
+        let key = kiln::codegen::MethodKey {
+            module,
+            row: token & 0x00FF_FFFF,
+        };
+        let arguments: Vec<u64> = if values.is_empty() {
+            Vec::new()
+        } else {
+            values
+                .split(',')
+                .map(|v| u64::from_str_radix(v, 16).unwrap_or(0))
+                .collect()
+        };
+        let kind = match returns {
+            "bool" => kiln::jit::ValueKind::Boolean,
+            "i8" => kiln::jit::ValueKind::I8,
+            "u8" => kiln::jit::ValueKind::U8,
+            "i16" => kiln::jit::ValueKind::I16,
+            "u16" => kiln::jit::ValueKind::U16,
+            "i32" => kiln::jit::ValueKind::I32,
+            "u32" => kiln::jit::ValueKind::U32,
+            "i64" => kiln::jit::ValueKind::I64,
+            "u64" => kiln::jit::ValueKind::U64,
+            "f32" => kiln::jit::ValueKind::F32,
+            _ => kiln::jit::ValueKind::F64,
+        };
+        if trace {
+            eprintln!(
+                "run {} row {} case {case} args [{values}]",
+                set.modules[module].name, key.row
+            );
+        }
+        let Some(raw) = image.call(&key, &arguments) else {
+            skipped += 1;
+            continue;
+        };
+        compared += 1;
+        methods_seen.insert(key.clone());
+        let actual = kind.normalize_result(raw);
+        if actual == result {
+            matched += 1;
+        } else {
+            let name = set.modules[module]
+                .metadata
+                .string_cell(kiln::metadata::TableId::MethodDef, key.row, 3)
+                .unwrap_or("?");
+            let label = format!("{}::{name} (row {})", set.modules[module].name, key.row);
+            *mismatched_methods.entry(label.clone()).or_default() += 1;
+            if examples.len() < 25 {
+                examples.push(format!(
+                    "{label} case {case} args [{values}] expected {result:x} got {actual:x}"
+                ));
+            }
+        }
+    }
+    for example in &examples {
+        println!("  MISMATCH {example}");
+    }
+    println!(
+        "{} methods compiled into {compiled_bytes} bytes of x64 and linked in {linked:.2?}, {} methods executed, {compared} cases compared, {matched} identical to .NET, {} mismatched in {} methods, {skipped} cases skipped (.NET threw or the case was not runnable), total {:.2?}",
+        eligible.methods.len(),
+        methods_seen.len(),
+        compared - matched,
+        mismatched_methods.len(),
+        started.elapsed()
+    );
+    if compared == matched {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }

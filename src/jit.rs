@@ -1,0 +1,407 @@
+use std::collections::HashMap;
+
+use crate::codegen::asm::{
+    ARGUMENT_REGISTERS, AbsoluteTarget, Assembler, R10, RAX, RBP, RCX, RDX, RSP,
+};
+use crate::codegen::{CompiledMethod, Helpers, MethodKey, VarType};
+use crate::signature::TypeSig;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn VirtualAlloc(address: *mut u8, size: usize, allocation: u32, protection: u32) -> *mut u8;
+    fn VirtualProtect(address: *mut u8, size: usize, protection: u32, old: *mut u32) -> i32;
+    fn VirtualFree(address: *mut u8, size: usize, kind: u32) -> i32;
+    fn FlushInstructionCache(process: isize, address: *const u8, size: usize) -> i32;
+    fn GetCurrentProcess() -> isize;
+}
+
+const MEM_COMMIT_RESERVE: u32 = 0x3000;
+const MEM_RELEASE: u32 = 0x8000;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+
+extern "win64" fn to_i8(value: f64) -> i64 {
+    value as i32 as i8 as i64
+}
+
+extern "win64" fn to_u8(value: f64) -> i64 {
+    value as i32 as u8 as i64
+}
+
+extern "win64" fn to_i16(value: f64) -> i64 {
+    value as i32 as i16 as i64
+}
+
+extern "win64" fn to_u16(value: f64) -> i64 {
+    value as i32 as u16 as i64
+}
+
+extern "win64" fn to_i32(value: f64) -> i64 {
+    value as i32 as i64
+}
+
+extern "win64" fn to_u32(value: f64) -> i64 {
+    value as u32 as i64
+}
+
+extern "win64" fn to_i64(value: f64) -> i64 {
+    value as i64
+}
+
+extern "win64" fn to_u64(value: f64) -> i64 {
+    value as u64 as i64
+}
+
+extern "win64" fn uint64_to_double(value: u64) -> f64 {
+    value as f64
+}
+
+extern "win64" fn remainder32(a: f32, b: f32) -> f32 {
+    a % b
+}
+
+extern "win64" fn remainder64(a: f64, b: f64) -> f64 {
+    a % b
+}
+
+pub fn helpers() -> Helpers {
+    Helpers {
+        float_to_int: [
+            to_i8 as *const () as u64,
+            to_u8 as *const () as u64,
+            to_i16 as *const () as u64,
+            to_u16 as *const () as u64,
+            to_i32 as *const () as u64,
+            to_u32 as *const () as u64,
+            to_i64 as *const () as u64,
+            to_u64 as *const () as u64,
+        ],
+        uint64_to_double: uint64_to_double as *const () as u64,
+        remainder32: remainder32 as *const () as u64,
+        remainder64: remainder64 as *const () as u64,
+    }
+}
+
+pub struct ExecutableMemory {
+    base: *mut u8,
+    size: usize,
+}
+
+impl ExecutableMemory {
+    pub fn address(&self, offset: usize) -> u64 {
+        self.base as u64 + offset as u64
+    }
+}
+
+impl Drop for ExecutableMemory {
+    fn drop(&mut self) {
+        unsafe {
+            VirtualFree(self.base, 0, MEM_RELEASE);
+        }
+        let _ = self.size;
+    }
+}
+
+pub struct Image {
+    memory: ExecutableMemory,
+    thunks: HashMap<MethodKey, usize>,
+}
+
+type Thunk = unsafe extern "win64" fn(*const u64, *mut [u64; 2]);
+
+impl Image {
+    pub fn link(methods: &HashMap<MethodKey, CompiledMethod>) -> Result<Image, String> {
+        let mut keys: Vec<&MethodKey> = methods.keys().collect();
+        keys.sort_by_key(|k| (k.module, k.row));
+        let mut code = Vec::new();
+        let mut offsets: HashMap<MethodKey, usize> = HashMap::new();
+        for key in &keys {
+            code.resize(code.len().next_multiple_of(16), 0xCC);
+            offsets.insert((*key).clone(), code.len());
+            code.extend_from_slice(&methods[*key].code);
+        }
+        let mut thunk_offsets = HashMap::new();
+        let mut pending = Vec::new();
+        for key in &keys {
+            code.resize(code.len().next_multiple_of(16), 0xCC);
+            let thunk = build_thunk(&methods[*key].parameters);
+            thunk_offsets.insert((*key).clone(), code.len());
+            pending.push((code.len() + thunk.1, offsets[*key]));
+            code.extend_from_slice(&thunk.0);
+        }
+
+        let mut relocations: Vec<(usize, Relocation)> = Vec::new();
+        for key in &keys {
+            let method = &methods[*key];
+            let start = offsets[*key];
+            for absolute in &method.absolutes {
+                let relocation = match absolute.target {
+                    AbsoluteTarget::Address(address) => Relocation::Address(address),
+                    AbsoluteTarget::Method(index) => {
+                        let callee = &method.callees[index];
+                        Relocation::Offset(*offsets.get(callee).ok_or("a callee was not compiled")?)
+                    }
+                };
+                relocations.push((start + absolute.at, relocation));
+            }
+        }
+        for (at, target) in pending {
+            relocations.push((at, Relocation::Offset(target)));
+        }
+
+        let memory = ExecutableMemory::new_at_any(&code, &relocations)?;
+        Ok(Image {
+            memory,
+            thunks: thunk_offsets,
+        })
+    }
+
+    pub fn call(&self, key: &MethodKey, arguments: &[u64]) -> Option<[u64; 2]> {
+        let offset = *self.thunks.get(key)?;
+        let thunk: Thunk = unsafe { std::mem::transmute(self.memory.address(offset) as usize) };
+        let mut result = [0u64; 2];
+        unsafe { thunk(arguments.as_ptr(), &mut result) };
+        Some(result)
+    }
+}
+
+enum Relocation {
+    Address(u64),
+    Offset(usize),
+}
+
+impl ExecutableMemory {
+    fn new_at_any(code: &[u8], relocations: &[(usize, Relocation)]) -> Result<Self, String> {
+        let size = code.len().max(1).next_multiple_of(4096);
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null_mut(),
+                size,
+                MEM_COMMIT_RESERVE,
+                PAGE_READWRITE,
+            );
+            if base.is_null() {
+                return Err("executable memory could not be allocated".into());
+            }
+            std::ptr::copy_nonoverlapping(code.as_ptr(), base, code.len());
+            for (at, relocation) in relocations {
+                let value = match relocation {
+                    Relocation::Address(address) => *address,
+                    Relocation::Offset(offset) => base as u64 + *offset as u64,
+                };
+                std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), base.add(*at), 8);
+            }
+            let mut old = 0u32;
+            if VirtualProtect(base, size, PAGE_EXECUTE_READ, &mut old) == 0 {
+                VirtualFree(base, 0, MEM_RELEASE);
+                return Err("executable memory could not be protected".into());
+            }
+            FlushInstructionCache(GetCurrentProcess(), base, size);
+            Ok(Self { base, size })
+        }
+    }
+}
+
+fn build_thunk(parameters: &[VarType]) -> (Vec<u8>, usize) {
+    let mut asm = Assembler::default();
+    let stack_arguments = parameters.len().saturating_sub(4) as u32;
+    let frame = (16 + 32 + 8 * stack_arguments).next_multiple_of(16);
+    asm.prologue(frame);
+    asm.store(true, RBP, -8, RCX);
+    asm.store(true, RBP, -16, RDX);
+    asm.move_register(true, R10, RCX);
+    for (index, _) in parameters.iter().enumerate().skip(4) {
+        asm.load(true, RAX, R10, 8 * index as i32);
+        asm.store(true, RSP, 32 + 8 * (index as i32 - 4), RAX);
+    }
+    for (index, var) in parameters.iter().enumerate().take(4) {
+        match var {
+            VarType::F32 => asm.sse_load(false, index as u8, R10, 8 * index as i32),
+            VarType::F64 => asm.sse_load(true, index as u8, R10, 8 * index as i32),
+            _ => asm.load(true, ARGUMENT_REGISTERS[index], R10, 8 * index as i32),
+        }
+    }
+    let call_at = asm.code.len() + 2;
+    asm.move_immediate(RAX, 0);
+    asm.call_register(RAX);
+    asm.load(true, RCX, RBP, -16);
+    asm.store(true, RCX, 0, RAX);
+    asm.sse_store(true, RCX, 8, 0);
+    asm.epilogue();
+    let (code, _) = asm.finish().expect("thunk has no labels");
+    (code, call_at)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    Boolean,
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    F32,
+    F64,
+}
+
+impl ValueKind {
+    pub fn from_sig(sig: &TypeSig) -> Option<ValueKind> {
+        use TypeSig as T;
+        Some(match sig {
+            T::Boolean => ValueKind::Boolean,
+            T::I1 => ValueKind::I8,
+            T::U1 => ValueKind::U8,
+            T::I2 => ValueKind::I16,
+            T::U2 | T::Char => ValueKind::U16,
+            T::I4 => ValueKind::I32,
+            T::U4 => ValueKind::U32,
+            T::I8 | T::IntPtr => ValueKind::I64,
+            T::U8 | T::UIntPtr => ValueKind::U64,
+            T::R4 => ValueKind::F32,
+            T::R8 => ValueKind::F64,
+            T::Modified { inner, .. } => return ValueKind::from_sig(inner),
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ValueKind::Boolean => "bool",
+            ValueKind::I8 => "i8",
+            ValueKind::U8 => "u8",
+            ValueKind::I16 => "i16",
+            ValueKind::U16 => "u16",
+            ValueKind::I32 => "i32",
+            ValueKind::U32 => "u32",
+            ValueKind::I64 => "i64",
+            ValueKind::U64 => "u64",
+            ValueKind::F32 => "f32",
+            ValueKind::F64 => "f64",
+        }
+    }
+
+    pub fn normalize_integer(self, raw: i64) -> u64 {
+        match self {
+            ValueKind::Boolean => u64::from(raw as u8 != 0),
+            ValueKind::I8 => raw as i8 as i64 as u64,
+            ValueKind::U8 => raw as u8 as u64,
+            ValueKind::I16 => raw as i16 as i64 as u64,
+            ValueKind::U16 => raw as u16 as u64,
+            ValueKind::I32 => raw as i32 as i64 as u64,
+            ValueKind::U32 => raw as u32 as u64,
+            ValueKind::I64 | ValueKind::U64 => raw as u64,
+            ValueKind::F32 => {
+                let value = f32::from_bits(raw as u32);
+                if value.is_nan() {
+                    0x7FC0_0000
+                } else {
+                    u64::from(value.to_bits())
+                }
+            }
+            ValueKind::F64 => {
+                let value = f64::from_bits(raw as u64);
+                if value.is_nan() {
+                    0x7FF8_0000_0000_0000
+                } else {
+                    value.to_bits()
+                }
+            }
+        }
+    }
+
+    pub fn normalize_result(self, result: [u64; 2]) -> u64 {
+        match self {
+            ValueKind::F32 | ValueKind::F64 => self.normalize_integer(result[1] as i64),
+            _ => self.normalize_integer(result[0] as i64),
+        }
+    }
+}
+
+const INTEGER_POOL: [i64; 34] = [
+    0,
+    1,
+    -1,
+    2,
+    3,
+    7,
+    8,
+    10,
+    15,
+    16,
+    31,
+    32,
+    63,
+    64,
+    100,
+    127,
+    128,
+    255,
+    256,
+    1000,
+    65535,
+    65536,
+    -2,
+    -100,
+    -128,
+    i32::MAX as i64,
+    i32::MIN as i64,
+    i64::MAX,
+    i64::MIN,
+    0x1234_5678,
+    0x7FFF_FFFF_FFFF,
+    -987_654_321,
+    1_000_000_007,
+    0x0F0F_0F0F_0F0F_0F0F,
+];
+
+const FLOAT_POOL: [f64; 24] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    -0.5,
+    1.5,
+    2.5,
+    std::f64::consts::PI,
+    -2.75,
+    100.25,
+    1e10,
+    -1e10,
+    1e-10,
+    f64::NAN,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::MAX,
+    f64::MIN_POSITIVE,
+    2_147_483_648.0,
+    -2_147_483_649.0,
+    i64::MAX as f64,
+    4_294_967_296.0,
+    0.1,
+];
+
+pub fn generate_argument(kind: ValueKind, seed: u64) -> u64 {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+    state ^= state >> 29;
+    state = state.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    state ^= state >> 32;
+    match kind {
+        ValueKind::F32 => {
+            let value = FLOAT_POOL[(state % FLOAT_POOL.len() as u64) as usize] as f32;
+            u64::from(value.to_bits())
+        }
+        ValueKind::F64 => FLOAT_POOL[(state % FLOAT_POOL.len() as u64) as usize].to_bits(),
+        _ => {
+            let raw = if state % 5 == 4 {
+                state as i64
+            } else {
+                INTEGER_POOL[(state % INTEGER_POOL.len() as u64) as usize]
+            };
+            kind.normalize_integer(raw)
+        }
+    }
+}

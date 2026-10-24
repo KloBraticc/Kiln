@@ -733,6 +733,16 @@ impl AssemblySet {
         namespace: &str,
         name: &str,
     ) -> Outcome<std::collections::HashSet<u32>> {
+        self.rows_with_attribute(module_index, TableId::TypeDef, namespace, name)
+    }
+
+    pub fn rows_with_attribute(
+        &self,
+        module_index: usize,
+        parent_table: TableId,
+        namespace: &str,
+        name: &str,
+    ) -> Outcome<std::collections::HashSet<u32>> {
         let module = &self.modules[module_index];
         let metadata = &module.metadata;
         let mut found = std::collections::HashSet::new();
@@ -740,7 +750,7 @@ impl AssemblySet {
             let Some(parent) = metadata.coded(TableId::CustomAttribute, row, 0)? else {
                 continue;
             };
-            if parent.table() != Some(TableId::TypeDef) {
+            if parent.table() != Some(parent_table) {
                 continue;
             }
             let Some(constructor) = metadata.coded(TableId::CustomAttribute, row, 1)? else {
