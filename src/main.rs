@@ -1380,6 +1380,12 @@ fn publish(arguments: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     executable.extend_from_slice(&encoded);
+    if let Some(folder) = Path::new(output).parent().filter(|f| !f.as_os_str().is_empty())
+        && let Err(error) = std::fs::create_dir_all(folder)
+    {
+        eprintln!("{}: {error}", folder.display());
+        return ExitCode::from(1);
+    }
     if let Err(error) = std::fs::write(output, &executable) {
         eprintln!("{output}: {error}");
         return ExitCode::from(1);
