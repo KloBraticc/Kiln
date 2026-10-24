@@ -13,6 +13,8 @@ fn main() -> ExitCode {
         Some("resolve") if arguments.len() > 1 => resolve(&arguments[1..]),
         Some("layout") if arguments.len() > 1 => layout(&arguments[1..]),
         Some("offsets") if arguments.len() > 1 => offsets(&arguments[1..]),
+        Some("ir") if arguments.len() > 1 => ir(&arguments[1..]),
+        Some("disasm") => disasm(&arguments[1..]),
         Some("--version") => {
             println!("kiln {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -303,5 +305,162 @@ fn offsets(arguments: &[String]) -> ExitCode {
         println!("{line}");
     }
     eprintln!("{} class fields placed, {failures} failures", lines.len());
+    ExitCode::SUCCESS
+}
+
+fn ir(arguments: &[String]) -> ExitCode {
+    let started = Instant::now();
+    let set = load_set(arguments);
+    let loaded = started.elapsed();
+    let next = AtomicUsize::new(0);
+    let totals = Mutex::new((0u64, 0u64, 0u64, 0u64, 0u64, 0u64));
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let translator = kiln::ir::Translator::new(&set);
+                let (
+                    mut methods,
+                    mut blocks,
+                    mut values,
+                    mut instructions,
+                    mut conflicts,
+                    mut unreachable,
+                ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+                let mut local_failures = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(module) = set.modules.get(index) else {
+                        break;
+                    };
+                    for row in 1..=module.metadata.rows(kiln::metadata::TableId::MethodDef) {
+                        match translator.translate(index, row) {
+                            Ok(Some(method)) => {
+                                if let Err(problem) = method.validate() {
+                                    let name = module
+                                        .metadata
+                                        .string_cell(kiln::metadata::TableId::MethodDef, row, 3)
+                                        .unwrap_or("?");
+                                    local_failures.push(format!(
+                                        "{}  {name} (MethodDef {row}): invalid IR, {problem}",
+                                        module.name
+                                    ));
+                                }
+                                methods += 1;
+                                blocks += method.blocks.len() as u64;
+                                values += u64::from(method.values);
+                                instructions += method
+                                    .blocks
+                                    .iter()
+                                    .map(|b| b.instructions.len() as u64)
+                                    .sum::<u64>();
+                                conflicts += u64::from(method.merge_conflicts);
+                                unreachable += u64::from(method.unreachable_blocks);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let name = module
+                                    .metadata
+                                    .string_cell(kiln::metadata::TableId::MethodDef, row, 3)
+                                    .unwrap_or("?");
+                                local_failures.push(format!(
+                                    "{}  {name} (MethodDef {row}): {error}",
+                                    module.name
+                                ));
+                            }
+                        }
+                    }
+                }
+                let mut total = totals.lock().expect("totals lock");
+                total.0 += methods;
+                total.1 += blocks;
+                total.2 += values;
+                total.3 += instructions;
+                total.4 += conflicts;
+                total.5 += unreachable;
+                failures
+                    .lock()
+                    .expect("failures lock")
+                    .extend(local_failures);
+            });
+        }
+    });
+    let (methods, blocks, values, instructions, conflicts, unreachable) =
+        totals.into_inner().expect("totals lock");
+    let mut failures = failures.into_inner().expect("failures lock");
+    failures.sort();
+    for failure in &failures {
+        println!("  FAIL {failure}");
+    }
+    println!(
+        "{} assemblies loaded in {:.2?}, {methods} methods translated into {blocks} blocks, {instructions} instructions, {values} values, {conflicts} merge type conflicts, {unreachable} unreachable blocks, {} failures, total {:.2?}",
+        set.modules.len(),
+        loaded,
+        failures.len(),
+        started.elapsed()
+    );
+    if failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn disasm(arguments: &[String]) -> ExitCode {
+    let [path, assembly, method] = arguments else {
+        eprintln!("usage: kiln disasm <folder> <assembly> <MethodDef row>");
+        return ExitCode::from(2);
+    };
+    let set = load_set(std::slice::from_ref(path));
+    let Some(module_index) = set.find_assembly(assembly) else {
+        eprintln!("{assembly} was not found");
+        return ExitCode::from(1);
+    };
+    let Ok(row) = method.parse::<u32>() else {
+        eprintln!("{method} is not a MethodDef row");
+        return ExitCode::from(2);
+    };
+    let module = &set.modules[module_index];
+    let metadata = &module.metadata;
+    let table = kiln::metadata::TableId::MethodDef;
+    let (Ok(rva), Ok(name), Ok(signature)) = (
+        metadata.cell(table, row, 0),
+        metadata.string_cell(table, row, 3),
+        metadata
+            .cell(table, row, 4)
+            .and_then(|blob| metadata.blob(blob))
+            .and_then(kiln::signature::Signature::parse),
+    ) else {
+        eprintln!("MethodDef {row} could not be read");
+        return ExitCode::from(1);
+    };
+    println!("{name} {signature:?}");
+    let body = module
+        .image
+        .tail_at_rva(rva)
+        .and_then(|tail| kiln::il::MethodBody::parse(tail, rva));
+    let Ok(body) = body else {
+        eprintln!("the method has no IL body");
+        return ExitCode::from(1);
+    };
+    println!(
+        "max stack {}  locals {:#010x}",
+        body.max_stack, body.local_signature.0
+    );
+    for instruction in body.instructions() {
+        match instruction {
+            Ok(instruction) => {
+                println!(
+                    "  IL_{:04x}: {} {:?}",
+                    instruction.offset, instruction.opcode.name, instruction.argument
+                );
+            }
+            Err(error) => {
+                println!("  {error}");
+                break;
+            }
+        }
+    }
     ExitCode::SUCCESS
 }
