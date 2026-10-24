@@ -192,6 +192,12 @@ enum Intrinsic {
     SetLastError,
     ClearMemory,
     LockTaken,
+    EnumHash,
+    EnumEquals,
+    CurrentThread,
+    Collections,
+    DefaultConstruct,
+    NewHandle,
     DependentFree,
     DependentClear,
     DependentSetSecond,
@@ -451,6 +457,7 @@ pub struct Interpreter<'s> {
     unmanaged_rows: RefCell<HashMap<usize, Rc<HashSet<u32>>>>,
     unmanaged_stubs: RefCell<HashMap<MethodKey, u64>>,
     delegate_stubs: RefCell<HashMap<u64, u64>>,
+    thread: Cell<u64>,
 }
 
 enum Pending {
@@ -698,6 +705,7 @@ impl<'s> Interpreter<'s> {
             unmanaged_rows: RefCell::new(HashMap::new()),
             unmanaged_stubs: RefCell::new(HashMap::new()),
             delegate_stubs: RefCell::new(HashMap::new()),
+            thread: Cell::new(0),
         }
     }
 
@@ -1378,6 +1386,14 @@ impl<'s> Interpreter<'s> {
             }
             ("System.Threading.Monitor", "Exit" | "Enter") if parameters.len() == 1 => Intrinsic::Nothing,
             ("System.Threading.Monitor", "IsEnteredNative") => Intrinsic::True,
+            ("System.Enum", "GetHashCode") if parameters.len() == 1 => Intrinsic::EnumHash,
+            ("System.Enum", "Equals") if parameters.len() == 2 => Intrinsic::EnumEquals,
+            ("System.Threading.Thread", "GetCurrentThreadNative") if parameters.is_empty() => Intrinsic::CurrentThread,
+            ("System.GC", "_CollectionCount") => Intrinsic::Collections,
+            ("System.GC", "GetMaxGeneration" | "GetGeneration" | "GetGenerationInternal") => Intrinsic::False,
+            ("System.Diagnostics.Debugger", "get_IsAttached" | "IsLogging") => Intrinsic::False,
+            ("System.Diagnostics.Debugger", "Log" | "NotifyOfCrossThreadDependencySlow") => Intrinsic::Nothing,
+            ("System.RuntimeType", "CreateInstanceDefaultCtor") if parameters.len() == 3 => Intrinsic::DefaultConstruct,
             ("System.Runtime.DependentHandle", "InternalFree") if parameters.len() == 1 => Intrinsic::DependentFree,
             ("System.Runtime.DependentHandle", "InternalSetTargetToNull") if parameters.len() == 1 => Intrinsic::DependentClear,
             ("System.Runtime.DependentHandle", "InternalSetDependent") if parameters.len() == 2 => Intrinsic::DependentSetSecond,
@@ -1485,6 +1501,8 @@ impl<'s> Interpreter<'s> {
                 ("Environment_GetProcessorCount", 0) => Intrinsic::ProcessorCount,
                 ("ThreadNative_SpinWait", 1) => Intrinsic::SpinWait,
                 ("MarshalNative_IsBuiltInComSupported", 0) => Intrinsic::False,
+                ("GCInterface_AddMemoryPressure" | "GCInterface_RemoveMemoryPressure", 1) => Intrinsic::Nothing,
+                ("QCall_GetGCHandleForTypeHandle", 2) => Intrinsic::NewHandle,
                 _ => return unsupported(format!("runtime QCall {entry}")),
             };
             return Ok(Native::Intrinsic(intrinsic));
@@ -2278,6 +2296,50 @@ impl<'s> Interpreter<'s> {
                 return Ok(None);
             }
             Intrinsic::Nothing => return Ok(None),
+            Intrinsic::EnumHash => {
+                let (var, bits) = self.enum_value(a[0])?;
+                V::I4(match var {
+                    VarType::I8 => {
+                        let v = bits as i8 as i32;
+                        v ^ (v << 8)
+                    }
+                    VarType::I16 => {
+                        let v = bits as i16;
+                        (v as u16 as u32 | ((v as i32 as u32) << 16)) as i32
+                    }
+                    VarType::I64 => (bits as i32) ^ ((bits >> 32) as i32),
+                    _ => bits as i32,
+                })
+            }
+            Intrinsic::EnumEquals => {
+                let other = a[1].address();
+                let this = self.boxed_address(a[0]);
+                let same = other != 0
+                    && this != 0
+                    && self.object_gen(other).ok() == self.object_gen(this).ok()
+                    && self.enum_value(a[0])? == self.enum_value(V::O(other))?;
+                V::I4(i32::from(same))
+            }
+            Intrinsic::CurrentThread => V::O(self.current_thread()?),
+            Intrinsic::Collections => V::I4(runtime::COLLECTIONS.load(std::sync::atomic::Ordering::Relaxed) as i32),
+            Intrinsic::DefaultConstruct => {
+                let exact = self
+                    .object_types
+                    .borrow()
+                    .get(&self.non_null(a[0])?)
+                    .cloned()
+                    .ok_or_else(|| Fault::Unsupported("type object from outside the fallback".into()))?;
+                match self.gen_ty(&exact)? {
+                    Ty::Prim(VarType::Ref) => V::O(self.construct_default(&exact)?),
+                    Ty::Prim(var) => {
+                        let boxed = self.allocate_box(&exact)?;
+                        write(boxed + 8, var, load_raw(var, 0));
+                        V::O(boxed)
+                    }
+                    Ty::Struct(_) => V::O(self.allocate_box(&exact)?),
+                }
+            }
+            Intrinsic::NewHandle => V::P(runtime::state().allocate_handle(0)),
             Intrinsic::DependentFree => { unsafe { *(a[0].bits() as *mut [u64; 2]) = [0, 0] }; return Ok(None) },
             Intrinsic::DependentClear => { unsafe { *(a[0].bits() as *mut u64) = 0 }; return Ok(None) },
             Intrinsic::DependentSetSecond => { unsafe { *((a[0].bits() + 8) as *mut u64) = a[1].address() }; return Ok(None) },
@@ -3211,7 +3273,7 @@ impl<'s> Interpreter<'s> {
             return unsupported("virtual table of a non class");
         };
         let mut table = match map(self.types.base(exact))? {
-            Some(base) if !self.types.is_value_type(exact) => {
+            Some(base) => {
                 let base = self.vtable_of(&base)?;
                 VTable {
                     slots: base.slots.clone(),
@@ -3323,7 +3385,16 @@ impl<'s> Interpreter<'s> {
             let slot = *table
                 .slot_of
                 .get(key)
-                .ok_or_else(|| Fault::Unsupported("method has no virtual slot".into()))?;
+                .ok_or_else(|| {
+                    let name = self.model.set.modules[key.module]
+                        .metadata
+                        .string_cell(TableId::MethodDef, key.row, 3)
+                        .unwrap_or("?");
+                    Fault::Unsupported(format!(
+                        "method {name} has no virtual slot on {}",
+                        self.types.full_name(&class)
+                    ))
+                })?;
             let (target, declaring) = table.slots[slot]
                 .clone()
                 .ok_or_else(|| Fault::Unsupported("virtual slot is empty".into()))?;
@@ -4569,6 +4640,55 @@ impl<'s> Interpreter<'s> {
             .offset;
         let message = unsafe { *((object + 8 + u64::from(offset)) as *const u64) };
         (message != 0).then(|| String::from_utf16_lossy(string_units(message)))
+    }
+
+    fn boxed_address(&self, value: V) -> u64 {
+        match value {
+            V::P(pointer) => pointer.wrapping_sub(8),
+            other => other.address(),
+        }
+    }
+
+    fn enum_value(&self, value: V) -> Run<(VarType, u64)> {
+        let object = self.boxed_address(value);
+        if object == 0 {
+            return self.throw("NullReferenceException");
+        }
+        let exact = self.object_gen(object)?;
+        let Ty::Prim(var) = self.gen_ty(&exact)? else {
+            return unsupported("enum without a primitive value");
+        };
+        let size = ElementKind::from_var(var).map_or(8, ElementKind::size) as usize;
+        let mut bits = 0u64;
+        unsafe { std::ptr::copy_nonoverlapping((object + 8) as *const u8, (&raw mut bits).cast(), size) };
+        Ok((var, bits))
+    }
+
+    fn current_thread(&self) -> Run<u64> {
+        if self.thread.get() != 0 {
+            return Ok(self.thread.get());
+        }
+        let handle = self.corelib_type("System.Threading", "Thread")?;
+        let exact = Gen::Named(handle, Rc::from(Vec::new()));
+        let object = runtime::allocate_managed(self.record_of(&exact)?, 0);
+        if object == 0 {
+            return self.throw("OutOfMemoryException");
+        }
+        type_roots().push(object);
+        let (_, placements) = self
+            .model
+            .set
+            .class_fields(handle)
+            .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
+        let metadata = &self.model.set.modules[handle.module].metadata;
+        if let Some(placement) = placements
+            .iter()
+            .find(|p| metadata.string_cell(TableId::Field, p.field, 1).ok() == Some("_managedThreadId"))
+        {
+            unsafe { *((object + 8 + u64::from(placement.offset)) as *mut i32) = 1 };
+        }
+        self.thread.set(object);
+        Ok(object)
     }
 
     pub fn has_native(&self, key: &MethodKey) -> bool {
