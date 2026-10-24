@@ -8,6 +8,7 @@ const BYTES: u32 = 0x20;
 
 pub enum Value<'a> {
     Data(&'a [u8]),
+    Text(String),
     Other(u32),
 }
 
@@ -90,7 +91,10 @@ pub fn entries(data: &[u8]) -> Result<Vec<(String, Value<'_>)>> {
         let offset = name_reader.u32()? as usize;
         let mut value_reader = Reader::at(data, data_section + offset, "resource value")?;
         let code = seven_bit(&mut value_reader)?;
-        let value = if code == STREAM || code == BYTES {
+        let value = if code == 1 {
+            let length = seven_bit(&mut value_reader)? as usize;
+            Value::Text(String::from_utf8_lossy(value_reader.bytes(length)?).into_owned())
+        } else if code == STREAM || code == BYTES {
             let length = value_reader.u32()? as usize;
             Value::Data(value_reader.bytes(length)?)
         } else {

@@ -9,6 +9,7 @@ pub const TYPE_VTABLE: i32 = 56;
 pub const FLAG_ARRAY: u64 = 1;
 pub const FLAG_STRING: u64 = 2;
 pub const FLAG_REFERENCE_ELEMENTS: u64 = 4;
+pub const FLAG_OBJECT: u64 = 8;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -183,6 +184,12 @@ pub struct RuntimeState {
     pub empty_string: u64,
     frozen: Vec<Box<[u64]>>,
     methods: Vec<(usize, usize, Box<[i32]>)>,
+    pub method_names: HashMap<usize, String>,
+    pub transitions: Vec<(u64, u64)>,
+    pub root_hook: Option<fn(&mut Vec<u64>)>,
+    pub code_addresses: HashMap<crate::codegen::MethodKey, u64>,
+    pub trap_address: u64,
+    pub late_resolver: Option<fn(&crate::codegen::MethodKey) -> Option<u64>>,
 }
 
 static STATE: AtomicPtr<RuntimeState> = AtomicPtr::new(std::ptr::null_mut());
@@ -210,6 +217,12 @@ pub fn install() -> &'static mut RuntimeState {
         empty_string: 0,
         frozen: Vec::new(),
         methods: Vec::new(),
+        method_names: HashMap::new(),
+        transitions: Vec::new(),
+        root_hook: None,
+        code_addresses: HashMap::new(),
+        trap_address: 0,
+        late_resolver: None,
     }));
     STATE.store(state, Ordering::Release);
     unsafe { &mut *state }
@@ -231,10 +244,14 @@ impl RuntimeState {
                     Some(parent) => self.type_record(model, RuntimeType::Class(parent))?,
                     None => 0,
                 };
+                let is_object = info.parent.is_none()
+                    && !info.is_interface
+                    && !info.is_value_type
+                    && model.set.full_type_name(handle).ok().as_deref() == Some("System.Object");
                 (
                     u64::from(info.base_size),
                     0u64,
-                    0u64,
+                    if is_object { FLAG_OBJECT } else { 0 },
                     parent,
                     info.reference_offsets.clone(),
                     info.vtable.len(),
@@ -270,6 +287,22 @@ impl RuntimeState {
             _ => u64::MAX,
         };
         words[6] = vtable_length as u64;
+        if let RuntimeType::Class(handle) = kind
+            && self.trap_address != 0
+        {
+            let info = model.class(handle)?;
+            for (slot, method) in info.vtable.iter().enumerate() {
+                words[7 + slot] = method
+                    .as_ref()
+                    .and_then(|key| {
+                        self.code_addresses
+                            .get(key)
+                            .copied()
+                            .or_else(|| self.late_resolver.and_then(|resolve| resolve(key)))
+                    })
+                    .unwrap_or(self.trap_address);
+            }
+        }
         let address = words.as_ptr() as u64;
         self.types.insert(kind, TypeRecord { words, offsets });
         Ok(address)
@@ -371,6 +404,19 @@ impl RuntimeState {
             .insert(at, (start, end, references.to_vec().into_boxed_slice()));
     }
 
+    pub fn method_containing(&self, address: usize) -> Option<(usize, String)> {
+        let at = self.methods.partition_point(|entry| entry.0 <= address);
+        let (start, end, _) = self.methods.get(at.checked_sub(1)?)?;
+        if address >= *end {
+            return None;
+        }
+        Some((address - start, self.method_names.get(start)?.clone()))
+    }
+
+    pub fn is_compiled(&self, address: usize) -> bool {
+        self.method_at(address).is_some()
+    }
+
     fn method_at(&self, address: usize) -> Option<&[i32]> {
         let at = self.methods.partition_point(|entry| entry.0 <= address);
         let (start, end, references) = self.methods.get(at.checked_sub(1)?)?;
@@ -382,7 +428,13 @@ impl RuntimeState {
         for &slot in &self.reference_statics {
             self.mark(unsafe { *(slot as *const u64) } as usize, &mut pending);
         }
-        if frame != 0 && stack != 0 {
+        let chains: Vec<(u64, u64)> = std::iter::once((frame, stack))
+            .chain(self.transitions.iter().copied())
+            .collect();
+        for (frame, stack) in chains {
+            if frame == 0 || stack == 0 {
+                continue;
+            }
             let mut base = frame as usize;
             let mut returned = unsafe { *((stack - 8) as *const u64) } as usize;
             while base != 0 {
@@ -395,6 +447,13 @@ impl RuntimeState {
                 }
                 returned = unsafe { *((base + 8) as *const u64) } as usize;
                 base = unsafe { *(base as *const u64) } as usize;
+            }
+        }
+        if let Some(hook) = self.root_hook {
+            let mut roots = Vec::new();
+            hook(&mut roots);
+            for root in roots {
+                self.mark(root as usize, &mut pending);
             }
         }
         while let Some(object) = pending.pop() {
@@ -475,11 +534,22 @@ pub extern "win64" fn allocate(type_record: u64, count: u64, frame: u64, stack: 
     object as u64
 }
 
+pub fn allocate_managed(type_record: u64, count: u64) -> u64 {
+    let state = state();
+    if STRESS.load(Ordering::Relaxed) || state.heap.should_collect() {
+        state.collect(0, 0);
+    }
+    allocate(type_record, count, 0, 0)
+}
+
 pub extern "win64" fn is_instance(object: u64, target: u64) -> u64 {
     if object == 0 {
         return 0;
     }
-    let mut current = unsafe { *(object as *const u64) };
+    if unsafe { *((target + 8) as *const u64) } & FLAG_OBJECT != 0 {
+        return object;
+    }
+    let mut current = unsafe { *(object as *const u64) } & !1;
     while current != 0 {
         if current == target {
             return object;

@@ -13,6 +13,7 @@ pub const ARGUMENT_REGISTERS: [u8; 4] = [RCX, RDX, R8, R9];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cond {
     Overflow = 0x0,
+    NoOverflow = 0x1,
     Below = 0x2,
     AboveOrEqual = 0x3,
     Equal = 0x4,
@@ -41,6 +42,7 @@ pub enum Alu {
 pub enum Unary {
     Not = 2,
     Neg = 3,
+    Mul = 4,
     Div = 6,
     Idiv = 7,
 }
@@ -329,6 +331,14 @@ impl Assembler {
 
     pub fn epilogue(&mut self) {
         self.bytes(&[0xC9, 0xC3]);
+    }
+
+    pub fn vector_store(&mut self, base: u8, displacement: i32, xmm: u8) {
+        self.op_memory(Some(0xF3), false, &[0x0F, 0x7F], xmm, base, displacement);
+    }
+
+    pub fn vector_load(&mut self, xmm: u8, base: u8, displacement: i32) {
+        self.op_memory(Some(0xF3), false, &[0x0F, 0x6F], xmm, base, displacement);
     }
 
     pub fn sse_load(&mut self, double: bool, xmm: u8, base: u8, displacement: i32) {

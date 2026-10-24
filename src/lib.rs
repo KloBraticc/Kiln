@@ -2,6 +2,7 @@ pub mod baml;
 pub mod codegen;
 pub mod error;
 pub mod il;
+pub mod interpreter;
 pub mod ir;
 pub mod jit;
 pub mod layout;

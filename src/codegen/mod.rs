@@ -128,6 +128,7 @@ pub struct Helpers {
     pub allocate: u64,
     pub is_instance: u64,
     pub initialize_array: u64,
+    pub throw: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1421,6 +1422,13 @@ impl<'a> Lowering<'a> {
                 Some(Resolved::Direct(index)) => {
                     let (parameters, returns) = self.callee_types[index].clone();
                     self.pass_arguments(inputs, &parameters)?;
+                    if instruction.opcode == 0x6F && parameters.first() == Some(&VarType::Ref) {
+                        let fine = self.asm.label();
+                        self.asm.test(true, RCX, RCX);
+                        self.asm.jump_if(Cond::NotEqual, fine);
+                        self.throw_now(0);
+                        self.asm.bind(fine);
+                    }
                     self.call_address(AbsoluteTarget::Method(index));
                     self.store_return(returns, output)?;
                 }
@@ -1612,6 +1620,17 @@ impl<'a> Lowering<'a> {
                     self.store_result(out()?, RAX)?;
                 } else {
                     self.store_result(out()?, RCX)?;
+                    let done = self.asm.label();
+                    self.asm.test(true, RCX, RCX);
+                    self.asm.jump_if(Cond::Equal, done);
+                    self.asm.move_absolute(RDX, AbsoluteTarget::Type(record));
+                    self.call_address(AbsoluteTarget::Address(self.helpers.is_instance));
+                    self.asm.test(true, RAX, RAX);
+                    self.asm.jump_if(Cond::NotEqual, done);
+                    self.asm.move_immediate(RCX, 2);
+                    self.asm.move_register(true, RDX, RBP);
+                    self.call_address(AbsoluteTarget::Address(self.helpers.throw));
+                    self.asm.bind(done);
                 }
             }
             0xD0 => {
@@ -1710,6 +1729,14 @@ impl<'a> Lowering<'a> {
     ) -> Result<(), CompileError> {
         self.load_int(RCX, array, true)?;
         self.load_int(RDX, index, true)?;
+        self.asm.load(false, R8, RCX, 8);
+        self.asm.alu(Alu::Cmp, true, RDX, R8);
+        let inside = self.asm.label();
+        self.asm.jump_if(Cond::Below, inside);
+        self.asm.move_immediate(RCX, 1);
+        self.asm.move_register(true, RDX, RBP);
+        self.call_address(AbsoluteTarget::Address(self.helpers.throw));
+        self.asm.bind(inside);
         let shift = kind.size().trailing_zeros() as u8;
         if shift > 0 {
             self.asm.shift_immediate(Shift::Left, true, RDX, shift);
@@ -1789,7 +1816,8 @@ impl<'a> Lowering<'a> {
         match opcode {
             0x58 | 0xD6 | 0xD7 => self.asm.alu(Alu::Add, wide, RAX, RCX),
             0x59 | 0xDA | 0xDB => self.asm.alu(Alu::Sub, wide, RAX, RCX),
-            0x5A | 0xD8 | 0xD9 => self.asm.imul(wide, RAX, RCX),
+            0x5A | 0xD8 => self.asm.imul(wide, RAX, RCX),
+            0xD9 => self.asm.unary(Unary::Mul, wide, RCX),
             0x5B | 0x5D => {
                 self.asm.sign_extend_accumulator(wide);
                 self.asm.unary(Unary::Idiv, wide, RCX);
@@ -1806,7 +1834,87 @@ impl<'a> Lowering<'a> {
             }
             _ => return unsupported("arithmetic opcode"),
         }
+        match opcode {
+            0xD6 | 0xD8 | 0xDA => self.throw_if(Cond::Overflow, 3),
+            0xD7 | 0xDB | 0xD9 => self.throw_if(Cond::Below, 3),
+            _ => {}
+        }
         self.store_result(output, RAX)
+    }
+
+    fn throw_if(&mut self, condition: Cond, kind: u64) {
+        if condition == Cond::Below {
+            let fine = self.asm.label();
+            self.asm.jump_if(Cond::AboveOrEqual, fine);
+            self.throw_now(kind);
+            self.asm.bind(fine);
+        } else {
+            let fine = self.asm.label();
+            self.asm.jump_if(Cond::NoOverflow, fine);
+            self.throw_now(kind);
+            self.asm.bind(fine);
+        }
+    }
+
+    fn throw_now(&mut self, kind: u64) {
+        self.asm.move_immediate(RCX, kind);
+        self.asm.move_register(true, RDX, RBP);
+        self.call_address(AbsoluteTarget::Address(self.helpers.throw));
+    }
+
+    fn check_range(&mut self, opcode: u16, from: Width, target: VarType) -> Result<(), CompileError> {
+        let unsigned_source = matches!(opcode, 0x82..=0x8B);
+        let (low, high): (i128, i128) = match opcode {
+            0x82 | 0xB3 => (i8::MIN.into(), i8::MAX.into()),
+            0x83 | 0xB5 => (i16::MIN.into(), i16::MAX.into()),
+            0x84 | 0xB7 => (i32::MIN.into(), i32::MAX.into()),
+            0x85 | 0xB9 | 0x8A | 0xD4 => (i64::MIN.into(), i64::MAX.into()),
+            0x86 | 0xB4 => (0, u8::MAX.into()),
+            0x87 | 0xB6 => (0, u16::MAX.into()),
+            0x88 | 0xB8 => (0, u32::MAX.into()),
+            _ => (0, u64::MAX.into()),
+        };
+        let _ = target;
+        if unsigned_source {
+            if from == Width::Int32 {
+                self.asm.move_register(false, RAX, RAX);
+            }
+            let limit = if from == Width::Int32 { i128::from(u32::MAX) } else { i128::from(u64::MAX) };
+            if high < limit {
+                self.asm.move_immediate(R8, high as u64);
+                self.asm.alu(Alu::Cmp, true, RAX, R8);
+                let fine = self.asm.label();
+                self.asm.jump_if(Cond::BelowOrEqual, fine);
+                self.throw_now(3);
+                self.asm.bind(fine);
+            }
+        } else {
+            if from == Width::Int32 {
+                self.asm.sign_extend_dword(RAX, RAX);
+            }
+            let (source_low, source_high) = if from == Width::Int32 {
+                (i128::from(i32::MIN), i128::from(i32::MAX))
+            } else {
+                (i128::from(i64::MIN), i128::from(i64::MAX))
+            };
+            if low > source_low {
+                self.asm.move_immediate(R8, low as i64 as u64);
+                self.asm.alu(Alu::Cmp, true, RAX, R8);
+                let fine = self.asm.label();
+                self.asm.jump_if(Cond::GreaterOrEqual, fine);
+                self.throw_now(3);
+                self.asm.bind(fine);
+            }
+            if high < source_high {
+                self.asm.move_immediate(R8, high as i64 as u64);
+                self.asm.alu(Alu::Cmp, true, RAX, R8);
+                let fine = self.asm.label();
+                self.asm.jump_if(Cond::LessOrEqual, fine);
+                self.throw_now(3);
+                self.asm.bind(fine);
+            }
+        }
+        Ok(())
     }
 
     fn convert(
@@ -1831,6 +1939,19 @@ impl<'a> Lowering<'a> {
             0x6D | 0x88 | 0xB8 | 0x6E | 0x89 | 0xBA | 0xE0 | 0x8B | 0xD5
         );
         let unsigned_source = matches!(opcode, 0x76 | 0x82..=0x8B);
+        let checked = matches!(opcode, 0x82..=0x8B | 0xB3..=0xBA | 0xD4 | 0xD5);
+        if checked {
+            if from.is_float() {
+                return unsupported("checked conversions from floating point");
+            }
+            self.load_int(RAX, input, from == Width::Int64)?;
+            self.check_range(opcode, from, target)?;
+            if target == VarType::I64 {
+                return self.store_result(output, RAX);
+            }
+            self.normalize(RAX, target);
+            return self.store_result(output, RAX);
+        }
         if from.is_float() {
             match target {
                 VarType::F32 | VarType::F64 => {

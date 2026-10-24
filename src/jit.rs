@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::codegen::asm::{
-    ARGUMENT_REGISTERS, AbsoluteTarget, Assembler, R10, RAX, RBP, RCX, RDX, RSP,
+    ARGUMENT_REGISTERS, AbsoluteTarget, Assembler, R8, R9, R10, RAX, RBP, RCX, RDX, RSP,
 };
 use crate::codegen::{CompiledMethod, Helpers, MethodKey, VarType};
 use crate::signature::TypeSig;
@@ -82,6 +82,7 @@ pub fn helpers() -> Helpers {
         allocate: crate::runtime::allocate as *const () as u64,
         is_instance: crate::runtime::is_instance as *const () as u64,
         initialize_array: crate::runtime::initialize_array as *const () as u64,
+        throw: crate::interpreter::compiled_throw as *const () as u64,
     }
 }
 
@@ -116,6 +117,14 @@ impl Image {
     pub fn link(
         methods: &HashMap<MethodKey, CompiledMethod>,
         model: &crate::objects::ObjectModel<'_>,
+    ) -> Result<Image, String> {
+        Self::link_with_fallback(methods, model, &|_| None)
+    }
+
+    pub fn link_with_fallback(
+        methods: &HashMap<MethodKey, CompiledMethod>,
+        model: &crate::objects::ObjectModel<'_>,
+        fallback: &dyn Fn(&MethodKey) -> Option<u64>,
     ) -> Result<Image, String> {
         let state = crate::runtime::install();
         let set = model.set;
@@ -153,7 +162,12 @@ impl Image {
                     AbsoluteTarget::Address(address) => Relocation::Address(address),
                     AbsoluteTarget::Method(index) => {
                         let callee = &method.callees[index];
-                        Relocation::Offset(*offsets.get(callee).ok_or("a callee was not compiled")?)
+                        match offsets.get(callee) {
+                            Some(offset) => Relocation::Offset(*offset),
+                            None => Relocation::Address(
+                                fallback(callee).ok_or("a callee was not compiled")?,
+                            ),
+                        }
                     }
                     AbsoluteTarget::Type(kind) => {
                         Relocation::Address(state.type_record(model, kind)?)
@@ -184,19 +198,51 @@ impl Image {
             let start = memory.address(offsets[*key]) as usize;
             let method = &methods[*key];
             state.register_method(start, start + method.code.len(), &method.references);
+            let metadata = &set.modules[key.module].metadata;
+            let name = format!(
+                "{}::{}::{}",
+                set.modules[key.module].name,
+                set.modules[key.module]
+                    .method_owner(key.row)
+                    .ok()
+                    .flatten()
+                    .map(|owner| set.type_name(crate::loader::TypeHandle { module: key.module, row: owner }))
+                    .unwrap_or_default(),
+                metadata
+                    .string_cell(crate::metadata::TableId::MethodDef, key.row, 3)
+                    .unwrap_or("?")
+            );
+            state.method_names.insert(start, name);
+            state
+                .code_addresses
+                .insert((*key).clone(), memory.address(offsets[*key]));
         }
-        for (kind, record) in state.types.iter_mut() {
-            let crate::objects::RuntimeType::Class(handle) = kind else {
-                continue;
-            };
-            let info = model.class(*handle)?;
-            for (slot, method) in info.vtable.iter().enumerate() {
-                let address = method
-                    .as_ref()
-                    .and_then(|key| offsets.get(key))
-                    .map(|offset| memory.address(*offset))
-                    .unwrap_or(trap);
-                record.words[7 + slot] = address;
+        state.trap_address = trap;
+        let handles: Vec<crate::loader::TypeHandle> = state
+            .types
+            .keys()
+            .filter_map(|kind| match kind {
+                crate::objects::RuntimeType::Class(handle) => Some(*handle),
+                _ => None,
+            })
+            .collect();
+        for handle in handles {
+            let info = model.class(handle)?;
+            let addresses: Vec<u64> = info
+                .vtable
+                .iter()
+                .map(|method| match method {
+                    Some(key) => state
+                        .code_addresses
+                        .get(key)
+                        .copied()
+                        .or_else(|| fallback(key))
+                        .unwrap_or(trap),
+                    None => trap,
+                })
+                .collect();
+            if let Some(record) = state.types.get_mut(&crate::objects::RuntimeType::Class(handle)) {
+                record.words[7..7 + addresses.len()].copy_from_slice(&addresses);
             }
         }
         Ok(Image {
@@ -251,13 +297,82 @@ impl ExecutableMemory {
     }
 }
 
+static STUBS: std::sync::Mutex<Vec<(usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn emit_fallback_stub(parameters: &[VarType], index: u64) -> Option<u64> {
+    let entry = crate::interpreter::fallback_entry as *const () as u64;
+    emit_code(&build_fallback_stub(parameters, index, entry))
+}
+
+fn emit_code(code: &[u8]) -> Option<u64> {
+    let mut pages = STUBS.lock().ok()?;
+    let needs_page = pages
+        .last()
+        .is_none_or(|&(_, size, used)| used.next_multiple_of(16) + code.len() > size);
+    if needs_page {
+        let size = 64 * 1024;
+        let base = unsafe { VirtualAlloc(std::ptr::null_mut(), size, MEM_COMMIT_RESERVE, PAGE_READWRITE) };
+        if base.is_null() {
+            return None;
+        }
+        pages.push((base as usize, size, 0));
+    }
+    let page = pages.last_mut()?;
+    let at = page.2.next_multiple_of(16);
+    let address = page.0 + at;
+    unsafe {
+        let mut old = 0u32;
+        VirtualProtect(page.0 as *mut u8, page.1, PAGE_READWRITE, &mut old);
+        std::ptr::copy_nonoverlapping(code.as_ptr(), address as *mut u8, code.len());
+        VirtualProtect(page.0 as *mut u8, page.1, PAGE_EXECUTE_READ, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), page.0 as *const u8, page.1);
+    }
+    page.2 = at + code.len();
+    Some(address as u64)
+}
+
+fn build_fallback_stub(parameters: &[VarType], index: u64, entry: u64) -> Vec<u8> {
+    let mut asm = Assembler::default();
+    let count = parameters.len().max(1) as i32;
+    asm.prologue((8 * count as u32 + 32).next_multiple_of(16));
+    for (position, var) in parameters.iter().enumerate() {
+        let slot = -8 * (count - position as i32);
+        if position < 4 {
+            match var {
+                VarType::F32 => asm.sse_store(false, RBP, slot, position as u8),
+                VarType::F64 => asm.sse_store(true, RBP, slot, position as u8),
+                _ => asm.store(true, RBP, slot, ARGUMENT_REGISTERS[position]),
+            }
+        } else {
+            asm.load(true, RAX, RBP, 48 + 8 * (position as i32 - 4));
+            asm.store(true, RBP, slot, RAX);
+        }
+    }
+    asm.move_immediate(RCX, index);
+    asm.load_address(RDX, RBP, -8 * count);
+    asm.load(true, R8, RBP, 0);
+    asm.load_address(R9, RBP, 16);
+    asm.move_immediate(RAX, entry);
+    asm.call_register(RAX);
+    asm.xmm_from_gpr(true, 0, RAX);
+    asm.epilogue();
+    let (code, _) = asm.finish().expect("fallback stub has no labels");
+    code
+}
+
 fn build_thunk(parameters: &[VarType]) -> (Vec<u8>, usize) {
     let mut asm = Assembler::default();
     let stack_arguments = parameters.len().saturating_sub(4) as u32;
-    let frame = (16 + 32 + 8 * stack_arguments).next_multiple_of(16);
+    let frame = (16 + SAVED_AREA + 32 + 8 * stack_arguments).next_multiple_of(16);
     asm.prologue(frame);
     asm.store(true, RBP, -8, RCX);
     asm.store(true, RBP, -16, RDX);
+    for (index, register) in NONVOLATILE.iter().enumerate() {
+        asm.store(true, RBP, -24 - 8 * index as i32, *register);
+    }
+    for xmm in 6..16u8 {
+        asm.vector_store(RBP, vector_slot(xmm), xmm);
+    }
     asm.move_register(true, R10, RCX);
     for (index, _) in parameters.iter().enumerate().skip(4) {
         asm.load(true, RAX, R10, 8 * index as i32);
@@ -273,12 +388,32 @@ fn build_thunk(parameters: &[VarType]) -> (Vec<u8>, usize) {
     let call_at = asm.code.len() + 2;
     asm.move_immediate(RAX, 0);
     asm.call_register(RAX);
+    for (index, register) in NONVOLATILE.iter().enumerate() {
+        asm.load(true, *register, RBP, -24 - 8 * index as i32);
+    }
+    for xmm in 6..16u8 {
+        asm.vector_load(xmm, RBP, vector_slot(xmm));
+    }
     asm.load(true, RCX, RBP, -16);
     asm.store(true, RCX, 0, RAX);
     asm.sse_store(true, RCX, 8, 0);
     asm.epilogue();
     let (code, _) = asm.finish().expect("thunk has no labels");
     (code, call_at)
+}
+
+const NONVOLATILE: [u8; 7] = [3, 6, 7, 12, 13, 14, 15];
+const SAVED_AREA: u32 = 8 * 7 + 16 * 10 + 8;
+
+fn vector_slot(xmm: u8) -> i32 {
+    -24 - 8 * 7 - 16 * (i32::from(xmm) - 5)
+}
+
+pub fn abort_routine() -> Option<u64> {
+    static ROUTINE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *ROUTINE.get_or_init(|| {
+        emit_code(&[0x48, 0x89, 0xCC, 0x5D, 0x31, 0xC0, 0x0F, 0x57, 0xC0, 0xC3])
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
