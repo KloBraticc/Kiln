@@ -20,6 +20,7 @@ pub mod reader;
 pub mod resources;
 pub mod runtime;
 pub mod signature;
+pub mod threads;
 
 pub use error::{Error, Result};
 

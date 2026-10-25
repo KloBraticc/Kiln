@@ -192,14 +192,85 @@ pub struct RuntimeState {
     frozen: Vec<Box<[u64]>>,
     methods: Vec<(usize, usize, Box<[i32]>)>,
     pub method_names: HashMap<usize, String>,
-    pub transitions: Vec<(u64, u64)>,
     pub root_hook: Option<fn(&mut Vec<u64>)>,
     pub code_addresses: HashMap<crate::codegen::MethodKey, u64>,
     pub trap_address: u64,
     pub late_resolver: Option<fn(&crate::codegen::MethodKey) -> Option<u64>>,
+    thread_static_fields: HashMap<usize, std::collections::HashSet<u32>>,
 }
 
 static STATE: AtomicPtr<RuntimeState> = AtomicPtr::new(std::ptr::null_mut());
+
+#[derive(Default)]
+pub struct ThreadRoots {
+    pub frames: Vec<usize>,
+    pub pinned: Vec<u64>,
+    pub transitions: Vec<(u64, u64)>,
+    pub modules: Vec<usize>,
+    pub depth: usize,
+    pub thread_object: u64,
+    pub statics: HashMap<(usize, u32, u32), Box<[u64]>>,
+    pub static_references: Vec<usize>,
+}
+
+struct Registry(Vec<usize>);
+
+unsafe impl Send for Registry {}
+
+static THREADS: std::sync::Mutex<Registry> = std::sync::Mutex::new(Registry(Vec::new()));
+
+thread_local! {
+    static CURRENT: std::cell::Cell<*mut ThreadRoots> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+pub fn roots() -> &'static mut ThreadRoots {
+    let current = CURRENT.with(std::cell::Cell::get);
+    if !current.is_null() {
+        return unsafe { &mut *current };
+    }
+    let created = Box::into_raw(Box::default());
+    THREADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0.push(created as usize);
+    CURRENT.with(|cell| cell.set(created));
+    unsafe { &mut *created }
+}
+
+impl ThreadRoots {
+    pub fn thread_static(&mut self, owner: u32, module: usize, row: u32, size: u32, references: &[u32]) -> u64 {
+        if let Some(block) = self.statics.get(&(module, row, owner)) {
+            return block.as_ptr() as u64;
+        }
+        let block = vec![0u64; (size as usize).div_ceil(8).max(1)].into_boxed_slice();
+        let address = block.as_ptr() as u64;
+        for offset in references {
+            self.static_references.push(address as usize + *offset as usize);
+        }
+        self.statics.insert((module, row, owner), block);
+        address
+    }
+}
+
+pub fn retire_roots() {
+    let current = CURRENT.with(|cell| cell.replace(std::ptr::null_mut()));
+    if current.is_null() {
+        return;
+    }
+    THREADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .0
+        .retain(|&entry| entry != current as usize);
+    drop(unsafe { Box::from_raw(current) });
+}
+
+pub fn threads() -> Vec<&'static ThreadRoots> {
+    THREADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .0
+        .iter()
+        .map(|&entry| unsafe { &*(entry as *const ThreadRoots) })
+        .collect()
+}
 pub static TRAPPED: AtomicU64 = AtomicU64::new(0);
 pub static STRESS: AtomicBool = AtomicBool::new(false);
 pub static COLLECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -231,11 +302,11 @@ pub fn install() -> &'static mut RuntimeState {
         frozen: Vec::new(),
         methods: Vec::new(),
         method_names: HashMap::new(),
-        transitions: Vec::new(),
         root_hook: None,
         code_addresses: HashMap::new(),
         trap_address: 0,
         late_resolver: None,
+        thread_static_fields: HashMap::new(),
     }));
     STATE.store(state, Ordering::Release);
     unsafe { &mut *state }
@@ -461,6 +532,16 @@ impl RuntimeState {
         address
     }
 
+    pub fn is_thread_static(&mut self, set: &AssemblySet, module: usize, row: u32) -> bool {
+        self.thread_static_fields
+            .entry(module)
+            .or_insert_with(|| {
+                set.rows_with_attribute(module, TableId::Field, "System", "ThreadStaticAttribute")
+                    .unwrap_or_default()
+            })
+            .contains(&row)
+    }
+
     pub fn init_flag(&mut self, handle: TypeHandle) -> u64 {
         let entry = self.flags.entry(handle).or_insert_with(|| Box::new(0));
         &mut **entry as *mut u8 as u64
@@ -568,9 +649,14 @@ impl RuntimeState {
         for &slot in &self.reference_statics {
             self.mark(unsafe { *(slot as *const u64) } as usize, &mut pending);
         }
-        let chains: Vec<(u64, u64)> = std::iter::once((frame, stack))
-            .chain(self.transitions.iter().copied())
-            .collect();
+        let mut chains: Vec<(u64, u64)> = vec![(frame, stack)];
+        for roots in threads() {
+            chains.extend_from_slice(&roots.transitions);
+            self.mark(roots.thread_object as usize, &mut pending);
+            for &slot in &roots.static_references {
+                self.mark(unsafe { *(slot as *const u64) } as usize, &mut pending);
+            }
+        }
         for (frame, stack) in chains {
             if frame == 0 || stack == 0 {
                 continue;

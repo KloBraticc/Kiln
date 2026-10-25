@@ -160,6 +160,7 @@ unsafe fn callback_handler(context: usize, slot: usize, integers: *const u64, fl
 enum Intrinsic {
     False,
     Intern(bool),
+    Thread(threading::ThreadOp),
     LoadLibrary(bool),
     LibrarySymbol,
     FreeLibrary,
@@ -204,7 +205,6 @@ enum Intrinsic {
     LastError,
     SetLastError,
     ClearMemory,
-    LockTaken,
     Reflect(reflection::Reflect),
     EnumHash,
     EnumEquals,
@@ -306,6 +306,7 @@ struct FieldRef {
     row: u32,
     is_static: bool,
     has_rva: bool,
+    thread_static: bool,
     owner_is_value: bool,
     ty: Ty,
     offset: u64,
@@ -336,15 +337,12 @@ struct Frame {
     scratch: Vec<Box<[u8]>>,
 }
 
-static FRAMES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-static PINNED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
-
-fn frames() -> std::sync::MutexGuard<'static, Vec<usize>> {
-    FRAMES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn frames() -> &'static mut Vec<usize> {
+    &mut runtime::roots().frames
 }
 
-fn pinned() -> std::sync::MutexGuard<'static, Vec<u64>> {
-    PINNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn pinned() -> &'static mut Vec<u64> {
+    &mut runtime::roots().pinned
 }
 
 static TYPE_ROOTS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
@@ -363,8 +361,8 @@ struct VTable {
 }
 
 fn scan_roots(out: &mut Vec<u64>) {
-    {
-        for &frame in frames().iter() {
+    for roots in runtime::threads() {
+        for &frame in &roots.frames {
             let frame = unsafe { &*(frame as *const Frame) };
             for (index, kind) in frame.kinds.iter().enumerate() {
                 let base = frame.offsets[index];
@@ -386,8 +384,8 @@ fn scan_roots(out: &mut Vec<u64>) {
             }
             out.extend_from_slice(&frame.caught);
         }
+        out.extend_from_slice(&roots.pinned);
     }
-    out.extend_from_slice(&pinned());
     out.extend_from_slice(&type_roots());
 }
 
@@ -395,7 +393,7 @@ struct Pin(usize);
 
 impl Pin {
     fn new(values: &[V]) -> Self {
-        let mut pinned = pinned();
+        let pinned = pinned();
         let mark = pinned.len();
         pinned.extend(values.iter().filter_map(|v| match v {
             V::O(o) | V::S(o) => Some(*o),
@@ -464,7 +462,6 @@ pub struct Interpreter<'s> {
     failed_types: RefCell<HashMap<TypeHandle, Option<String>>>,
     fields: RefCell<HashMap<(usize, u32, Vec<u32>, Vec<u32>), Rc<FieldRef>>>,
     intrinsic_rows: RefCell<HashMap<usize, IntrinsicRows>>,
-    depth: Cell<usize>,
     pub interpreted: Cell<u64>,
     pub compiled_calls: Cell<u64>,
     pending: RefCell<Option<Pending>>,
@@ -475,11 +472,9 @@ pub struct Interpreter<'s> {
     unmanaged_rows: RefCell<HashMap<usize, Rc<HashSet<u32>>>>,
     unmanaged_stubs: RefCell<HashMap<MethodKey, u64>>,
     delegate_stubs: RefCell<HashMap<u64, u64>>,
-    thread: Cell<u64>,
     assemblies: RefCell<HashMap<usize, u64>>,
     entry_module: Cell<usize>,
     module_objects: RefCell<HashMap<usize, u64>>,
-    frames: RefCell<Vec<usize>>,
     method_tables: RefCell<HashMap<u32, u64>>,
     method_table_types: RefCell<HashMap<u64, Gen>>,
     native_layouts: RefCell<HashMap<u32, Rc<marshal::NativeLayout>>>,
@@ -604,9 +599,9 @@ pub extern "win64" fn compiled_initialize(handle: u64, cctor: u64, frame: u64, s
         return;
     }
     let interpreter = unsafe { &*(*bridge).interpreter };
-    runtime::state().transitions.push((frame, stack));
+    runtime::roots().transitions.push((frame, stack));
     let outcome = interpreter.ensure_initialized(owner);
-    runtime::state().transitions.pop();
+    runtime::roots().transitions.pop();
     if let Err(fault) = outcome {
         abort_compiled(interpreter, frame, fault);
     }
@@ -673,9 +668,9 @@ pub(crate) unsafe extern "win64" fn fallback_entry(index: u64, arguments: *const
         .enumerate()
         .map(|(position, var)| load_raw(*var, unsafe { *arguments.add(position) }))
         .collect();
-    runtime::state().transitions.push((frame, stack));
+    runtime::roots().transitions.push((frame, stack));
     let outcome = interpreter.invoke_ctx(key, &ctx, &values);
-    runtime::state().transitions.pop();
+    runtime::roots().transitions.pop();
     match outcome {
         Ok(value) => {
             let returns = loaded.returns.as_ref().and_then(Ty::prim);
@@ -715,6 +710,7 @@ fn abort_compiled(interpreter: &Interpreter<'_>, frame: u64, fault: Fault) -> ! 
 
 impl<'s> Interpreter<'s> {
     pub fn new(model: &'s ObjectModel<'s>, image: Option<&'s Image>) -> Self {
+        crate::threads::acquire();
         let state = runtime::install();
         state.root_hook = Some(scan_roots);
         Self {
@@ -735,7 +731,6 @@ impl<'s> Interpreter<'s> {
             failed_types: RefCell::new(HashMap::new()),
             fields: RefCell::new(HashMap::new()),
             intrinsic_rows: RefCell::new(HashMap::new()),
-            depth: Cell::new(0),
             interpreted: Cell::new(0),
             compiled_calls: Cell::new(0),
             pending: RefCell::new(None),
@@ -746,11 +741,9 @@ impl<'s> Interpreter<'s> {
             unmanaged_rows: RefCell::new(HashMap::new()),
             unmanaged_stubs: RefCell::new(HashMap::new()),
             delegate_stubs: RefCell::new(HashMap::new()),
-            thread: Cell::new(0),
             assemblies: RefCell::new(HashMap::new()),
             entry_module: Cell::new(0),
             module_objects: RefCell::new(HashMap::new()),
-            frames: RefCell::new(Vec::new()),
             method_tables: RefCell::new(HashMap::new()),
             method_table_types: RefCell::new(HashMap::new()),
             native_layouts: RefCell::new(HashMap::new()),
@@ -839,11 +832,14 @@ impl<'s> Interpreter<'s> {
 
     fn throw<T>(&self, name: &str) -> Run<T> {
         if self.trace_calls {
-            eprintln!("{}throw {name}", " ".repeat(self.depth.get().min(60)));
+            eprintln!("{}throw {name}", " ".repeat(runtime::roots().depth.min(60)));
         }
-        let handle = match self.corelib_type("System", name) {
+        let handle = match self
+            .corelib_type("System", name)
+            .or_else(|_| self.corelib_type("System.IO", name))
+        {
             Ok(handle) => handle,
-            Err(_) => self.corelib_type("System.IO", name)?,
+            Err(_) => self.corelib_type("System.Threading", name)?,
         };
         let record = self.record(RuntimeType::Class(handle))?;
         let object = runtime::allocate_managed(record, 0);
@@ -931,7 +927,7 @@ impl<'s> Interpreter<'s> {
 
     fn gen_ty(&self, exact: &Gen) -> Run<Ty> {
         match exact {
-            Gen::Named(handle, arguments) => {
+            Gen::Named(handle, _) => {
                 let set = self.model.set;
                 let name = self.type_name(*handle);
                 let primitive = match name.as_str() {
@@ -955,7 +951,7 @@ impl<'s> Interpreter<'s> {
                 if !set.is_value_type(*handle).unwrap_or(false) {
                     return Ok(Ty::Prim(VarType::Ref));
                 }
-                if arguments.is_empty() && set.is_enum(*handle).unwrap_or(false) {
+                if set.is_enum(*handle).unwrap_or(false) {
                     let size = set
                         .value_type_layout(*handle)
                         .map_err(|e| Fault::Unsupported(format!("{e:?}")))?
@@ -1421,6 +1417,9 @@ impl<'s> Interpreter<'s> {
         returns: Option<VarType>,
     ) -> Option<Native> {
         let type_name = self.type_name(owner);
+        if let Some(operation) = threading::thread_internal(&type_name, name, parameters.len()) {
+            return Some(Native::Intrinsic(Intrinsic::Thread(operation)));
+        }
         if let Some(operation) = reflection::internal(&type_name, name, parameters.len()) {
             return Some(Native::Intrinsic(Intrinsic::Reflect(operation)));
         }
@@ -1482,19 +1481,12 @@ impl<'s> Interpreter<'s> {
             ("System.Buffer", "BlockCopy") if parameters.len() == 5 => Intrinsic::BlockCopy,
             ("Interop+BCrypt", "BCryptGenRandom") if parameters.len() == 4 => Intrinsic::RandomBytes,
             ("System.Environment", "get_CurrentManagedThreadId") => Intrinsic::ThreadId,
-            ("System.Threading.Monitor", "ReliableEnter" | "ReliableEnterTimeout")
-                if parameters.last() == Some(&VarType::Pointer) =>
-            {
-                Intrinsic::LockTaken
-            }
-            ("System.Threading.Monitor", "Exit" | "Enter") if parameters.len() == 1 => Intrinsic::Nothing,
-            ("System.Threading.Monitor", "IsEnteredNative") => Intrinsic::True,
             ("System.RuntimeTypeHandle", "InternalAllocNoChecks_FastPath") if parameters.len() == 1 => Intrinsic::AllocateRecord(false),
-            ("System.Threading.Monitor", "TryEnter_FastPath" | "TryEnter_FastPath_WithTimeout") => Intrinsic::False,
             ("System.Enum", "GetHashCode") if parameters.len() == 1 => Intrinsic::EnumHash,
             ("System.Enum", "Equals") if parameters.len() == 2 => Intrinsic::EnumEquals,
             ("System.Threading.Thread", "GetCurrentThreadNative") if parameters.is_empty() => Intrinsic::CurrentThread,
             ("System.GC", "_CollectionCount") => Intrinsic::Collections,
+            ("System.GC", "GetMemoryInfo") if parameters.len() == 2 => Intrinsic::Nothing,
             ("System.GC", "GetMaxGeneration" | "GetGeneration" | "GetGenerationInternal") => Intrinsic::False,
             ("System.Diagnostics.Debugger", "get_IsAttached" | "IsLogging") => Intrinsic::False,
             ("System.Diagnostics.Debugger", "Log" | "NotifyOfCrossThreadDependencySlow") => Intrinsic::Nothing,
@@ -1607,6 +1599,9 @@ impl<'s> Interpreter<'s> {
         if import.library.eq_ignore_ascii_case("QCall") {
             let entry = if import.entry.is_empty() { name } else { import.entry };
             let intrinsic = match (entry, parameters.len()) {
+                (entry, count) if threading::thread_qcall(entry, count).is_some() => {
+                    Intrinsic::Thread(threading::thread_qcall(entry, count).unwrap_or(threading::ThreadOp::Ignore))
+                }
                 ("Buffer_Clear", 2) => Intrinsic::ClearMemory,
                 ("Buffer_MemMove", 3) => Intrinsic::Memmove,
                 ("String_Intern", 1) => Intrinsic::Intern(false),
@@ -1620,9 +1615,6 @@ impl<'s> Interpreter<'s> {
                 ("MarshalNative_IsBuiltInComSupported", 0) => Intrinsic::True,
                 ("GCInterface_AddMemoryPressure" | "GCInterface_RemoveMemoryPressure", 1) => Intrinsic::Nothing,
                 ("QCall_GetGCHandleForTypeHandle", 2) => Intrinsic::NewHandle,
-                ("Monitor_Pulse" | "Monitor_PulseAll", 1) => Intrinsic::Nothing,
-                ("Monitor_Enter_Slowpath" | "Monitor_Exit_Slowpath", 1) => Intrinsic::Nothing,
-                ("Monitor_TryEnter_Slowpath", _) => Intrinsic::True,
                 ("Monitor_GetLockContentionCount", 0) => Intrinsic::False,
                 ("AssemblyNative_IsApplyUpdateSupported", 0) => Intrinsic::False,
                 ("MultiCoreJIT_InternalSetProfileRoot" | "MultiCoreJIT_InternalStartProfile", _) => Intrinsic::Nothing,
@@ -2638,7 +2630,7 @@ impl<'s> Interpreter<'s> {
                     .unwrap_or("?");
                 eprintln!(
                     "{}native {}::{name} {arguments:?}",
-                    " ".repeat(self.depth.get().min(60)),
+                    " ".repeat(runtime::roots().depth.min(60)),
                     self.types.full_name(&loaded.owner_gen)
                 );
             }
@@ -2776,13 +2768,10 @@ impl<'s> Interpreter<'s> {
         Ok(Some(match intrinsic {
             Intrinsic::Unsafe(operation) => return self.run_unsafe(operation, a, ctx),
             Intrinsic::ArrayData => V::P(self.non_null(a[0])? + u64::from(ARRAY_DATA)),
-            Intrinsic::ThreadId => V::I4(1),
-            Intrinsic::LockTaken => {
-                unsafe { *(a[a.len() - 1].address() as *mut u8) = 1 };
-                return Ok(None);
-            }
+            Intrinsic::ThreadId => V::I4(self.current_managed_id()?),
             Intrinsic::Nothing => return Ok(None),
             Intrinsic::Reflect(operation) => return self.reflect(operation, a, ctx),
+            Intrinsic::Thread(operation) => return self.thread_call(operation, a),
             Intrinsic::EnumHash => {
                 let (var, bits) = self.enum_value(a[0])?;
                 V::I4(match var {
@@ -2934,8 +2923,12 @@ impl<'s> Interpreter<'s> {
             }
             Intrinsic::ProcessorCount => V::I4(processor_count()),
             Intrinsic::SpinWait => {
-                for _ in 0..a[0].int().max(0) {
-                    std::hint::spin_loop();
+                if crate::threads::others_waiting() {
+                    crate::threads::yield_now();
+                } else {
+                    for _ in 0..a[0].int().max(0) {
+                        std::hint::spin_loop();
+                    }
                 }
                 return Ok(None);
             }
@@ -3495,11 +3488,11 @@ impl<'s> Interpreter<'s> {
         if loaded.is_abstract {
             return unsupported("abstract method");
         }
-        let depth = self.depth.get();
+        let depth = runtime::roots().depth;
         if depth >= MAX_DEPTH {
             return unsupported("interpreter call depth");
         }
-        self.depth.set(depth + 1);
+        runtime::roots().depth = depth + 1;
         self.interpreted.set(self.interpreted.get() + 1);
         if self.trace_calls {
             let name = self.model.set.modules[loaded.key.module]
@@ -3536,11 +3529,11 @@ impl<'s> Interpreter<'s> {
             }
         }
         let registered = Registered::new(&frame);
-        self.frames.borrow_mut().push(loaded.key.module);
+        runtime::roots().modules.push(loaded.key.module);
         let result = self.execute(loaded, &mut frame, 0);
-        self.frames.borrow_mut().pop();
+        runtime::roots().modules.pop();
         drop(registered);
-        self.depth.set(depth);
+        runtime::roots().depth = depth;
         match result? {
             Exit::Return(value) => Ok(value),
             _ => unsupported("method ended outside a return"),
@@ -4229,6 +4222,7 @@ impl<'s> Interpreter<'s> {
             row,
             is_static,
             has_rva: flags & 0x100 != 0,
+            thread_static: is_static && runtime::state().is_thread_static(self.model.set, field_module, row),
             owner_is_value,
             ty,
             offset,
@@ -4249,6 +4243,13 @@ impl<'s> Interpreter<'s> {
             let generic = !field.owner.arguments().is_empty();
             let address = if field.has_rva {
                 map(runtime::rva_data(self.model.set, field.module, field.row))?
+            } else if field.thread_static {
+                let owner = if generic { self.types.id(&field.owner) } else { u32::MAX };
+                let (size, references): (u32, Vec<u32>) = match &field.ty {
+                    Ty::Prim(var) => (8, if *var == VarType::Ref { vec![0] } else { Vec::new() }),
+                    Ty::Struct(layout) => (layout.size, layout.references.clone()),
+                };
+                runtime::roots().thread_static(owner, field.module, field.row, size, &references)
             } else if generic {
                 let id = self.types.id(&field.owner);
                 match &field.ty {
@@ -4322,6 +4323,9 @@ impl<'s> Interpreter<'s> {
                 return unsupported("instruction budget exhausted");
             }
             self.budget.set(remaining - 1);
+            if remaining & 0x3FFF == 0 && crate::threads::others_waiting() {
+                crate::threads::yield_now();
+            }
             let instruction = decode_at(code, at)?;
             let next = instruction.1;
             let opcode = instruction.0.opcode.value;
@@ -4661,7 +4665,7 @@ impl<'s> Interpreter<'s> {
                     if self.trace_calls {
                         eprintln!(
                             "{}throw {} {}",
-                            " ".repeat(self.depth.get().min(60)),
+                            " ".repeat(runtime::roots().depth.min(60)),
                             self.exception_type(object),
                             self.exception_message(object).unwrap_or_default()
                         );
@@ -5429,33 +5433,6 @@ impl<'s> Interpreter<'s> {
         Ok((var, bits))
     }
 
-    fn current_thread(&self) -> Run<u64> {
-        if self.thread.get() != 0 {
-            return Ok(self.thread.get());
-        }
-        let handle = self.corelib_type("System.Threading", "Thread")?;
-        let exact = Gen::Named(handle, Rc::from(Vec::new()));
-        let object = runtime::allocate_managed(self.record_of(&exact)?, 0);
-        if object == 0 {
-            return self.throw("OutOfMemoryException");
-        }
-        type_roots().push(object);
-        let (_, placements) = self
-            .model
-            .set
-            .class_fields(handle)
-            .map_err(|e| Fault::Unsupported(format!("{e:?}")))?;
-        let metadata = &self.model.set.modules[handle.module].metadata;
-        if let Some(placement) = placements
-            .iter()
-            .find(|p| metadata.string_cell(TableId::Field, p.field, 1).ok() == Some("_managedThreadId"))
-        {
-            unsafe { *((object + 8 + u64::from(placement.offset)) as *mut i32) = 1 };
-        }
-        self.thread.set(object);
-        Ok(object)
-    }
-
     pub fn has_native(&self, key: &MethodKey) -> bool {
         self.load(key).is_ok_and(|loaded| loaded.native.is_some())
     }
@@ -6060,6 +6037,7 @@ mod com;
 mod marshal;
 mod members;
 mod reflection;
+mod threading;
 
 mod crt {
     use std::sync::OnceLock;

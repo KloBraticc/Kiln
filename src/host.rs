@@ -113,7 +113,7 @@ pub fn run_main(interpreter: &Interpreter<'_>, entry: &MethodKey, arguments: &[S
     }
 }
 
-fn report(interpreter: &Interpreter<'_>, fault: Fault) -> i32 {
+pub(crate) fn report(interpreter: &Interpreter<'_>, fault: Fault) -> i32 {
     match fault {
         Fault::Exception(object) => {
             match interpreter.exception_message(object) {

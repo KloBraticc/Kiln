@@ -91,7 +91,6 @@ pub(super) enum Reflect {
     Instance,
     ModuleType,
     OsThreadId,
-    Sleep,
     WaitOne,
     SpinIterations,
     Member(super::members::Member),
@@ -518,7 +517,6 @@ impl Interpreter<'_> {
             | Reflect::Instance
             | Reflect::ModuleType
             | Reflect::OsThreadId
-            | Reflect::Sleep
             | Reflect::WaitOne
             | Reflect::SpinIterations => return self.type_call(operation, a),
             _ => return self.metadata_call(operation, a),
@@ -535,8 +533,8 @@ impl Interpreter<'_> {
 
     fn caller_module(&self, depth: usize) -> usize {
         let core = self.corelib_type("System", "Object").map(|h| h.module).ok();
-        self.frames
-            .borrow()
+        runtime::roots()
+            .modules
             .iter()
             .rev()
             .filter(|module| Some(**module) != core)
@@ -1392,9 +1390,6 @@ pub(super) fn type_qcall(entry: &str, count: usize) -> Option<Reflect> {
         ("CustomAttribute_CreatePropertyOrFieldData", 7) => Reflect::AttributeNamed,
         ("CustomAttribute_ParseAttributeUsageAttribute", 5) => Reflect::AttributeUsage,
         ("ThreadNative_GetCurrentOSThreadId", 0) => Reflect::OsThreadId,
-        ("ThreadNative_Sleep", 1) => Reflect::Sleep,
-        ("ThreadNative_YieldThread", 0) => Reflect::Sleep,
-        ("ThreadNative_InformThreadNameChange", 3) | ("ThreadNative_SetIsBackground", 2) => Reflect::Ignore,
         ("RuntimeTypeHandle_GetGenericTypeDefinition", 2) => Reflect::GenericDefinition,
         ("RuntimeTypeHandle_GetInstantiation", 3) => Reflect::Instantiation,
         ("RuntimeTypeHandle_Instantiate", 4) => Reflect::Instantiate,
@@ -1463,11 +1458,6 @@ impl Interpreter<'_> {
                 return Ok(None);
             }
             Reflect::OsThreadId => V::I8(crate::pinvoke::current_thread_id() as i64),
-            Reflect::Sleep => {
-                let milliseconds = a.first().map_or(0, |v| v.int().max(0) as u64);
-                std::thread::sleep(std::time::Duration::from_millis(milliseconds));
-                if a.is_empty() { V::I4(1) } else { return Ok(None) }
-            }
             Reflect::WaitOne => V::I4(crate::pinvoke::wait_one(a[0].bits(), a[1].int() as i32)),
             Reflect::SpinIterations => V::I4(8),
             Reflect::GenericDefinition => {

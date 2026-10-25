@@ -220,7 +220,7 @@ pub fn current_thread_id() -> u32 {
 }
 
 pub fn wait_one(handle: u64, milliseconds: i32) -> i32 {
-    match unsafe { WaitForSingleObjectEx(handle as usize, milliseconds as u32, 1) } {
+    match crate::threads::blocking(|| unsafe { WaitForSingleObjectEx(handle as usize, milliseconds as u32, 1) }) {
         0 => 0,
         0x80 => 0x80,
         0x102 => 0x102,
@@ -270,11 +270,11 @@ pub unsafe fn call(function: usize, arguments: &[u64], capture_error: bool) -> (
         slots.push(0);
     }
     let bytes = slots.len() * 8;
-    let integer: u64;
-    let float: f64;
     let system_error = if capture_error { 0 } else { SYSTEM_ERROR.with(Cell::get) };
-    unsafe { SetLastError(system_error) };
-    unsafe {
+    let (integer, float, error) = crate::threads::blocking(|| unsafe {
+        let integer: u64;
+        let float: f64;
+        SetLastError(system_error);
         asm!(
             "mov r12, rsp",
             "sub rsp, r13",
@@ -307,8 +307,8 @@ pub unsafe fn call(function: usize, arguments: &[u64], capture_error: bool) -> (
             lateout("xmm0") float,
             clobber_abi("win64"),
         );
-    }
-    let error = unsafe { GetLastError() };
+        (integer, float, GetLastError())
+    });
     SYSTEM_ERROR.with(|cell| cell.set(error));
     if capture_error {
         set_last_error(error);
@@ -325,8 +325,10 @@ struct Entry {
     slot: usize,
 }
 
-thread_local! {
-    static ENTRIES: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+static ENTRIES: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+
+fn entries() -> std::sync::MutexGuard<'static, Vec<Entry>> {
+    ENTRIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 const STUB_SIZE: usize = 96;
@@ -338,11 +340,21 @@ unsafe extern "system" {
 }
 
 unsafe extern "win64" fn reverse_entry(index: u64, integers: *const u64, floats: *const u64) -> u64 {
-    let entry = ENTRIES.with(|entries| entries.borrow().get(index as usize).copied());
+    let entry = entries().get(index as usize).copied();
     match entry {
-        Some(entry) => unsafe { (entry.handler)(entry.context, entry.slot, integers, floats) },
+        Some(entry) => {
+            let acquired = !crate::threads::holding();
+            if acquired {
+                crate::threads::acquire();
+            }
+            let result = unsafe { (entry.handler)(entry.context, entry.slot, integers, floats) };
+            if acquired {
+                crate::threads::release();
+            }
+            result
+        }
         None => {
-            eprintln!("native callback {index} was called on a thread that did not create it");
+            eprintln!("native callback {index} has no entry");
             std::process::abort();
         }
     }
@@ -364,11 +376,11 @@ fn executable(size: usize) -> Option<usize> {
 }
 
 pub fn make_stub(handler: Handler, context: usize, slot: usize) -> Option<usize> {
-    let index = ENTRIES.with(|entries| {
-        let mut entries = entries.borrow_mut();
+    let index = {
+        let mut entries = entries();
         entries.push(Entry { handler, context, slot });
         entries.len() - 1
-    }) as u64;
+    } as u64;
     let target = reverse_entry as *const () as usize as u64;
     let mut code: Vec<u8> = vec![
         0x48, 0x89, 0x4C, 0x24, 0x08, 0x48, 0x89, 0x54, 0x24, 0x10, 0x4C, 0x89, 0x44, 0x24, 0x18, 0x4C, 0x89,

@@ -528,6 +528,11 @@ impl<'s> Compiler<'s> {
                         if field.is_static != static_access {
                             return unsupported("field access does not match the field");
                         }
+                        if static_access
+                            && crate::runtime::install().is_thread_static(self.model.set, field.module, field.row)
+                        {
+                            return Err(CompileError::Unsupported("thread static field".into()));
+                        }
                         if static_access {
                             let owner_info = self
                                 .model
