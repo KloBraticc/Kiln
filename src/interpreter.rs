@@ -695,8 +695,8 @@ fn outermost_compiled(frame: u64) -> u64 {
 
 struct Bridge {
     interpreter: *const Interpreter<'static>,
-    keys: RefCell<Vec<(MethodKey, Ctx)>>,
-    stubs: RefCell<HashMap<InstKey, u64>>,
+    keys: RefCell<Vec<(MethodKey, Ctx, bool)>>,
+    stubs: RefCell<HashMap<(InstKey, bool), u64>>,
 }
 
 fn record_vtable(record: u64) -> Vec<u64> {
@@ -713,6 +713,14 @@ fn resolve_stub(key: &MethodKey) -> Option<u64> {
     unsafe { &*(*bridge).interpreter }.stub_for(key)
 }
 
+fn resolve_boxed_stub(key: &MethodKey) -> Option<u64> {
+    let bridge = BRIDGE.load(std::sync::atomic::Ordering::Acquire);
+    if bridge.is_null() {
+        return None;
+    }
+    unsafe { &*(*bridge).interpreter }.stub_entry(key, &Ctx::default(), true)
+}
+
 static BRIDGE: std::sync::atomic::AtomicPtr<Bridge> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
@@ -725,7 +733,7 @@ pub(crate) unsafe extern "win64" fn fallback_entry(index: u64, arguments: *const
     let bridge = unsafe { &*bridge };
     let interpreter = unsafe { &*bridge.interpreter };
     FALLBACK_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let Some((key, ctx)) = bridge.keys.borrow().get(index as usize).cloned() else {
+    let Some((key, ctx, boxed)) = bridge.keys.borrow().get(index as usize).cloned() else {
         runtime::trap();
         return 0;
     };
@@ -740,7 +748,10 @@ pub(crate) unsafe extern "win64" fn fallback_entry(index: u64, arguments: *const
     let values: Vec<V> = parameters
         .iter()
         .enumerate()
-        .map(|(position, var)| load_raw(*var, unsafe { *arguments.add(position) }))
+        .map(|(position, var)| {
+            let raw = unsafe { *arguments.add(position) };
+            if boxed && position == 0 { V::P(raw + 8) } else { load_raw(*var, raw) }
+        })
         .collect();
     runtime::roots().transitions.push((frame, stack));
     let outcome = interpreter.invoke_ctx(key, &ctx, &values);
@@ -849,6 +860,7 @@ impl<'s> Interpreter<'s> {
         });
         BRIDGE.store(Box::into_raw(bridge), std::sync::atomic::Ordering::Release);
         runtime::state().late_resolver = Some(resolve_stub);
+        runtime::state().boxed_resolver = Some(resolve_boxed_stub);
         unsafe { AddVectoredExceptionHandler(1, hardware_fault) };
     }
 
@@ -861,19 +873,23 @@ impl<'s> Interpreter<'s> {
     }
 
     fn stub_for_ctx(&self, key: &MethodKey, ctx: &Ctx) -> Option<u64> {
+        self.stub_entry(key, ctx, false)
+    }
+
+    fn stub_entry(&self, key: &MethodKey, ctx: &Ctx, boxed: bool) -> Option<u64> {
         let bridge = BRIDGE.load(std::sync::atomic::Ordering::Acquire);
         if bridge.is_null() {
             return None;
         }
         let bridge = unsafe { &*bridge };
-        let inst = self.inst_key(key, ctx);
+        let inst = (self.inst_key(key, ctx), boxed);
         if let Some(address) = bridge.stubs.borrow().get(&inst) {
             return Some(*address);
         }
         let loaded = self.load_ctx(key, ctx).ok()?;
         let index = bridge.keys.borrow().len() as u64;
         let address = crate::jit::emit_fallback_stub(&prims(&loaded.parameters)?, index)?;
-        bridge.keys.borrow_mut().push((key.clone(), ctx.clone()));
+        bridge.keys.borrow_mut().push((key.clone(), ctx.clone(), boxed));
         bridge.stubs.borrow_mut().insert(inst, address);
         Some(address)
     }
@@ -1187,6 +1203,7 @@ impl<'s> Interpreter<'s> {
         let Ok(table) = self.vtable_of(exact) else {
             return Vec::new();
         };
+        let boxed = self.types.is_value_type(exact);
         table
             .slots
             .iter()
@@ -1198,6 +1215,9 @@ impl<'s> Interpreter<'s> {
                     return trap;
                 };
                 let ctx = self.owner_context(declaring, owner, &Rc::from(Vec::new()));
+                if boxed && self.model.set.is_value_type(owner).unwrap_or(false) {
+                    return self.stub_entry(key, &ctx, true).unwrap_or(trap);
+                }
                 let compiled = if ctx.is_empty() { runtime::state().code_addresses.get(key).copied() } else { None };
                 compiled.or_else(|| self.stub_for_ctx(key, &ctx)).unwrap_or(trap)
             })

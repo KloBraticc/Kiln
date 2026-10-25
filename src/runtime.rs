@@ -196,6 +196,7 @@ pub struct RuntimeState {
     pub code_addresses: HashMap<crate::codegen::MethodKey, u64>,
     pub trap_address: u64,
     pub late_resolver: Option<fn(&crate::codegen::MethodKey) -> Option<u64>>,
+    pub boxed_resolver: Option<fn(&crate::codegen::MethodKey) -> Option<u64>>,
     thread_static_fields: HashMap<usize, std::collections::HashSet<u32>>,
 }
 
@@ -307,10 +308,15 @@ pub fn install() -> &'static mut RuntimeState {
         code_addresses: HashMap::new(),
         trap_address: 0,
         late_resolver: None,
+        boxed_resolver: None,
         thread_static_fields: HashMap::new(),
     }));
     STATE.store(state, Ordering::Release);
     unsafe { &mut *state }
+}
+
+pub fn receives_box(model: &ObjectModel<'_>, boxed: bool, key: &crate::codegen::MethodKey) -> bool {
+    boxed && model.method_owner(key).ok().is_some_and(|owner| model.set.is_value_type(owner).unwrap_or(false))
 }
 
 impl RuntimeState {
@@ -400,9 +406,10 @@ impl RuntimeState {
                 words[7 + slot] = method
                     .as_ref()
                     .and_then(|key| {
-                        self.code_addresses
-                            .get(key)
-                            .copied()
+                        if receives_box(model, info.is_value_type, key) {
+                            return self.boxed_resolver.and_then(|resolve| resolve(key));
+                        }
+                        self.code_addresses.get(key).copied()
                             .or_else(|| self.late_resolver.and_then(|resolve| resolve(key)))
                     })
                     .unwrap_or(self.trap_address);

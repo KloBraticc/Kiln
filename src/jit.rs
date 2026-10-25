@@ -235,6 +235,9 @@ impl Image {
                 .vtable
                 .iter()
                 .map(|method| match method {
+                    Some(key) if crate::runtime::receives_box(model, info.is_value_type, key) => {
+                        state.boxed_resolver.and_then(|resolve| resolve(key)).unwrap_or(trap)
+                    }
                     Some(key) => state
                         .code_addresses
                         .get(key)
