@@ -192,8 +192,8 @@ impl Interpreter<'_> {
                 let (targets, inherited, multiple) = attribute_usage(blob);
                 unsafe {
                     *(a[2].address() as *mut i32) = targets;
-                    *(a[3].address() as *mut i32) = inherited;
-                    *(a[4].address() as *mut i32) = multiple;
+                    *(a[3].address() as *mut i32) = multiple;
+                    *(a[4].address() as *mut i32) = inherited;
                 }
                 V::I4(1)
             }
