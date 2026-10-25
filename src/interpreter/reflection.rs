@@ -360,15 +360,20 @@ impl Interpreter<'_> {
             Reflect::LoadedAssemblies => {
                 let handle = self.corelib_type("System.Reflection", "Assembly")?;
                 let record = self.array_record(&Gen::Named(handle, Rc::from(Vec::new())))?;
-                let count = set.modules.len();
-                let array = runtime::allocate_managed(record, count as u64);
+                self.mark_used(self.entry_module.get());
+                if let Ok(core) = self.corelib_type("System", "Object") {
+                    self.mark_used(core.module);
+                }
+                let mut used: Vec<usize> = self.used_modules.borrow().iter().copied().collect();
+                used.sort_unstable();
+                let array = runtime::allocate_managed(record, used.len() as u64);
                 if array == 0 {
                     return self.throw("OutOfMemoryException");
                 }
                 let _pin = Pin::new(&[V::O(array)]);
-                for module in 0..count {
-                    let assembly = self.assembly_object(module)?;
-                    unsafe { *((array + u64::from(ARRAY_DATA) + 8 * module as u64) as *mut u64) = assembly };
+                for (slot, module) in used.iter().enumerate() {
+                    let assembly = self.assembly_object(*module)?;
+                    unsafe { *((array + u64::from(ARRAY_DATA) + 8 * slot as u64) as *mut u64) = assembly };
                 }
                 self.store_handle(a[0], array);
                 return Ok(None);
@@ -642,10 +647,17 @@ impl Interpreter<'_> {
             .ok_or_else(|| Fault::Unsupported("type object from outside the fallback".into()))
     }
 
+    pub(super) fn mark_used(&self, module: usize) {
+        if !self.used_modules.borrow().contains(&module) {
+            self.used_modules.borrow_mut().insert(module);
+        }
+    }
+
     pub(super) fn assembly_object(&self, module: usize) -> Run<u64> {
         if let Some(found) = self.assemblies.borrow().get(&module) {
             return Ok(*found);
         }
+        self.mark_used(module);
         let object = self.allocate_runtime_object("System.Reflection", "RuntimeAssembly")?;
         let offset = self.class_field_offset("System.Reflection", "RuntimeAssembly", "m_assembly")?;
         unsafe { *((object + u64::from(offset)) as *mut u64) = module as u64 + 1 };

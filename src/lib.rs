@@ -1,5 +1,6 @@
 pub mod baml;
 pub mod codegen;
+pub mod diagnostics;
 pub mod error;
 pub mod generics;
 pub mod host;
@@ -14,6 +15,7 @@ pub mod metadata;
 pub mod objects;
 pub mod package;
 pub mod pinvoke;
+pub mod profiler;
 pub mod pe;
 pub mod reachability;
 pub mod reader;

@@ -207,6 +207,7 @@ pub struct ThreadRoots {
     pub pinned: Vec<u64>,
     pub transitions: Vec<(u64, u64)>,
     pub modules: Vec<usize>,
+    pub calls: Vec<(usize, u32)>,
     pub depth: usize,
     pub thread_object: u64,
     pub statics: HashMap<(usize, u32, u32), Box<[u64]>>,

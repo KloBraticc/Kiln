@@ -63,6 +63,8 @@ pub struct Types<'s> {
     list: RefCell<Vec<Gen>>,
     parameters: RefCell<HashMap<usize, HashMap<(u8, u32), usize>>>,
     interfaces: RefCell<HashMap<usize, HashMap<u32, Vec<Token>>>>,
+    all_interfaces: RefCell<HashMap<Gen, Rc<[Gen]>>>,
+    type_specs: RefCell<HashMap<(usize, u32, Ctx), Gen>>,
 }
 
 fn primitive_name(sig: &TypeSig) -> Option<&'static str> {
@@ -121,6 +123,8 @@ impl<'s> Types<'s> {
             list: RefCell::new(Vec::new()),
             parameters: RefCell::new(HashMap::new()),
             interfaces: RefCell::new(HashMap::new()),
+            all_interfaces: RefCell::new(HashMap::new()),
+            type_specs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -262,13 +266,19 @@ impl<'s> Types<'s> {
     pub fn resolve_token(&self, module: usize, token: Token, ctx: &Ctx) -> Outcome<Gen> {
         match token.table() {
             Some(TableId::TypeSpec) => {
+                let key = (module, token.row(), ctx.clone());
+                if let Some(found) = self.type_specs.borrow().get(&key) {
+                    return Ok(found.clone());
+                }
                 let metadata = &self.set.modules[module].metadata;
                 let sig = metadata
                     .cell(TableId::TypeSpec, token.row(), 0)
                     .and_then(|b| metadata.blob(b))
                     .and_then(Signature::parse_type)
                     .map_err(|e| e.to_string())?;
-                self.resolve(module, &sig, ctx)
+                let resolved = self.resolve(module, &sig, ctx)?;
+                self.type_specs.borrow_mut().insert(key, resolved.clone());
+                Ok(resolved)
             }
             Some(TableId::TypeDef) | Some(TableId::TypeRef) => {
                 let handle = self.handle(module, token)?;
@@ -378,6 +388,15 @@ impl<'s> Types<'s> {
     }
 
     pub fn all_interfaces(&self, exact: &Gen) -> Vec<Gen> {
+        if let Some(found) = self.all_interfaces.borrow().get(exact) {
+            return found.to_vec();
+        }
+        let found = self.compute_interfaces(exact);
+        self.all_interfaces.borrow_mut().insert(exact.clone(), Rc::from(found.clone()));
+        found
+    }
+
+    fn compute_interfaces(&self, exact: &Gen) -> Vec<Gen> {
         let mut found: Vec<Gen> = Vec::new();
         let mut pending: Vec<Gen> = self
             .ancestry(exact)

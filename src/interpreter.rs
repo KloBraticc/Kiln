@@ -88,7 +88,11 @@ pub enum Fault {
 pub type Run<T> = Result<T, Fault>;
 
 fn unsupported<T>(what: impl Into<String>) -> Run<T> {
-    Err(Fault::Unsupported(what.into()))
+    let reason = what.into();
+    if crate::diagnostics::enabled() {
+        crate::diagnostics::write_once("unsupported", &reason);
+    }
+    Err(Fault::Unsupported(reason))
 }
 
 fn map<T>(result: Result<T, String>) -> Run<T> {
@@ -365,6 +369,13 @@ fn type_roots() -> std::sync::MutexGuard<'static, Vec<u64>> {
 
 const EXACT_TAG: u64 = 0x8000_0000_0000_0000;
 
+thread_local! {
+    static LAST_NATIVE: Cell<(usize, u32)> = const { Cell::new((0, 0)) };
+    static LAST_METHOD: Cell<(usize, u32)> = const { Cell::new((0, 0)) };
+}
+
+pub static FALLBACK_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 type InstKey = (MethodKey, Vec<u32>, Vec<u32>);
@@ -497,6 +508,9 @@ pub struct Interpreter<'s> {
     indirect_platforms: RefCell<HashMap<(usize, u32, u64), usize>>,
     wrappers: RefCell<com::Wrappers>,
     accessors: RefCell<Vec<Rc<accessors::Accessor>>>,
+    used_modules: RefCell<HashSet<usize>>,
+    method_insts: RefCell<HashMap<(usize, u32, Ctx), (MethodKey, Ctx)>>,
+    assignable: RefCell<HashMap<(Gen, Gen), bool>>,
 }
 
 enum Pending {
@@ -588,7 +602,27 @@ extern "system" fn report_fault(pointers: *mut [usize; 2]) -> i32 {
         Some((offset, name)) => eprintln!(
             "fault {code:#x} at {address:#x} in compiled method {name} at offset {offset:#x}"
         ),
-        None => eprintln!("fault {code:#x} reading {address:#x} outside compiled code at {rip:#x}"),
+        None => {
+            let (module, row) = LAST_NATIVE.with(Cell::get);
+            let bridge = BRIDGE.load(std::sync::atomic::Ordering::Acquire);
+            let name = if bridge.is_null() {
+                String::new()
+            } else {
+                let interpreter = unsafe { &*(*bridge).interpreter };
+                let key = MethodKey { module, row };
+                let owner = interpreter.model.method_owner(&key).map(|o| interpreter.type_name(o)).unwrap_or_default();
+                let method = interpreter.model.set.modules[module].metadata.string_cell(TableId::MethodDef, row, 3).unwrap_or("");
+                format!("{owner}::{method}")
+            };
+            let message = format!("{code:#x} reading {address:#x} outside compiled code at {rip:#x}, last native {name}");
+            crate::diagnostics::write("fault", &message);
+            eprintln!(
+                "fault {message}{}
+{}",
+                crate::diagnostics::managed_stack(40),
+                std::backtrace::Backtrace::force_capture()
+            )
+        }
     }
     CONTINUE_SEARCH
 }
@@ -666,6 +700,7 @@ pub(crate) unsafe extern "win64" fn fallback_entry(index: u64, arguments: *const
     }
     let bridge = unsafe { &*bridge };
     let interpreter = unsafe { &*bridge.interpreter };
+    FALLBACK_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some((key, ctx)) = bridge.keys.borrow().get(index as usize).cloned() else {
         runtime::trap();
         return 0;
@@ -726,6 +761,7 @@ fn abort_compiled(interpreter: &Interpreter<'_>, frame: u64, fault: Fault) -> ! 
 impl<'s> Interpreter<'s> {
     pub fn new(model: &'s ObjectModel<'s>, image: Option<&'s Image>) -> Self {
         crate::threads::acquire();
+        crate::diagnostics::attach(model);
         let state = runtime::install();
         state.root_hook = Some(scan_roots);
         Self {
@@ -767,6 +803,9 @@ impl<'s> Interpreter<'s> {
             indirect_platforms: RefCell::new(HashMap::new()),
             wrappers: RefCell::new(com::Wrappers::default()),
             accessors: RefCell::new(Vec::new()),
+            used_modules: RefCell::new(HashSet::new()),
+            method_insts: RefCell::new(HashMap::new()),
+            assignable: RefCell::new(HashMap::new()),
         }
     }
 
@@ -850,6 +889,7 @@ impl<'s> Interpreter<'s> {
         if self.trace_calls {
             eprintln!("{}throw {name}", trace_indent(runtime::roots().depth));
         }
+        crate::diagnostics::write("runtime throw", name);
         let handle = match self
             .corelib_type("System", name)
             .or_else(|_| self.corelib_type("System.IO", name))
@@ -1241,6 +1281,7 @@ impl<'s> Interpreter<'s> {
     }
 
     fn load_uncached(&self, key: &MethodKey, ctx: &Ctx) -> Run<Loaded> {
+        self.mark_used(key.module);
         let set = self.model.set;
         let module = &set.modules[key.module];
         let metadata = &module.metadata;
@@ -1585,6 +1626,7 @@ impl<'s> Interpreter<'s> {
             }
             ("System.Buffer", "Memmove") if parameters.len() == 3 => Intrinsic::Memmove,
             ("System.Buffer", "__Memmove") if parameters.len() == 3 => Intrinsic::Memmove,
+            ("System.Buffer", "BulkMoveWithWriteBarrierInternal" | "__BulkMoveWithWriteBarrier") if parameters.len() == 3 => Intrinsic::Memmove,
             _ => {
                 if (type_name == "System.SR" || type_name.ends_with(".SR"))
                     && name == "GetResourceString"
@@ -2786,6 +2828,7 @@ impl<'s> Interpreter<'s> {
     }
 
     fn run_native(&self, loaded: &Loaded, native: Native, arguments: &[V]) -> Run<Option<V>> {
+        LAST_NATIVE.with(|last| last.set((loaded.key.module, loaded.key.row)));
         match native {
             Native::Intrinsic(intrinsic) => self.intrinsic(intrinsic, arguments, &loaded.ctx),
             Native::PlatformInvoke(index) => self.platform_call(index, arguments),
@@ -3265,6 +3308,17 @@ impl<'s> Interpreter<'s> {
             }
             Intrinsic::StringChar => {
                 let s = self.non_null(a[0])?;
+                if s & 7 != 0 || unsafe { *(s as *const u64) } == 0 {
+                    let (module, row) = LAST_METHOD.with(Cell::get);
+                    let key = MethodKey { module, row };
+                    let owner = self.model.method_owner(&key).map(|o| self.type_name(o)).unwrap_or_default();
+                    let method = self.model.set.modules[module].metadata.string_cell(TableId::MethodDef, row, 3).unwrap_or("");
+                    return unsupported(format!(
+                        "get_Chars on a freed or invalid string {:?} called from {owner}::{method}{}",
+                        a[0],
+                        crate::diagnostics::managed_stack(40)
+                    ));
+                }
                 let index = a[1].int();
                 let length = i64::from(unsafe { *((s + 8) as *const i32) });
                 if index < 0 || index >= length {
@@ -3640,6 +3694,7 @@ impl<'s> Interpreter<'s> {
             return unsupported("interpreter call depth");
         }
         runtime::roots().depth = depth + 1;
+        LAST_METHOD.with(|last| last.set((loaded.key.module, loaded.key.row)));
         self.interpreted.set(self.interpreted.get() + 1);
         if self.trace_calls {
             let name = self.model.set.modules[loaded.key.module]
@@ -3677,8 +3732,10 @@ impl<'s> Interpreter<'s> {
         }
         let registered = Registered::new(&frame);
         runtime::roots().modules.push(loaded.key.module);
+        runtime::roots().calls.push((loaded.key.module, loaded.key.row));
         let result = self.execute(loaded, &mut frame, 0);
         runtime::roots().modules.pop();
+        runtime::roots().calls.pop();
         drop(registered);
         runtime::roots().depth = depth;
         match result? {
@@ -3829,6 +3886,16 @@ impl<'s> Interpreter<'s> {
         if exact == target {
             return true;
         }
+        let key = (exact.clone(), target.clone());
+        if let Some(found) = self.assignable.borrow().get(&key) {
+            return *found;
+        }
+        let result = self.gen_assignable_uncached(exact, target);
+        self.assignable.borrow_mut().insert(key, result);
+        result
+    }
+
+    fn gen_assignable_uncached(&self, exact: &Gen, target: &Gen) -> bool {
         if let Some(handle) = target.handle()
             && self.type_name(handle) == "System.Object"
         {
@@ -3892,6 +3959,16 @@ impl<'s> Interpreter<'s> {
     }
 
     fn method_inst(&self, module: usize, token: Token, ctx: &Ctx) -> Run<(MethodKey, Ctx)> {
+        let cache_key = (module, token.0, ctx.clone());
+        if let Some(found) = self.method_insts.borrow().get(&cache_key) {
+            return Ok(found.clone());
+        }
+        let resolved = self.method_inst_uncached(module, token, ctx)?;
+        self.method_insts.borrow_mut().insert(cache_key, resolved.clone());
+        Ok(resolved)
+    }
+
+    fn method_inst_uncached(&self, module: usize, token: Token, ctx: &Ctx) -> Run<(MethodKey, Ctx)> {
         let set = self.model.set;
         match token.table() {
             Some(TableId::MethodDef) => {
@@ -4821,6 +4898,12 @@ impl<'s> Interpreter<'s> {
                     if object == 0 {
                         return self.throw("NullReferenceException");
                     }
+                    if crate::diagnostics::enabled() {
+                        crate::diagnostics::write(
+                            "throw",
+                            &format!("{}: {}", self.exception_type(object), self.exception_message(object).unwrap_or_default()),
+                        );
+                    }
                     if self.trace_calls {
                         eprintln!(
                             "{}throw {} {}",
@@ -5336,6 +5419,9 @@ impl<'s> Interpreter<'s> {
         }
         type_roots().push(object);
         self.type_objects.borrow_mut().insert(exact.clone(), object);
+        if let Ok(module) = self.gen_module(exact) {
+            self.mark_used(module);
+        }
         self.object_types.borrow_mut().insert(object, exact.clone());
         if let Ok(offset) = self.class_field_offset("System", "RuntimeType", "m_handle") {
             let table = self.method_table(exact)?;

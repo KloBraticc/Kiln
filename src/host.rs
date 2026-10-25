@@ -38,12 +38,27 @@ pub fn compile(
     let compiler = Compiler::new(set, helpers);
     let mut methods = HashMap::new();
     let mut failed = HashSet::new();
+    let report = std::env::var_os("KILN_COMPILE_REPORT").is_some();
+    let mut reasons: HashMap<String, usize> = HashMap::new();
     let mut queue: Vec<MethodKey> = wanted.iter().cloned().collect();
     while let Some(key) = queue.pop() {
         if methods.contains_key(&key) || failed.contains(&key) || interpreter.has_native(&key) {
             continue;
         }
         if !compilable(set, &key) {
+            if report {
+                let metadata = &set.modules[key.module].metadata;
+                let rva = metadata.cell(TableId::MethodDef, key.row, 0).unwrap_or(0);
+                let implementation = metadata.cell(TableId::MethodDef, key.row, 1).unwrap_or(0);
+                let reason = if rva == 0 {
+                    "no body".to_owned()
+                } else if implementation & 0x3 != 0 {
+                    "runtime implemented".to_owned()
+                } else {
+                    "runtime implemented".to_owned()
+                };
+                *reasons.entry(reason).or_default() += 1;
+            }
             failed.insert(key);
             continue;
         }
@@ -52,7 +67,14 @@ pub fn compile(
                 queue.extend(method.callees.iter().cloned());
                 methods.insert(key, method);
             }
-            Err(_) => {
+            Err(error) => {
+                if report {
+                    let reason = match error {
+                        crate::codegen::CompileError::Unsupported(reason) | crate::codegen::CompileError::Translate(reason) => reason,
+                    };
+                    let reason: String = reason.chars().take_while(|c| !c.is_ascii_digit()).collect();
+                    *reasons.entry(reason).or_default() += 1;
+                }
                 failed.insert(key);
             }
         }
@@ -69,7 +91,18 @@ pub fn compile(
             .map(|(key, _)| key.clone())
             .collect();
         if broken.is_empty() {
+            if report {
+                let mut sorted: Vec<_> = reasons.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                eprintln!("compiled {} methods, {} failed", methods.len(), failed.len());
+                for (reason, count) in sorted.iter().take(40) {
+                    eprintln!("{count:>8}  {reason}");
+                }
+            }
             return methods;
+        }
+        if report {
+            *reasons.entry("removed because a callee could not be compiled".into()).or_default() += broken.len();
         }
         for key in broken {
             methods.remove(&key);
@@ -81,7 +114,7 @@ fn compilable(set: &AssemblySet, key: &MethodKey) -> bool {
     let metadata = &set.modules[key.module].metadata;
     let rva = metadata.cell(TableId::MethodDef, key.row, 0).unwrap_or(0);
     let implementation = metadata.cell(TableId::MethodDef, key.row, 1).unwrap_or(0);
-    rva != 0 && implementation & 0x3 == 0 && crate::codegen::method_types(set, key).is_ok()
+    rva != 0 && implementation & 0x3 == 0
 }
 
 pub fn start(model: &ObjectModel<'_>) {
@@ -116,6 +149,10 @@ pub fn run_main(interpreter: &Interpreter<'_>, entry: &MethodKey, arguments: &[S
 pub(crate) fn report(interpreter: &Interpreter<'_>, fault: Fault) -> i32 {
     match fault {
         Fault::Exception(object) => {
+            crate::diagnostics::write(
+                "unhandled",
+                &format!("{}: {}", interpreter.exception_type(object), interpreter.exception_message(object).unwrap_or_default()),
+            );
             match interpreter.exception_message(object) {
                 Some(message) => eprintln!("Unhandled exception. {}: {message}", interpreter.exception_type(object)),
                 None => eprintln!("Unhandled exception. {}", interpreter.exception_type(object)),
@@ -242,12 +279,20 @@ pub fn launch(
         eprintln!("{} has no entry point", set.modules[application].name);
         return 2;
     };
+    if std::env::var_os("KILN_TRACE").is_some() {
+        crate::interpreter::install_fault_report();
+    }
     let model = ObjectModel::new(set);
     start(&model);
     let interpreter = Interpreter::new(&model, None);
     interpreter.install_bridge();
     interpreter.set_entry_module(application);
+    let phase = std::time::Instant::now();
     let methods = methods(&interpreter);
+    if std::env::var_os("KILN_TIMING").is_some() {
+        eprintln!("kiln: {} methods loaded in {:?}", methods.len(), phase.elapsed());
+    }
+    let phase = std::time::Instant::now();
     let image = match crate::jit::Image::link_with_fallback(
         &methods,
         &model,
@@ -261,9 +306,24 @@ pub fn launch(
         }
     };
     interpreter.attach(&image);
+    if std::env::var_os("KILN_TIMING").is_some() {
+        eprintln!("kiln: linked in {:?}", phase.elapsed());
+    }
     if let Err(error) = configure(&interpreter, properties) {
         eprintln!("Kiln could not configure the application: {error}");
         return 134;
     }
-    run_main(&interpreter, &entry, arguments)
+    crate::profiler::start();
+    let code = run_main(&interpreter, &entry, arguments);
+    crate::profiler::report();
+    if std::env::var_os("KILN_TIMING").is_some() {
+        eprintln!(
+            "kiln: {} interpreted calls, {} compiled calls from the interpreter, {} fallbacks from compiled code, {} collections",
+            interpreter.interpreted.get(),
+            interpreter.compiled_calls.get(),
+            crate::interpreter::FALLBACK_ENTRIES.load(std::sync::atomic::Ordering::Relaxed),
+            crate::runtime::COLLECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+    code
 }
