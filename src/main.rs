@@ -1324,7 +1324,10 @@ fn publish(arguments: &[String]) -> ExitCode {
     };
     let mut set = kiln::loader::AssemblySet::default();
     let mut modules = Vec::new();
-    for index in kiln::host::closure(&everything, application) {
+    let mut order = kiln::host::closure(&everything, application);
+    let rest: Vec<usize> = (0..everything.modules.len()).filter(|index| !order.contains(index)).collect();
+    order.extend(rest);
+    for index in order {
         let module = &everything.modules[index];
         let data = module.image.data();
         if let Err(error) = set.add_bytes(&module.path, data) {
