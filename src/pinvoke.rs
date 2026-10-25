@@ -190,6 +190,7 @@ pub fn resolve(directory: &Path, import: &Import<'_>, method_name: &str) -> Resu
 
 thread_local! {
     static LAST_ERROR: Cell<u32> = const { Cell::new(0) };
+    static SYSTEM_ERROR: Cell<u32> = const { Cell::new(0) };
 }
 
 pub fn apartment_state() -> i32 {
@@ -240,6 +241,14 @@ pub fn set_last_error(code: u32) {
     LAST_ERROR.with(|cell| cell.set(code));
 }
 
+pub fn system_error() -> u32 {
+    SYSTEM_ERROR.with(Cell::get)
+}
+
+pub fn set_system_error(code: u32) {
+    SYSTEM_ERROR.with(|cell| cell.set(code));
+}
+
 pub fn ansi(units: &[u16]) -> Vec<u8> {
     if units.is_empty() {
         return vec![0];
@@ -263,9 +272,8 @@ pub unsafe fn call(function: usize, arguments: &[u64], capture_error: bool) -> (
     let bytes = slots.len() * 8;
     let integer: u64;
     let float: f64;
-    if capture_error {
-        unsafe { SetLastError(0) };
-    }
+    let system_error = if capture_error { 0 } else { SYSTEM_ERROR.with(Cell::get) };
+    unsafe { SetLastError(system_error) };
     unsafe {
         asm!(
             "mov r12, rsp",
@@ -300,8 +308,10 @@ pub unsafe fn call(function: usize, arguments: &[u64], capture_error: bool) -> (
             clobber_abi("win64"),
         );
     }
+    let error = unsafe { GetLastError() };
+    SYSTEM_ERROR.with(|cell| cell.set(error));
     if capture_error {
-        set_last_error(unsafe { GetLastError() });
+        set_last_error(error);
     }
     (integer, float.to_bits())
 }

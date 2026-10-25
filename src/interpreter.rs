@@ -209,6 +209,10 @@ enum Intrinsic {
     EnumHash,
     EnumEquals,
     CurrentThread,
+    CurrentThreadOnStack,
+    SystemError,
+    SetSystemError,
+    AllocateRecord(bool),
     Collections,
     DefaultConstruct,
     NewHandle,
@@ -1268,6 +1272,13 @@ impl<'s> Interpreter<'s> {
             _ if name == ".ctor" && self.type_name(owner) == "System.String" => {
                 Some(Native::StringConstructor)
             }
+            _ if !sig.has_this
+                && name == "GetRuntimeType"
+                && parameters.len() == 1
+                && self.type_name(owner) == "System.RuntimeTypeHandle" =>
+            {
+                Some(Native::Intrinsic(Intrinsic::Reflect(reflection::Reflect::Member(members::Member::TypeFromMethodTable))))
+            }
             _ if reflection::internal(&self.type_name(owner), name, parameters.len()).is_some() => {
                 reflection::internal(&self.type_name(owner), name, parameters.len()).map(|r| Native::Intrinsic(Intrinsic::Reflect(r)))
             }
@@ -1478,6 +1489,8 @@ impl<'s> Interpreter<'s> {
             }
             ("System.Threading.Monitor", "Exit" | "Enter") if parameters.len() == 1 => Intrinsic::Nothing,
             ("System.Threading.Monitor", "IsEnteredNative") => Intrinsic::True,
+            ("System.RuntimeTypeHandle", "InternalAllocNoChecks_FastPath") if parameters.len() == 1 => Intrinsic::AllocateRecord(false),
+            ("System.Threading.Monitor", "TryEnter_FastPath" | "TryEnter_FastPath_WithTimeout") => Intrinsic::False,
             ("System.Enum", "GetHashCode") if parameters.len() == 1 => Intrinsic::EnumHash,
             ("System.Enum", "Equals") if parameters.len() == 2 => Intrinsic::EnumEquals,
             ("System.Threading.Thread", "GetCurrentThreadNative") if parameters.is_empty() => Intrinsic::CurrentThread,
@@ -1493,6 +1506,8 @@ impl<'s> Interpreter<'s> {
             ("System.Runtime.DependentHandle", "InternalGetDependent") if parameters.len() == 1 => Intrinsic::DependentSecond,
             ("System.Runtime.DependentHandle", "InternalGetTarget") if parameters.len() == 1 => Intrinsic::DependentTarget,
             ("System.Runtime.DependentHandle", "InternalAlloc") if parameters.len() == 2 => Intrinsic::DependentAlloc,
+            ("System.Runtime.CompilerServices.RuntimeHelpers", "TryEnsureSufficientExecutionStack") => Intrinsic::True,
+            ("System.Runtime.CompilerServices.RuntimeHelpers", "EnsureSufficientExecutionStack") => Intrinsic::Nothing,
             ("System.Runtime.CompilerServices.RuntimeHelpers", "PrepareDelegate" | "PrepareMethod" | "PrepareContractedDelegate" | "ProbeForSufficientStack") => Intrinsic::Nothing,
             ("System.Runtime.CompilerServices.RuntimeHelpers", "GetHashCode" | "TryGetHashCode" | "InternalGetHashCode") if parameters.len() == 1 => Intrinsic::IdentityHash,
             ("System.Runtime.InteropServices.GCHandle", "_InternalAlloc" | "InternalAlloc") if parameters.len() == 2 => {
@@ -1533,6 +1548,8 @@ impl<'s> Interpreter<'s> {
             ("System.Runtime.InteropServices.Marshal", "SetLastPInvokeError") if parameters.len() == 1 => {
                 Intrinsic::SetLastError
             }
+            ("System.Runtime.InteropServices.Marshal", "GetLastSystemError") if parameters.is_empty() => Intrinsic::SystemError,
+            ("System.Runtime.InteropServices.Marshal", "SetLastSystemError") if parameters.len() == 1 => Intrinsic::SetSystemError,
             ("System.Threading.Interlocked", "Exchange")
                 if parameters.len() == 2 && parameters[0] == VarType::Pointer =>
             {
@@ -1591,6 +1608,7 @@ impl<'s> Interpreter<'s> {
             let entry = if import.entry.is_empty() { name } else { import.entry };
             let intrinsic = match (entry, parameters.len()) {
                 ("Buffer_Clear", 2) => Intrinsic::ClearMemory,
+                ("Buffer_MemMove", 3) => Intrinsic::Memmove,
                 ("String_Intern", 1) => Intrinsic::Intern(false),
                 ("NativeLibrary_LoadByName", 5) => Intrinsic::LoadLibrary(false),
                 ("NativeLibrary_LoadFromPath", 2) => Intrinsic::LoadLibrary(true),
@@ -1603,6 +1621,13 @@ impl<'s> Interpreter<'s> {
                 ("GCInterface_AddMemoryPressure" | "GCInterface_RemoveMemoryPressure", 1) => Intrinsic::Nothing,
                 ("QCall_GetGCHandleForTypeHandle", 2) => Intrinsic::NewHandle,
                 ("Monitor_Pulse" | "Monitor_PulseAll", 1) => Intrinsic::Nothing,
+                ("Monitor_Enter_Slowpath" | "Monitor_Exit_Slowpath", 1) => Intrinsic::Nothing,
+                ("Monitor_TryEnter_Slowpath", _) => Intrinsic::True,
+                ("Monitor_GetLockContentionCount", 0) => Intrinsic::False,
+                ("AssemblyNative_IsApplyUpdateSupported", 0) => Intrinsic::False,
+                ("MultiCoreJIT_InternalSetProfileRoot" | "MultiCoreJIT_InternalStartProfile", _) => Intrinsic::Nothing,
+                ("ThreadNative_GetCurrentThread", 1) => Intrinsic::CurrentThreadOnStack,
+                ("RuntimeTypeHandle_InternalAllocNoChecks", 2) => Intrinsic::AllocateRecord(true),
                 (entry, count) if reflection::qcall(entry, count).is_some() => {
                     Intrinsic::Reflect(reflection::qcall(entry, count).unwrap_or(reflection::Reflect::EntryAssembly))
                 }
@@ -2783,6 +2808,23 @@ impl<'s> Interpreter<'s> {
                 V::I4(i32::from(same))
             }
             Intrinsic::CurrentThread => V::O(self.current_thread()?),
+            Intrinsic::AllocateRecord(on_stack) => {
+                let exact = self.method_table_type(a[0].bits())?;
+                let object = runtime::allocate_managed(self.record_of(&exact)?, 0);
+                if object == 0 {
+                    return self.throw("OutOfMemoryException");
+                }
+                if on_stack {
+                    self.store_handle(a[1], object);
+                    return Ok(None);
+                }
+                V::O(object)
+            }
+            Intrinsic::CurrentThreadOnStack => {
+                let thread = self.current_thread()?;
+                self.store_handle(a[0], thread);
+                return Ok(None);
+            }
             Intrinsic::Collections => V::I4(runtime::COLLECTIONS.load(std::sync::atomic::Ordering::Relaxed) as i32),
             Intrinsic::DefaultConstruct => {
                 let exact = self
@@ -2898,6 +2940,11 @@ impl<'s> Interpreter<'s> {
                 return Ok(None);
             }
             Intrinsic::LastError => V::I4(pinvoke::last_error() as i32),
+            Intrinsic::SystemError => V::I4(pinvoke::system_error() as i32),
+            Intrinsic::SetSystemError => {
+                pinvoke::set_system_error(a[0].int() as u32);
+                return Ok(None);
+            }
             Intrinsic::SetLastError => {
                 pinvoke::set_last_error(a[0].int() as u32);
                 return Ok(None);
@@ -4610,6 +4657,14 @@ impl<'s> Interpreter<'s> {
                     let object = pop!().address();
                     if object == 0 {
                         return self.throw("NullReferenceException");
+                    }
+                    if self.trace_calls {
+                        eprintln!(
+                            "{}throw {} {}",
+                            " ".repeat(self.depth.get().min(60)),
+                            self.exception_type(object),
+                            self.exception_message(object).unwrap_or_default()
+                        );
                     }
                     return Err(Fault::Exception(object));
                 }

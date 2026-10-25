@@ -24,6 +24,7 @@ pub(super) enum Reflect {
     TypeCore,
     Load,
     ManifestModule,
+    HandleElementKind,
     ComInterface,
     ReleaseCom(bool),
     Modules,
@@ -126,6 +127,7 @@ pub(super) fn qcall(entry: &str, count: usize) -> Option<Reflect> {
         ("AssemblyNative_GetExecutingAssembly", 2) => Reflect::ExecutingAssembly,
         ("AssemblyNative_GetLoadedAssemblies", 1) => Reflect::LoadedAssemblies,
         ("AssemblyNative_GetModules", 4) => Reflect::Modules,
+        ("TypeHandle_GetCorElementType", 1) => Reflect::HandleElementKind,
         ("MarshalNative_GetComInterfaceForObject", 3) => Reflect::ComInterface,
         ("MarshalNative_ReleaseComObject", 1) => Reflect::ReleaseCom(false),
         ("MarshalNative_FinalReleaseComObject", 1) => Reflect::ReleaseCom(true),
@@ -145,7 +147,7 @@ pub(super) fn internal(type_name: &str, name: &str, count: usize) -> Option<Refl
     }
     Some(match (type_name, name, count) {
         ("System.Reflection.RuntimeAssembly", "GetManifestModule", 1) => Reflect::ManifestModule,
-        ("System.Reflection.RuntimeAssembly", "FCallIsDynamic", 1) => Reflect::IsDynamic,
+        ("System.Reflection.RuntimeAssembly", "FCallIsDynamic" | "GetIsDynamic", 1) => Reflect::IsDynamic,
         ("System.Reflection.RuntimeAssembly", "GetToken", 1) => Reflect::AssemblyToken,
         ("System.RuntimeTypeHandle", "GetModule", 1) => Reflect::TypeModule,
         ("System.RuntimeTypeHandle", "GetAssembly", 1) => Reflect::TypeAssembly,
@@ -153,13 +155,13 @@ pub(super) fn internal(type_name: &str, name: &str, count: usize) -> Option<Refl
         ("System.RuntimeTypeHandle", "GetAttributes", 1) => Reflect::TypeAttributes,
         ("System.RuntimeTypeHandle", "GetBaseType", 1) => Reflect::BaseType,
         ("System.RuntimeTypeHandle", "GetCorElementType", 1) => Reflect::ElementKind,
-        ("System.RuntimeTypeHandle", "IsInstanceOfType", 2) => Reflect::InstanceOfType,
+        ("System.RuntimeTypeHandle" | "System.RuntimeType", "IsInstanceOfType", 2) => Reflect::InstanceOfType,
         ("System.RuntimeTypeHandle", "GetDeclaringType", 1) => Reflect::DeclaringType,
         ("System.RuntimeTypeHandle", "GetElementType", 1) => Reflect::ElementType,
         ("System.RuntimeTypeHandle", "GetArrayRank", 1) => Reflect::ArrayRank,
         ("System.RuntimeTypeHandle", "ContainsGenericVariables", 1) => Reflect::ContainsGenericVariables,
         ("System.RuntimeTypeHandle", "IsEquivalentTo" | "CompareCanonicalHandles", 2) => Reflect::SameType,
-        ("System.RuntimeTypeHandle", "_GetUtf8Name", 1) => Reflect::Utf8Name,
+        ("System.RuntimeTypeHandle", "_GetUtf8Name" | "GetUtf8NameInternal", 1) => Reflect::Utf8Name,
         ("System.ModuleHandle", "GetMDStreamVersion", 1) => Reflect::StreamVersion,
         ("System.ModuleHandle", "GetToken", 1) => Reflect::ModuleToken,
         ("System.Reflection.MetadataImport", name, count) => return metadata_internal(name, count),
@@ -396,7 +398,12 @@ impl Interpreter<'_> {
                         let assembly = self.assembly_object(module)?;
                         self.store_handle(a[5], assembly);
                     }
-                    None if a[3].int() != 0 => return self.throw("FileNotFoundException"),
+                    None if a[3].int() != 0 => {
+                        if self.trace_calls {
+                            eprintln!("assembly {name} was not found");
+                        }
+                        return self.throw("FileNotFoundException");
+                    }
                     None => self.store_handle(a[5], 0),
                 }
                 return Ok(None);
@@ -438,6 +445,7 @@ impl Interpreter<'_> {
                 })
             }
             Reflect::ElementKind => V::I4(self.element_kind(&self.type_gen(a[0])?)),
+            Reflect::HandleElementKind => V::I4(self.element_kind(&self.method_table_type(a[0].bits())?)),
             Reflect::InstanceOfType => {
                 let exact = self.type_gen(a[0])?;
                 let exact = self.nullable_argument(&exact).unwrap_or(exact);
