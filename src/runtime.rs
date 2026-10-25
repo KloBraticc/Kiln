@@ -814,12 +814,13 @@ pub extern "win64" fn initialize_array(array: u64, data: u64) {
         return;
     }
     unsafe {
-        let record = *(array as *const u64) as *const u64;
+        let record = (*(array as *const u64) & !1) as *const u64;
         let component = *record >> 32;
+        let base = *record & 0xFFFF_FFFF;
         let length = u64::from(*((array + 8) as *const u32));
         std::ptr::copy_nonoverlapping(
             data as *const u8,
-            (array + u64::from(ARRAY_DATA)) as *mut u8,
+            (array + base) as *mut u8,
             (component * length) as usize,
         );
     }

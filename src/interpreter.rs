@@ -129,6 +129,8 @@ enum Pass {
     Field(u32),
     SafeHandle(u32),
     SafeHandleOut(Gen, u32),
+    StringOut(u8),
+    BoolOut(u8),
     Delegate,
     Formatted(Rc<marshal::NativeLayout>, bool),
     FormattedRef(Rc<marshal::NativeLayout>),
@@ -168,6 +170,13 @@ unsafe fn callback_handler(context: usize, slot: usize, integers: *const u64, fl
 enum Intrinsic {
     False,
     Intern(bool),
+    HasComponentSize,
+    TrackerVtable,
+    UntrackedReference,
+    CountedHandle,
+    TaggedImpl,
+    UnknownImpl,
+    TypeMemory,
     Collect,
     SetExitCode,
     ExitCode,
@@ -375,6 +384,21 @@ thread_local! {
 }
 
 pub static FALLBACK_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+unsafe extern "system" fn wrapper_query_interface(_this: u64, _iid: u64, result: *mut u64) -> i32 {
+    if !result.is_null() {
+        unsafe { *result = 0 };
+    }
+    0x8000_4002_u32 as i32
+}
+
+unsafe extern "system" fn wrapper_not_implemented(_this: u64, _version: u64) -> i32 {
+    0x8000_4001_u32 as i32
+}
+
+unsafe extern "system" fn wrapper_reference(_this: u64) -> u32 {
+    1
+}
 
 pub static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -1681,6 +1705,13 @@ impl<'s> Interpreter<'s> {
                 ("Monitor_GetLockContentionCount", 0) => Intrinsic::False,
                 ("AssemblyNative_IsApplyUpdateSupported", 0) => Intrinsic::False,
                 ("GCInterface_Collect", _) => Intrinsic::Collect,
+                ("RuntimeTypeHandle_AllocateTypeAssociatedMemory", _) => Intrinsic::TypeMemory,
+                ("ComWrappers_GetIUnknownImpl", 3) => Intrinsic::UnknownImpl,
+                ("ComWrappers_GetTaggedImpl", 0) => Intrinsic::TaggedImpl,
+                ("ComWrappers_GetIReferenceTrackerTargetVftbl", 0) => Intrinsic::TrackerVtable,
+                ("ComWrappers_GetUntrackedAddRefRelease", 0) => Intrinsic::UntrackedReference,
+                ("ComWrappers_AllocateRefCountedHandle", 1) => Intrinsic::CountedHandle,
+                ("ComWrappers_RegisterIsRootedCallback", _) => Intrinsic::Nothing,
                 ("GCInterface_WaitForPendingFinalizers", 0) => Intrinsic::Nothing,
                 ("MultiCoreJIT_InternalSetProfileRoot" | "MultiCoreJIT_InternalStartProfile", _) => Intrinsic::Nothing,
                 ("ThreadNative_GetCurrentThread", 1) => Intrinsic::CurrentThreadOnStack,
@@ -1859,6 +1890,22 @@ impl<'s> Interpreter<'s> {
                 (TypeSig::SzArray(element), 0x2A) if blittable(element, unicode) => Pass::Array,
                 (_, 0x26) if is_delegate => Pass::Delegate,
                 (_, 0x28) => Pass::AsAny(unicode),
+                (_, 0x2B) if declared.as_ref().is_some_and(|exact| self.has_layout(exact)) => {
+                    let exact = declared.clone().unwrap_or(Gen::FunctionPointer);
+                    Pass::Formatted(self.native_layout(&exact)?, outward)
+                }
+                (_, 0x14 | 0x15 | 0x16)
+                    if declared
+                        .as_ref()
+                        .and_then(Gen::handle)
+                        .is_some_and(|h| self.type_name(h) == "System.Text.StringBuilder") =>
+                {
+                    Pass::Builder(native != 0x14)
+                }
+                (TypeSig::ByRef(inner), 0x02..=0x04) if matches!(unmodified(inner), TypeSig::Boolean) => Pass::BoolOut(native),
+                (TypeSig::ByRef(inner), 0x14) if matches!(unmodified(inner), TypeSig::String) => Pass::StringOut(1),
+                (TypeSig::ByRef(inner), 0x15 | 0x16) if matches!(unmodified(inner), TypeSig::String) => Pass::StringOut(0),
+                (TypeSig::ByRef(inner), 0x30) if matches!(unmodified(inner), TypeSig::String) => Pass::StringOut(2),
                 (TypeSig::ByRef(_), 0x19 | 0x1C) => Pass::ComOut,
                 (_, 0x19 | 0x1C) if declared.as_ref().is_some_and(|g| self.is_com_interface(g)) => {
                     Pass::Com(declared.clone().unwrap_or(Gen::FunctionPointer))
@@ -1907,6 +1954,12 @@ impl<'s> Interpreter<'s> {
                     ));
                 }
             },
+            (TypeSig::ByRef(inner), Ty::Prim(VarType::Pointer)) if matches!(unmodified(inner), TypeSig::Boolean) => {
+                Pass::BoolOut(0x02)
+            }
+            (TypeSig::ByRef(inner), Ty::Prim(VarType::Pointer)) if matches!(unmodified(inner), TypeSig::String) => {
+                Pass::StringOut(if unicode { 0 } else { 1 })
+            }
             (TypeSig::ByRef(inner), Ty::Prim(VarType::Pointer))
                 if matches!(unmodified(inner), TypeSig::Class(_) | TypeSig::GenericInst { .. })
                     && self.is_com_interface(&map(self.types.resolve(module, unmodified(inner), ctx))?) =>
@@ -2037,6 +2090,8 @@ impl<'s> Interpreter<'s> {
         let mut builders: Vec<(u64, u64, bool)> = Vec::new();
         let mut com_outs: Vec<(u64, u64)> = Vec::new();
         let mut handle_outs: Vec<(u64, u64, Gen, u32)> = Vec::new();
+        let mut string_outs: Vec<(u64, u64, u8)> = Vec::new();
+        let mut bool_outs: Vec<(u64, u64, u8)> = Vec::new();
         for (pass, value) in platform.passes.iter().zip(arguments) {
             let data = match value {
                 V::S(boxed) | V::O(boxed) if *boxed != 0 => boxed + 8,
@@ -2135,6 +2190,38 @@ impl<'s> Interpreter<'s> {
                         }
                     },
                 },
+                Pass::BoolOut(native) => {
+                    let target = value.address();
+                    let current = target != 0 && unsafe { *(target as *const u8) } != 0;
+                    let initial = match (native, current) {
+                        (0x04, true) => 0xFFFF,
+                        (_, true) => 1,
+                        (_, false) => 0,
+                    };
+                    buffers.push(vec![initial; 1]);
+                    let slot = buffers[buffers.len() - 1].as_ptr() as u64;
+                    bool_outs.push((slot, target, *native));
+                    slot
+                }
+                Pass::StringOut(kind) => {
+                    let target = value.address();
+                    let current = if target == 0 { 0 } else { unsafe { *(target as *const u64) } };
+                    let initial = if current == 0 {
+                        0
+                    } else {
+                        let units = string_units(current);
+                        let bytes: Vec<u8> = match kind {
+                            0 => units.iter().chain(&[0]).flat_map(|u| u.to_le_bytes()).collect(),
+                            2 => String::from_utf16_lossy(units).bytes().chain([0]).collect(),
+                            _ => pinvoke::ansi(units),
+                        };
+                        pinvoke::task_alloc(&bytes)
+                    };
+                    buffers.push(vec![initial; 1]);
+                    let slot = buffers[buffers.len() - 1].as_ptr() as u64;
+                    string_outs.push((slot, target, *kind));
+                    slot
+                }
                 Pass::SafeHandleOut(exact, offset) => {
                     let target = value.address();
                     let current = match target {
@@ -2229,6 +2316,37 @@ impl<'s> Interpreter<'s> {
         }
         for (layout, native, managed) in copy_back {
             self.marshal_in(&layout, native, managed)?;
+        }
+        for (slot, target, native) in bool_outs {
+            let raw = unsafe { *(slot as *const u64) };
+            let truth = match native {
+                0x03 => raw & 0xFF != 0,
+                0x04 => raw & 0xFFFF != 0,
+                _ => raw & 0xFFFF_FFFF != 0,
+            };
+            if target != 0 {
+                unsafe { *(target as *mut u8) = u8::from(truth) };
+            }
+        }
+        for (slot, target, kind) in string_outs {
+            let native = unsafe { *(slot as *const u64) };
+            let object = if native == 0 {
+                0
+            } else {
+                let units = match kind {
+                    0 => reflection::wide_units(native),
+                    2 => {
+                        let text = unsafe { std::ffi::CStr::from_ptr(native as *const std::ffi::c_char) }.to_string_lossy().into_owned();
+                        text.encode_utf16().collect()
+                    }
+                    _ => reflection::ansi_units(native),
+                };
+                pinvoke::task_free(native);
+                runtime::new_string(&units)
+            };
+            if target != 0 {
+                unsafe { *(target as *mut u64) = object };
+            }
         }
         for (slot, target, exact, offset) in handle_outs {
             let object = self.construct_default(&exact)?;
@@ -2545,6 +2663,7 @@ impl<'s> Interpreter<'s> {
             ("System.Buffer", "Memmove") if ctx.methods.len() == 1 => Intrinsic::MemmoveElements,
             ("System.Runtime.InteropServices.MemoryMarshal", "GetArrayDataReference") => Intrinsic::ArrayData,
             ("System.Runtime.CompilerServices.RuntimeHelpers", "GetMultiDimensionalArrayRank") => Intrinsic::ArrayRank,
+            ("System.Runtime.CompilerServices.RuntimeHelpers", "ObjectHasComponentSize") => Intrinsic::HasComponentSize,
             ("System.Runtime.CompilerServices.Unsafe", _) => Intrinsic::Unsafe(self.unsafe_operation(name)?),
             ("System.Runtime.CompilerServices.RuntimeHelpers", "CreateSpan") if ctx.methods.len() == 1 => {
                 Intrinsic::CreateSpan
@@ -2922,6 +3041,45 @@ impl<'s> Interpreter<'s> {
         Ok(Some(match intrinsic {
             Intrinsic::Unsafe(operation) => return self.run_unsafe(operation, a, ctx),
             Intrinsic::ArrayData => V::P(Self::array_data(self.non_null(a[0])?)),
+            Intrinsic::TrackerVtable => {
+                static TABLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let table = *TABLE.get_or_init(|| {
+                    let entries: Box<[u64]> = vec![
+                        wrapper_query_interface as *const () as u64,
+                        wrapper_reference as *const () as u64,
+                        wrapper_reference as *const () as u64,
+                        wrapper_reference as *const () as u64,
+                        wrapper_reference as *const () as u64,
+                        wrapper_reference as *const () as u64,
+                        wrapper_reference as *const () as u64,
+                    ]
+                    .into_boxed_slice();
+                    Box::leak(entries).as_ptr() as usize
+                });
+                V::P(table as u64)
+            }
+            Intrinsic::UntrackedReference => V::P(wrapper_reference as *const () as u64),
+            Intrinsic::CountedHandle => {
+                let slot = unsafe { *(Self::struct_data(a[0]) as *const u64) };
+                let object = if slot == 0 { 0 } else { unsafe { *(slot as *const u64) } };
+                V::P(runtime::state().allocate_handle(object))
+            }
+            Intrinsic::TaggedImpl => V::P(wrapper_not_implemented as *const () as u64),
+            Intrinsic::UnknownImpl => {
+                unsafe {
+                    *(a[0].address() as *mut u64) = wrapper_query_interface as *const () as u64;
+                    *(a[1].address() as *mut u64) = wrapper_reference as *const () as u64;
+                    *(a[2].address() as *mut u64) = wrapper_reference as *const () as u64;
+                }
+                return Ok(None);
+            }
+            Intrinsic::TypeMemory => {
+                let size = a.get(1).map_or(0, |v| v.int() as u32 as usize);
+                let alignment = a.get(2).map_or(8, |v| (v.int() as u32 as usize).max(8));
+                let block: &'static mut [u8] = Box::leak(vec![0u8; size + alignment].into_boxed_slice());
+                let address = block.as_ptr() as usize;
+                V::P(address.next_multiple_of(alignment) as u64)
+            }
             Intrinsic::Collect => {
                 runtime::state().collect(0, 0);
                 return Ok(None);
@@ -2931,6 +3089,12 @@ impl<'s> Interpreter<'s> {
                 return Ok(None);
             }
             Intrinsic::ExitCode => V::I4(EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst)),
+            Intrinsic::HasComponentSize => {
+                let object = self.non_null(a[0])?;
+                let record = unsafe { *(object as *const u64) } & !1;
+                let flags = unsafe { *((record + 8) as *const u64) };
+                V::I4(i32::from(flags & (runtime::FLAG_ARRAY | runtime::FLAG_STRING) != 0))
+            }
             Intrinsic::ArrayRank => V::I4(Self::array_rank(self.non_null(a[0])?) as i32),
             Intrinsic::ThreadId => V::I4(self.current_managed_id()?),
             Intrinsic::Nothing => return Ok(None),

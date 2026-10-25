@@ -62,6 +62,7 @@ pub(super) enum Member {
     MethodAtSlot,
     AllocateArray,
     DelegateMethodsEqual,
+    DelegateMethod,
     BindMethod,
     SignaturesEqual,
     TypeGuid,
@@ -141,6 +142,7 @@ pub(super) fn member_qcall(entry: &str, count: usize) -> Option<Member> {
         ("RuntimeTypeHandle_GetMethodAt", 2) => Member::MethodAtSlot,
         ("GCInterface_AllocateNewArray", 4) => Member::AllocateArray,
         ("Delegate_InternalEqualMethodHandles", 2) => Member::DelegateMethodsEqual,
+        ("Delegate_FindMethodHandle", 2) => Member::DelegateMethod,
         ("ExceptionNative_GetFrozenStackTrace", 2) => Member::Ignore,
         ("StackTrace_GetStackFramesInternal", _) => Member::Ignore,
         ("Delegate_BindToMethodInfo", 5) => Member::BindMethod,
@@ -646,6 +648,24 @@ impl Interpreter<'_> {
                     Some((key, ctx)) => V::I4(i32::from(self.bind_delegate(delegate, target, key, ctx, flags)?)),
                     None => V::I4(0),
                 }
+            }
+            Member::DelegateMethod => {
+                let slot = unsafe { *(Self::struct_data(a[0]) as *const u64) };
+                let delegate = if slot == 0 { 0 } else { unsafe { *(slot as *const u64) } };
+                let delegate = self.non_null(V::O(delegate))?;
+                let (_, function) = self.delegate_fields()?;
+                let encoded = unsafe { *((delegate + function) as *const u64) };
+                let stub = match self.decode_function(encoded) {
+                    Some((key, ctx)) => {
+                        let owner = map(self.model.method_owner(&key))?;
+                        let declaring = Gen::Named(owner, ctx.types.clone());
+                        let handle = self.method_handle(&key, &ctx, &declaring);
+                        self.method_stub(handle)?
+                    }
+                    None => 0,
+                };
+                self.store_handle(a[1], stub);
+                return Ok(None);
             }
             Member::DelegateMethodsEqual => {
                 let read = |value: V| -> u64 {

@@ -84,6 +84,22 @@ pub fn marshals(metadata: &Metadata<'_>, method_row: u32) -> Vec<(u32, u8)> {
 unsafe extern "system" {
     fn CoInitializeEx(reserved: *const u8, model: u32) -> i32;
     fn CoGetApartmentType(kind: *mut i32, qualifier: *mut i32) -> i32;
+    fn CoTaskMemAlloc(size: usize) -> *mut u8;
+    fn CoTaskMemFree(pointer: *mut u8);
+}
+
+pub fn task_alloc(bytes: &[u8]) -> u64 {
+    let pointer = unsafe { CoTaskMemAlloc(bytes.len().max(1)) };
+    if !pointer.is_null() {
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
+    }
+    pointer as u64
+}
+
+pub fn task_free(pointer: u64) {
+    if pointer != 0 {
+        unsafe { CoTaskMemFree(pointer as *mut u8) };
+    }
 }
 
 #[link(name = "kernel32")]

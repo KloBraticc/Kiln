@@ -175,6 +175,13 @@ impl Interpreter<'_> {
                     }
                     S_OK
                 } else {
+                    if crate::diagnostics::enabled() {
+                        let text: Vec<String> = iid.iter().map(|b| format!("{b:02x}")).collect();
+                        crate::diagnostics::write_once(
+                            "com",
+                            &format!("QueryInterface for {} on {} refused", text.join(""), self.types.full_name(&interface.exact)),
+                        );
+                    }
                     unsafe { *target = 0 };
                     E_NOINTERFACE
                 }
@@ -204,8 +211,17 @@ impl Interpreter<'_> {
                 let object = unsafe { *wrapper.add(1) };
                 match self.com_invoke(object, &exact, &key, integers, floats) {
                     Ok(code) => code,
-                    Err(Fault::Exception(exception)) => self.exception_hresult(exception),
-                    Err(Fault::Unsupported(_)) => E_NOTIMPL,
+                    Err(Fault::Exception(exception)) => {
+                        crate::diagnostics::write(
+                            "com exception",
+                            &format!("{}: {}", self.exception_type(exception), self.exception_message(exception).unwrap_or_default()),
+                        );
+                        self.exception_hresult(exception)
+                    }
+                    Err(Fault::Unsupported(reason)) => {
+                        crate::diagnostics::write("com unsupported", &format!("{reason} in {}", crate::diagnostics::method_name(key.module, key.row)));
+                        E_NOTIMPL
+                    }
                 }
             }
         }

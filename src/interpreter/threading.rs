@@ -39,7 +39,7 @@ pub(super) fn thread_internal(type_name: &str, name: &str, count: usize) -> Opti
         ("System.Threading.Monitor", "ReliableEnter" | "ReliableEnterTimeout", 2 | 3) => ThreadOp::ReliableEnter,
         ("System.Threading.Monitor", "Enter", 1) => ThreadOp::Enter,
         ("System.Threading.Monitor", "Exit", 1) => ThreadOp::Exit,
-        ("System.Threading.Thread", "PollGCInternal", 0) => ThreadOp::PollGc,
+        ("System.Threading.Thread", "PollGCInternal" | "FastPollGC", 0) => ThreadOp::PollGc,
         ("System.Threading.Thread", "CatchAtSafePoint", 0) => ThreadOp::False,
         ("System.Threading.Thread", "InternalFinalize", 1) => ThreadOp::Ignore,
         _ => return None,
