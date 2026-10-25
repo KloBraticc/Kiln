@@ -102,6 +102,7 @@ enum Native {
     DelegateInvoke,
     StringConstructor,
     PlatformInvoke(usize),
+    Accessor(usize),
 }
 
 struct Platform {
@@ -495,6 +496,7 @@ pub struct Interpreter<'s> {
     native_delegates: RefCell<HashMap<u64, (usize, u64)>>,
     indirect_platforms: RefCell<HashMap<(usize, u32, u64), usize>>,
     wrappers: RefCell<com::Wrappers>,
+    accessors: RefCell<Vec<Rc<accessors::Accessor>>>,
 }
 
 enum Pending {
@@ -764,6 +766,7 @@ impl<'s> Interpreter<'s> {
             native_delegates: RefCell::new(HashMap::new()),
             indirect_platforms: RefCell::new(HashMap::new()),
             wrappers: RefCell::new(com::Wrappers::default()),
+            accessors: RefCell::new(Vec::new()),
         }
     }
 
@@ -1310,6 +1313,11 @@ impl<'s> Interpreter<'s> {
             None if flags & PINVOKE != 0 => {
                 Some(self.platform_invoke(key, name, &sig, &parameters, &returns, implementation, ctx)?)
             }
+            None if rva == 0 && flags & ABSTRACT == 0 => self.unsafe_accessor(key, ctx)?.map(|accessor| {
+                let mut accessors = self.accessors.borrow_mut();
+                accessors.push(accessor);
+                Native::Accessor(accessors.len() - 1)
+            }),
             other => other,
         };
         let mut code: &'static [u8] = &[];
@@ -2781,6 +2789,10 @@ impl<'s> Interpreter<'s> {
         match native {
             Native::Intrinsic(intrinsic) => self.intrinsic(intrinsic, arguments, &loaded.ctx),
             Native::PlatformInvoke(index) => self.platform_call(index, arguments),
+            Native::Accessor(index) => {
+                let accessor = self.accessors.borrow()[index].clone();
+                self.run_accessor(&accessor, arguments)
+            }
             Native::StringConstructor => unsupported("string constructors are only reached through newobj"),
             Native::DelegateConstruct => {
                 let this = arguments[0].address();
@@ -6183,6 +6195,7 @@ pub fn method_returns(interpreter: &Interpreter<'_>, key: &MethodKey) -> Option<
     interpreter.load(key).ok().and_then(|l| l.returns.as_ref().and_then(Ty::prim))
 }
 
+mod accessors;
 mod arrays;
 mod attributes;
 mod com;

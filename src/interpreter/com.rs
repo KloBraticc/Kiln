@@ -65,11 +65,21 @@ impl Interpreter<'_> {
                 return None;
             }
             let constructor = metadata.coded(TableId::CustomAttribute, row, 1).ok().flatten()?;
-            let parent = metadata.coded(TableId::MemberRef, constructor.row(), 0).ok().flatten()?;
-            if constructor.table() != Some(TableId::MemberRef) || parent.table() != Some(TableId::TypeRef) {
-                return None;
-            }
-            if metadata.string_cell(TableId::TypeRef, parent.row(), 1).ok()? != "GuidAttribute" {
+            let attribute = match constructor.table()? {
+                TableId::MemberRef => {
+                    let parent = metadata.coded(TableId::MemberRef, constructor.row(), 0).ok().flatten()?;
+                    if parent.table() != Some(TableId::TypeRef) {
+                        return None;
+                    }
+                    metadata.string_cell(TableId::TypeRef, parent.row(), 1).ok()?
+                }
+                TableId::MethodDef => {
+                    let owner = self.model.set.modules[handle.module].method_owner(constructor.row()).ok().flatten()?;
+                    metadata.string_cell(TableId::TypeDef, owner, 1).ok()?
+                }
+                _ => return None,
+            };
+            if attribute != "GuidAttribute" {
                 return None;
             }
             let blob = metadata.blob(metadata.cell(TableId::CustomAttribute, row, 2).ok()?).ok()?;

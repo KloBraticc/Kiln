@@ -142,6 +142,7 @@ pub(super) fn member_qcall(entry: &str, count: usize) -> Option<Member> {
         ("GCInterface_AllocateNewArray", 4) => Member::AllocateArray,
         ("Delegate_InternalEqualMethodHandles", 2) => Member::DelegateMethodsEqual,
         ("ExceptionNative_GetFrozenStackTrace", 2) => Member::Ignore,
+        ("StackTrace_GetStackFramesInternal", _) => Member::Ignore,
         ("Delegate_BindToMethodInfo", 5) => Member::BindMethod,
         ("Signature_AreEqual", 6) => Member::SignaturesEqual,
         ("ReflectionInvocation_GetGuid", 2) => Member::TypeGuid,
