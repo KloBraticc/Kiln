@@ -149,7 +149,9 @@ struct Callback {
     ctx: Ctx,
     receiver: Option<u64>,
     parameters: Vec<VarType>,
+    structs: Vec<Option<Rc<StructLayout>>>,
     returns: Option<VarType>,
+    struct_return: Option<Rc<StructLayout>>,
 }
 
 unsafe fn callback_handler(context: usize, slot: usize, integers: *const u64, floats: *const u64) -> u64 {
@@ -161,6 +163,7 @@ unsafe fn callback_handler(context: usize, slot: usize, integers: *const u64, fl
 enum Intrinsic {
     False,
     Intern(bool),
+    Collect,
     SetExitCode,
     ExitCode,
     ArrayRank,
@@ -1627,6 +1630,8 @@ impl<'s> Interpreter<'s> {
                 ("QCall_GetGCHandleForTypeHandle", 2) => Intrinsic::NewHandle,
                 ("Monitor_GetLockContentionCount", 0) => Intrinsic::False,
                 ("AssemblyNative_IsApplyUpdateSupported", 0) => Intrinsic::False,
+                ("GCInterface_Collect", _) => Intrinsic::Collect,
+                ("GCInterface_WaitForPendingFinalizers", 0) => Intrinsic::Nothing,
                 ("MultiCoreJIT_InternalSetProfileRoot" | "MultiCoreJIT_InternalStartProfile", _) => Intrinsic::Nothing,
                 ("ThreadNative_GetCurrentThread", 1) => Intrinsic::CurrentThreadOnStack,
                 ("RuntimeTypeHandle_InternalAllocNoChecks" | "RuntimeTypeHandle_InternalAlloc", 2) => Intrinsic::AllocateRecord(true),
@@ -2301,12 +2306,26 @@ impl<'s> Interpreter<'s> {
     fn callback_stub(&self, key: &MethodKey, ctx: &Ctx, receiver: Option<u64>) -> Run<u64> {
         let loaded = self.load_ctx(key, ctx)?;
         let skip = usize::from(receiver.is_some());
-        let parameters = prims(&loaded.parameters[skip.min(loaded.parameters.len())..])
-            .ok_or_else(|| Fault::Unsupported("native callback with struct arguments".into()))?;
-        let returns = match &loaded.returns {
-            None => None,
-            Some(Ty::Prim(var)) => Some(*var),
-            Some(Ty::Struct(_)) => return unsupported("native callback returning a struct"),
+        let mut parameters = Vec::new();
+        let mut structs = Vec::new();
+        for ty in &loaded.parameters[skip.min(loaded.parameters.len())..] {
+            match ty {
+                Ty::Prim(var) => {
+                    parameters.push(*var);
+                    structs.push(None);
+                }
+                Ty::Struct(layout) if layout.references.is_empty() => {
+                    parameters.push(VarType::I64);
+                    structs.push(Some(layout.clone()));
+                }
+                Ty::Struct(_) => return unsupported("native callback with struct arguments that hold references"),
+            }
+        }
+        let (returns, struct_return) = match &loaded.returns {
+            None => (None, None),
+            Some(Ty::Prim(var)) => (Some(*var), None),
+            Some(Ty::Struct(layout)) if layout.references.is_empty() => (Some(VarType::I64), Some(layout.clone())),
+            Some(Ty::Struct(_)) => return unsupported("native callback returning a struct that holds references"),
         };
         let slot = {
             let mut callbacks = self.callbacks.borrow_mut();
@@ -2315,7 +2334,9 @@ impl<'s> Interpreter<'s> {
                 ctx: ctx.clone(),
                 receiver,
                 parameters,
+                structs,
                 returns,
+                struct_return,
             });
             callbacks.len() - 1
         };
@@ -2325,7 +2346,7 @@ impl<'s> Interpreter<'s> {
     }
 
     fn reverse(&self, slot: usize, integers: *const u64, floats: *const u64) -> u64 {
-        let (key, ctx, receiver, parameters, returns) = {
+        let (key, ctx, receiver, parameters, structs, returns, struct_return) = {
             let callbacks = self.callbacks.borrow();
             let callback = &callbacks[slot];
             (
@@ -2333,24 +2354,69 @@ impl<'s> Interpreter<'s> {
                 callback.ctx.clone(),
                 callback.receiver,
                 callback.parameters.clone(),
+                callback.structs.clone(),
                 callback.returns,
+                callback.struct_return.clone(),
             )
         };
+        let hidden = struct_return.as_ref().filter(|layout| !matches!(layout.size, 1 | 2 | 4 | 8)).map(|_| unsafe { *integers });
+        let shift = usize::from(hidden.is_some());
+        let mut pins = Vec::new();
         let mut arguments = Vec::with_capacity(parameters.len() + 1);
         if let Some(receiver) = receiver {
             arguments.push(V::O(receiver));
         }
         for (index, var) in parameters.iter().enumerate() {
+            let position = index + shift;
             let raw = unsafe {
-                if index < 4 && matches!(var, VarType::F32 | VarType::F64) {
-                    *floats.add(index)
+                if position < 4 && matches!(var, VarType::F32 | VarType::F64) {
+                    *floats.add(position)
                 } else {
-                    *integers.add(index)
+                    *integers.add(position)
                 }
             };
-            arguments.push(load_raw(*var, raw));
+            match &structs[index] {
+                Some(layout) => {
+                    let boxed = match self.allocate_box(&self.layout_gen(layout)) {
+                        Ok(boxed) => boxed,
+                        Err(_) => {
+                            eprintln!("native callback could not box a struct argument");
+                            std::process::abort();
+                        }
+                    };
+                    let size = layout.size as usize;
+                    let source = if matches!(size, 1 | 2 | 4 | 8) { (&raw const raw).cast::<u8>() } else { raw as *const u8 };
+                    unsafe { std::ptr::copy_nonoverlapping(source, (boxed + 8) as *mut u8, size) };
+                    pins.push(Pin::new(&[V::S(boxed)]));
+                    arguments.push(V::S(boxed));
+                }
+                None => arguments.push(load_raw(*var, raw)),
+            }
         }
+        let _pins = pins;
         match self.invoke_ctx(&key, &ctx, &arguments) {
+            Ok(Some(value)) if struct_return.is_some() => {
+                let layout = struct_return.as_ref().map_or(0, |layout| layout.size as usize);
+                let source = match value {
+                    V::S(boxed) | V::O(boxed) if boxed != 0 => boxed + 8,
+                    _ => 0,
+                };
+                match hidden {
+                    Some(buffer) => {
+                        if source != 0 {
+                            unsafe { std::ptr::copy_nonoverlapping(source as *const u8, buffer as *mut u8, layout) };
+                        }
+                        buffer
+                    }
+                    None => {
+                        let mut bits = 0u64;
+                        if source != 0 {
+                            unsafe { std::ptr::copy_nonoverlapping(source as *const u8, (&raw mut bits).cast::<u8>(), layout) };
+                        }
+                        bits
+                    }
+                }
+            }
             Ok(Some(value)) => returns.map_or(0, |var| store_raw(var, value)),
             Ok(None) => 0,
             Err(Fault::Exception(object)) => {
@@ -2801,6 +2867,10 @@ impl<'s> Interpreter<'s> {
         Ok(Some(match intrinsic {
             Intrinsic::Unsafe(operation) => return self.run_unsafe(operation, a, ctx),
             Intrinsic::ArrayData => V::P(Self::array_data(self.non_null(a[0])?)),
+            Intrinsic::Collect => {
+                runtime::state().collect(0, 0);
+                return Ok(None);
+            }
             Intrinsic::SetExitCode => {
                 EXIT_CODE.store(a[0].int() as i32, std::sync::atomic::Ordering::SeqCst);
                 return Ok(None);

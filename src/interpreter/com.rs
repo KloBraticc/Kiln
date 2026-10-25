@@ -57,7 +57,7 @@ impl Interpreter<'_> {
         })
     }
 
-    fn interface_guid(&self, handle: TypeHandle) -> Option<[u8; 16]> {
+    pub(super) fn interface_guid(&self, handle: TypeHandle) -> Option<[u8; 16]> {
         let metadata = &self.model.set.modules[handle.module].metadata;
         (1..=metadata.rows(TableId::CustomAttribute)).find_map(|row| {
             let owner = metadata.coded(TableId::CustomAttribute, row, 0).ok().flatten()?;

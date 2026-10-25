@@ -64,6 +64,7 @@ pub(super) enum Member {
     DelegateMethodsEqual,
     BindMethod,
     SignaturesEqual,
+    TypeGuid,
     BindMethodName,
     QCallVirtualCount,
     InterfaceImplementation,
@@ -143,6 +144,7 @@ pub(super) fn member_qcall(entry: &str, count: usize) -> Option<Member> {
         ("ExceptionNative_GetFrozenStackTrace", 2) => Member::Ignore,
         ("Delegate_BindToMethodInfo", 5) => Member::BindMethod,
         ("Signature_AreEqual", 6) => Member::SignaturesEqual,
+        ("ReflectionInvocation_GetGuid", 2) => Member::TypeGuid,
         ("Delegate_BindToMethodName", 5) => Member::BindMethodName,
         ("AssemblyNative_InitializeAssemblyLoadContext", 3) => Member::Identity,
         ("RuntimeTypeHandle_GetNumVirtualsAndStaticVirtuals", 1) => Member::QCallVirtualCount,
@@ -581,6 +583,11 @@ impl Interpreter<'_> {
                 let exact = self.type_gen(a[0])?;
                 let interfaces = self.types.all_interfaces(&exact);
                 V::O(self.type_array(&interfaces)?)
+            }
+            Member::TypeGuid => {
+                let guid = self.method_table_type(a[0].bits())?.handle().and_then(|handle| self.interface_guid(handle)).unwrap_or([0; 16]);
+                unsafe { std::ptr::copy_nonoverlapping(guid.as_ptr(), a[1].address() as *mut u8, 16) };
+                return Ok(None);
             }
             Member::SignaturesEqual => {
                 let left_type = self.qcall_type(a[2])?;
