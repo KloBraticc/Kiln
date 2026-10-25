@@ -96,6 +96,8 @@ unsafe extern "system" {
     fn GetCurrentThreadId() -> u32;
     fn GetTickCount64() -> u64;
     fn WaitForSingleObjectEx(handle: usize, milliseconds: u32, alertable: i32) -> u32;
+    fn WaitForMultipleObjectsEx(count: u32, handles: *const usize, all: i32, milliseconds: u32, alertable: i32) -> u32;
+    fn SignalObjectAndWait(signal: usize, wait: usize, milliseconds: u32, alertable: i32) -> u32;
     fn SetLastError(code: u32);
     fn WideCharToMultiByte(
         page: u32,
@@ -225,6 +227,28 @@ pub fn wait_one(handle: u64, milliseconds: i32) -> i32 {
         0x80 => 0x80,
         0x102 => 0x102,
         0xC0 => -1,
+        _ => -1,
+    }
+}
+
+pub fn wait_many(handles: u64, count: i32, all: bool, milliseconds: i32) -> i32 {
+    let count = count.max(0) as u32;
+    let result = crate::threads::blocking(|| unsafe {
+        WaitForMultipleObjectsEx(count, handles as *const usize, i32::from(all), milliseconds as u32, 1)
+    });
+    match result {
+        index if index < count => index as i32,
+        index if (0x80..0x80 + count).contains(&index) => index as i32,
+        0x102 => 0x102,
+        _ => -1,
+    }
+}
+
+pub fn signal_and_wait(signal: u64, wait: u64, milliseconds: i32) -> i32 {
+    match crate::threads::blocking(|| unsafe { SignalObjectAndWait(signal as usize, wait as usize, milliseconds as u32, 1) }) {
+        0 => 0,
+        0x80 => 0x80,
+        0x102 => 0x102,
         _ => -1,
     }
 }

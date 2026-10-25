@@ -92,6 +92,8 @@ pub(super) enum Reflect {
     ModuleType,
     OsThreadId,
     WaitOne,
+    WaitMany,
+    SignalAndWait,
     SpinIterations,
     Member(super::members::Member),
     CreateAttribute,
@@ -518,6 +520,8 @@ impl Interpreter<'_> {
             | Reflect::ModuleType
             | Reflect::OsThreadId
             | Reflect::WaitOne
+            | Reflect::WaitMany
+            | Reflect::SignalAndWait
             | Reflect::SpinIterations => return self.type_call(operation, a),
             _ => return self.metadata_call(operation, a),
         }))
@@ -1390,6 +1394,9 @@ pub(super) fn type_qcall(entry: &str, count: usize) -> Option<Reflect> {
         ("CustomAttribute_CreatePropertyOrFieldData", 7) => Reflect::AttributeNamed,
         ("CustomAttribute_ParseAttributeUsageAttribute", 5) => Reflect::AttributeUsage,
         ("ThreadNative_GetCurrentOSThreadId", 0) => Reflect::OsThreadId,
+        ("WaitHandle_WaitOneCore", 3) => Reflect::WaitOne,
+        ("WaitHandle_WaitMultipleIgnoringSyncContext", 4) => Reflect::WaitMany,
+        ("WaitHandle_SignalAndWait", 3) => Reflect::SignalAndWait,
         ("RuntimeTypeHandle_GetGenericTypeDefinition", 2) => Reflect::GenericDefinition,
         ("RuntimeTypeHandle_GetInstantiation", 3) => Reflect::Instantiation,
         ("RuntimeTypeHandle_Instantiate", 4) => Reflect::Instantiate,
@@ -1459,6 +1466,8 @@ impl Interpreter<'_> {
             }
             Reflect::OsThreadId => V::I8(crate::pinvoke::current_thread_id() as i64),
             Reflect::WaitOne => V::I4(crate::pinvoke::wait_one(a[0].bits(), a[1].int() as i32)),
+            Reflect::WaitMany => V::I4(crate::pinvoke::wait_many(a[0].bits(), a[1].int() as i32, a[2].int() != 0, a[3].int() as i32)),
+            Reflect::SignalAndWait => V::I4(crate::pinvoke::signal_and_wait(a[0].bits(), a[1].bits(), a[2].int() as i32)),
             Reflect::SpinIterations => V::I4(8),
             Reflect::GenericDefinition => {
                 let exact = self.qcall_type(a[0])?;

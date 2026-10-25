@@ -59,6 +59,9 @@ pub(super) enum Member {
     MethodSlot,
     MethodAtSlot,
     AllocateArray,
+    DelegateMethodsEqual,
+    BindMethod,
+    BindMethodName,
     QCallVirtualCount,
     InterfaceImplementation,
     TypicalDefinition,
@@ -133,6 +136,10 @@ pub(super) fn member_qcall(entry: &str, count: usize) -> Option<Member> {
         ("Signature_Init", 5) => Member::InitSignature,
         ("RuntimeTypeHandle_GetMethodAt", 2) => Member::MethodAtSlot,
         ("GCInterface_AllocateNewArray", 4) => Member::AllocateArray,
+        ("Delegate_InternalEqualMethodHandles", 2) => Member::DelegateMethodsEqual,
+        ("ExceptionNative_GetFrozenStackTrace", 2) => Member::Ignore,
+        ("Delegate_BindToMethodInfo", 5) => Member::BindMethod,
+        ("Delegate_BindToMethodName", 5) => Member::BindMethodName,
         ("AssemblyNative_InitializeAssemblyLoadContext", 3) => Member::Identity,
         ("RuntimeTypeHandle_GetNumVirtualsAndStaticVirtuals", 1) => Member::QCallVirtualCount,
         ("RuntimeTypeHandle_GetInterfaceMethodImplementation", 3) => Member::InterfaceImplementation,
@@ -432,6 +439,56 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn bind_delegate(&self, delegate: u64, target: u64, key: MethodKey, ctx: Ctx, flags: i32) -> Run<bool> {
+        let delegate = self.non_null(V::O(delegate))?;
+        let loaded = self.load_ctx(&key, &ctx)?;
+        if (flags & 1 != 0 && !loaded.is_static) || (flags & 2 != 0 && loaded.is_static) {
+            return Ok(false);
+        }
+        if target == 0 && !loaded.is_static && flags & 8 != 0 {
+            return Ok(false);
+        }
+        let (key, ctx) = if target != 0 && loaded.is_virtual {
+            self.resolve_virtual(&key, &ctx, target)?
+        } else {
+            (key, ctx)
+        };
+        let (target_offset, function_offset) = self.delegate_fields()?;
+        let encoded = self.encode_function(&key, &ctx);
+        unsafe {
+            *((delegate + target_offset) as *mut u64) = target;
+            *((delegate + function_offset) as *mut u64) = encoded;
+        }
+        Ok(true)
+    }
+
+    fn find_bindable(&self, owner: &Gen, name: &str, flags: i32, has_target: bool) -> Run<Option<(MethodKey, Ctx)>> {
+        let caseless = flags & 32 != 0;
+        let mut current = Some(owner.clone());
+        while let Some(exact) = current {
+            if let Gen::Named(handle, _) = &exact {
+                let metadata = &self.model.set.modules[handle.module].metadata;
+                if let Ok(range) = metadata.method_range(handle.row) {
+                    for row in range {
+                        let candidate = metadata.string_cell(TableId::MethodDef, row, 3).unwrap_or("");
+                        let matches = if caseless { candidate.eq_ignore_ascii_case(name) } else { candidate == name };
+                        if !matches {
+                            continue;
+                        }
+                        let method_flags = metadata.cell(TableId::MethodDef, row, 2).unwrap_or(0);
+                        let is_static = method_flags & 0x10 != 0;
+                        if (flags & 1 != 0 && !is_static) || (flags & 2 != 0 && is_static) || (is_static && has_target && flags & 8 == 0 && flags & 1 != 0) {
+                            continue;
+                        }
+                        return Ok(Some((MethodKey { module: handle.module, row }, exact.context())));
+                    }
+                }
+            }
+            current = map(self.types.base(&exact))?;
+        }
+        Ok(None)
+    }
+
     pub(super) fn member_call(&self, operation: Member, a: &[V]) -> Run<Option<V>> {
         let set = self.model.set;
         Ok(Some(match operation {
@@ -495,6 +552,42 @@ impl Interpreter<'_> {
                 let exact = self.type_gen(a[0])?;
                 let interfaces = self.types.all_interfaces(&exact);
                 V::O(self.type_array(&interfaces)?)
+            }
+            Member::BindMethod => {
+                let read = |value: V| -> u64 {
+                    let slot = unsafe { *(Self::struct_data(value) as *const u64) };
+                    if slot == 0 { 0 } else { unsafe { *(slot as *const u64) } }
+                };
+                let (delegate, target) = (read(a[0]), read(a[1]));
+                let (key, ctx, _) = self.method_entry(Self::handle_value(a[2]))?;
+                V::I4(i32::from(self.bind_delegate(delegate, target, key, ctx, a[4].int() as i32)?))
+            }
+            Member::BindMethodName => {
+                let read = |value: V| -> u64 {
+                    let slot = unsafe { *(Self::struct_data(value) as *const u64) };
+                    if slot == 0 { 0 } else { unsafe { *(slot as *const u64) } }
+                };
+                let (delegate, target) = (read(a[0]), read(a[1]));
+                let owner = self.qcall_type(a[2])?;
+                let name = unsafe { std::ffi::CStr::from_ptr(a[3].address() as *const std::ffi::c_char) }
+                    .to_string_lossy()
+                    .into_owned();
+                let flags = a[4].int() as i32;
+                let found = self.find_bindable(&owner, &name, flags, target != 0)?;
+                match found {
+                    Some((key, ctx)) => V::I4(i32::from(self.bind_delegate(delegate, target, key, ctx, flags)?)),
+                    None => V::I4(0),
+                }
+            }
+            Member::DelegateMethodsEqual => {
+                let read = |value: V| -> u64 {
+                    let slot = unsafe { *(Self::struct_data(value) as *const u64) };
+                    if slot == 0 { 0 } else { unsafe { *(slot as *const u64) } }
+                };
+                let (left, right) = (read(a[0]), read(a[1]));
+                let (_, function) = self.delegate_fields()?;
+                let method = |object: u64| if object == 0 { 0 } else { unsafe { *((object + function) as *const u64) } };
+                V::I4(i32::from(method(left) == method(right)))
             }
             Member::AllocateArray => {
                 let element = match self.method_table_type(a[0].bits())? {

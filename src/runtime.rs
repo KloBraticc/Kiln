@@ -685,10 +685,11 @@ impl RuntimeState {
         while let Some(object) = pending.pop() {
             let record = (unsafe { *(object as *const u64) } & !MARK) as *const u64;
             let flags = unsafe { *record.add(1) };
+            let data = object + (unsafe { *record } & 0xFFFF_FFFF) as usize;
             if flags & FLAG_REFERENCE_ELEMENTS != 0 {
                 let count = unsafe { *((object + 8) as *const u32) } as usize;
                 for index in 0..count {
-                    let element = object + ARRAY_DATA as usize + 8 * index;
+                    let element = data + 8 * index;
                     self.mark(unsafe { *(element as *const u64) } as usize, &mut pending);
                 }
             } else if flags & FLAG_STRUCT_ELEMENTS != 0 {
@@ -697,7 +698,7 @@ impl RuntimeState {
                 let (offsets, references) =
                     unsafe { (*record.add(3) as *const u32, *record.add(4) as usize) };
                 for index in 0..count {
-                    let element = object + ARRAY_DATA as usize + component * index;
+                    let element = data + component * index;
                     for position in 0..references {
                         let slot = element + unsafe { *offsets.add(position) } as usize;
                         self.mark(unsafe { *(slot as *const u64) } as usize, &mut pending);

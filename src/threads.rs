@@ -330,3 +330,39 @@ impl NativeThread {
 }
 
 pub const THREAD_STACK: usize = 256 * 1024 * 1024;
+
+pub enum Initialization {
+    Run,
+    Recursive,
+    Waited,
+}
+
+static INITIALIZING: LazyLock<Mutex<HashMap<u64, u32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static INITIALIZED: Condvar = Condvar::new();
+
+pub fn begin_initialization(key: u64) -> Initialization {
+    let me = os_thread_id();
+    {
+        let mut running = guard(&INITIALIZING);
+        match running.get(&key) {
+            None => {
+                running.insert(key, me);
+                return Initialization::Run;
+            }
+            Some(&owner) if owner == me => return Initialization::Recursive,
+            Some(_) => {}
+        }
+    }
+    blocking(|| {
+        let mut running = guard(&INITIALIZING);
+        while running.contains_key(&key) {
+            running = INITIALIZED.wait(running).unwrap_or_else(PoisonError::into_inner);
+        }
+    });
+    Initialization::Waited
+}
+
+pub fn end_initialization(key: u64) {
+    guard(&INITIALIZING).remove(&key);
+    INITIALIZED.notify_all();
+}

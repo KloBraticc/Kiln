@@ -109,6 +109,7 @@ struct Platform {
     passes: Vec<Pass>,
     back: Back,
     last_error: bool,
+    hresult: bool,
 }
 
 enum Pass {
@@ -160,6 +161,7 @@ unsafe fn callback_handler(context: usize, slot: usize, integers: *const u64, fl
 enum Intrinsic {
     False,
     Intern(bool),
+    ArrayRank,
     Thread(threading::ThreadOp),
     LoadLibrary(bool),
     LibrarySymbol,
@@ -335,6 +337,10 @@ struct Frame {
     stack: Vec<V>,
     caught: Vec<u64>,
     scratch: Vec<Box<[u8]>>,
+}
+
+fn trace_indent(depth: usize) -> String {
+    format!("{:>6} {}", pinvoke::current_thread_id(), " ".repeat(depth.min(60)))
 }
 
 fn frames() -> &'static mut Vec<usize> {
@@ -832,7 +838,7 @@ impl<'s> Interpreter<'s> {
 
     fn throw<T>(&self, name: &str) -> Run<T> {
         if self.trace_calls {
-            eprintln!("{}throw {name}", " ".repeat(runtime::roots().depth.min(60)));
+            eprintln!("{}throw {name}", trace_indent(runtime::roots().depth));
         }
         let handle = match self
             .corelib_type("System", name)
@@ -1591,9 +1597,7 @@ impl<'s> Interpreter<'s> {
         let metadata = &module.metadata;
         let import = pinvoke::find_import(metadata, key.row)
             .ok_or_else(|| Fault::Unsupported("platform invoke without an import".into()))?;
-        if implementation & pinvoke::PRESERVE_SIG == 0 {
-            return unsupported("platform invoke without PreserveSig");
-        }
+        let hresult = implementation & pinvoke::PRESERVE_SIG == 0;
         let marshals = pinvoke::marshals(metadata, key.row);
         let native_of = |sequence: u32| marshals.iter().find(|(s, _)| *s == sequence).map(|(_, n)| *n);
         if import.library.eq_ignore_ascii_case("QCall") {
@@ -1619,7 +1623,7 @@ impl<'s> Interpreter<'s> {
                 ("AssemblyNative_IsApplyUpdateSupported", 0) => Intrinsic::False,
                 ("MultiCoreJIT_InternalSetProfileRoot" | "MultiCoreJIT_InternalStartProfile", _) => Intrinsic::Nothing,
                 ("ThreadNative_GetCurrentThread", 1) => Intrinsic::CurrentThreadOnStack,
-                ("RuntimeTypeHandle_InternalAllocNoChecks", 2) => Intrinsic::AllocateRecord(true),
+                ("RuntimeTypeHandle_InternalAllocNoChecks" | "RuntimeTypeHandle_InternalAlloc", 2) => Intrinsic::AllocateRecord(true),
                 (entry, count) if reflection::qcall(entry, count).is_some() => {
                     Intrinsic::Reflect(reflection::qcall(entry, count).unwrap_or(reflection::Reflect::EntryAssembly))
                 }
@@ -1654,6 +1658,7 @@ impl<'s> Interpreter<'s> {
             passes,
             back,
             last_error: import.flags & pinvoke::SUPPORTS_LAST_ERROR != 0,
+            hresult,
         }));
         Ok(Native::PlatformInvoke(platforms.len() - 1))
     }
@@ -1718,6 +1723,7 @@ impl<'s> Interpreter<'s> {
                 passes,
                 back,
                 last_error: false,
+                hresult: false,
             }));
             platforms.len() - 1
         };
@@ -1751,6 +1757,7 @@ impl<'s> Interpreter<'s> {
                 passes,
                 back,
                 last_error: false,
+                hresult: false,
             }));
             platforms.len() - 1
         };
@@ -2141,7 +2148,24 @@ impl<'s> Interpreter<'s> {
                 }
             });
         }
-        let (integer, float) = unsafe { pinvoke::call(platform.function, &raw, platform.last_error) };
+        let returned = if platform.hresult && !matches!(platform.back, Back::Nothing) {
+            buffers.push(vec![0u64; 4]);
+            let slot = buffers[buffers.len() - 1].as_ptr() as u64;
+            raw.push(slot);
+            Some(slot)
+        } else {
+            None
+        };
+        let (mut integer, mut float) = unsafe { pinvoke::call(platform.function, &raw, platform.last_error) };
+        if platform.hresult {
+            if (integer as i32) < 0 {
+                return self.throw_hresult(integer as i32);
+            }
+            if let Some(slot) = returned {
+                integer = unsafe { *(slot as *const u64) };
+                float = integer;
+            }
+        }
         for (layout, native, managed) in copy_back {
             self.marshal_in(&layout, native, managed)?;
         }
@@ -2398,6 +2422,7 @@ impl<'s> Interpreter<'s> {
             ("System.Object", "GetType") => Intrinsic::GetType,
             ("System.Buffer", "Memmove") if ctx.methods.len() == 1 => Intrinsic::MemmoveElements,
             ("System.Runtime.InteropServices.MemoryMarshal", "GetArrayDataReference") => Intrinsic::ArrayData,
+            ("System.Runtime.CompilerServices.RuntimeHelpers", "GetMultiDimensionalArrayRank") => Intrinsic::ArrayRank,
             ("System.Runtime.CompilerServices.Unsafe", _) => Intrinsic::Unsafe(self.unsafe_operation(name)?),
             ("System.Runtime.CompilerServices.RuntimeHelpers", "CreateSpan") if ctx.methods.len() == 1 => {
                 Intrinsic::CreateSpan
@@ -2630,7 +2655,7 @@ impl<'s> Interpreter<'s> {
                     .unwrap_or("?");
                 eprintln!(
                     "{}native {}::{name} {arguments:?}",
-                    " ".repeat(runtime::roots().depth.min(60)),
+                    trace_indent(runtime::roots().depth),
                     self.types.full_name(&loaded.owner_gen)
                 );
             }
@@ -2731,8 +2756,10 @@ impl<'s> Interpreter<'s> {
                     .ok_or_else(|| Fault::Unsupported("delegate to native code".into()))?;
                 let callee = self.load_ctx(&key, &ctx)?;
                 let mut forwarded = Vec::with_capacity(arguments.len());
-                if !callee.is_static {
-                    forwarded.push(V::O(target));
+                if target != 0 || !callee.is_static {
+                    if target != 0 || callee.parameters.len() == arguments.len() {
+                        forwarded.push(V::O(target));
+                    }
                 }
                 forwarded.extend_from_slice(&arguments[1..]);
                 let result = self.invoke_ctx(&key, &ctx, &forwarded)?;
@@ -2767,7 +2794,8 @@ impl<'s> Interpreter<'s> {
     fn intrinsic(&self, intrinsic: Intrinsic, a: &[V], ctx: &Ctx) -> Run<Option<V>> {
         Ok(Some(match intrinsic {
             Intrinsic::Unsafe(operation) => return self.run_unsafe(operation, a, ctx),
-            Intrinsic::ArrayData => V::P(self.non_null(a[0])? + u64::from(ARRAY_DATA)),
+            Intrinsic::ArrayData => V::P(Self::array_data(self.non_null(a[0])?)),
+            Intrinsic::ArrayRank => V::I4(Self::array_rank(self.non_null(a[0])?) as i32),
             Intrinsic::ThreadId => V::I4(self.current_managed_id()?),
             Intrinsic::Nothing => return Ok(None),
             Intrinsic::Reflect(operation) => return self.reflect(operation, a, ctx),
@@ -3411,7 +3439,21 @@ impl<'s> Interpreter<'s> {
             Some(Some(None)) => return self.throw("TypeInitializationException"),
             None => {}
         }
-        self.generic_init.borrow_mut().insert(id, None);
+        let gate = (1u64 << 63) | u64::from(id);
+        match crate::threads::begin_initialization(gate) {
+            crate::threads::Initialization::Recursive => return Ok(()),
+            crate::threads::Initialization::Waited => return self.ensure_initialized_gen(owner),
+            crate::threads::Initialization::Run => {}
+        }
+        let outcome = self.run_generic_initializer(*handle, owner, id);
+        if outcome.is_ok() {
+            self.generic_init.borrow_mut().insert(id, None);
+        }
+        crate::threads::end_initialization(gate);
+        outcome
+    }
+
+    fn run_generic_initializer(&self, handle: TypeHandle, owner: &Gen, id: u32) -> Run<()> {
         let metadata = &self.model.set.modules[handle.module].metadata;
         let Ok(range) = metadata.method_range(handle.row) else {
             return Ok(());
@@ -3450,7 +3492,21 @@ impl<'s> Interpreter<'s> {
         if unsafe { *flag } != 0 {
             return Ok(());
         }
-        unsafe { *flag = 1 };
+        let gate = ((owner.module as u64) << 32) | u64::from(owner.row);
+        match crate::threads::begin_initialization(gate) {
+            crate::threads::Initialization::Recursive => return Ok(()),
+            crate::threads::Initialization::Waited => return self.ensure_initialized(owner),
+            crate::threads::Initialization::Run => {}
+        }
+        let outcome = self.run_type_initializer(owner);
+        if outcome.is_ok() {
+            unsafe { *flag = 1 };
+        }
+        crate::threads::end_initialization(gate);
+        outcome
+    }
+
+    fn run_type_initializer(&self, owner: TypeHandle) -> Run<()> {
         let metadata = &self.model.set.modules[owner.module].metadata;
         let Ok(range) = metadata.method_range(owner.row) else {
             return Ok(());
@@ -3462,7 +3518,6 @@ impl<'s> Interpreter<'s> {
             match self.invoke(&MethodKey { module: owner.module, row }, &[]) {
                 Ok(_) => {}
                 Err(Fault::Unsupported(reason)) => {
-                    unsafe { *flag = 0 };
                     self.failed_types.borrow_mut().insert(owner, Some(reason.clone()));
                     return unsupported(reason);
                 }
@@ -3475,7 +3530,6 @@ impl<'s> Interpreter<'s> {
                             self.exception_message(object).unwrap_or_default()
                         );
                     }
-                    unsafe { *flag = 0 };
                     self.failed_types.borrow_mut().insert(owner, None);
                     return self.throw("TypeInitializationException");
                 }
@@ -3501,7 +3555,7 @@ impl<'s> Interpreter<'s> {
                 .unwrap_or("?");
             eprintln!(
                 "{}{}::{name}",
-                " ".repeat(depth.min(60)),
+                trace_indent(depth),
                 self.types.full_name(&loaded.owner_gen)
             );
         }
@@ -4525,6 +4579,18 @@ impl<'s> Interpreter<'s> {
                     let Argument::Token(token) = argument else {
                         return unsupported("call token");
                     };
+                    if let Some(array) = self.array_method(module, token, &method.ctx)? {
+                        let count = if opcode == 0x73 { array.parameters.saturating_sub(1) } else { array.parameters };
+                        if frame.stack.len() < count {
+                            return unsupported("evaluation stack underflow");
+                        }
+                        let arguments: Vec<V> = frame.stack.split_off(frame.stack.len() - count);
+                        let _pin = Pin::new(&arguments);
+                        if let Some(value) = self.array_call(&array, &arguments)? {
+                            frame.stack.push(value);
+                        }
+                        continue;
+                    }
                     let (key, call_ctx) = self.method_inst(module, token, &method.ctx)?;
                     let callee = self.load_ctx(&key, &call_ctx)?;
                     if opcode == 0x73 {
@@ -4665,7 +4731,7 @@ impl<'s> Interpreter<'s> {
                     if self.trace_calls {
                         eprintln!(
                             "{}throw {} {}",
-                            " ".repeat(runtime::roots().depth.min(60)),
+                            trace_indent(runtime::roots().depth),
                             self.exception_type(object),
                             self.exception_message(object).unwrap_or_default()
                         );
@@ -6032,6 +6098,7 @@ pub fn method_returns(interpreter: &Interpreter<'_>, key: &MethodKey) -> Option<
     interpreter.load(key).ok().and_then(|l| l.returns.as_ref().and_then(Ty::prim))
 }
 
+mod arrays;
 mod attributes;
 mod com;
 mod marshal;

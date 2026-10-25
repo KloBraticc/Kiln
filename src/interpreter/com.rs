@@ -418,6 +418,7 @@ impl Interpreter<'_> {
                 passes,
                 back,
                 last_error: false,
+                hresult: false,
             }));
             platforms.len() - 1
         };
@@ -425,7 +426,7 @@ impl Interpreter<'_> {
         Ok(index)
     }
 
-    fn throw_hresult<T>(&self, code: i32) -> Run<T> {
+    pub(super) fn throw_hresult<T>(&self, code: i32) -> Run<T> {
         let handle = self.corelib_type("System.Runtime.InteropServices", "COMException")?;
         let object = runtime::allocate_managed(self.record(RuntimeType::Class(handle))?, 0);
         if object == 0 {
