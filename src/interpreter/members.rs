@@ -56,11 +56,14 @@ pub(super) enum Member {
     True,
     TypeFromMethodTable,
     InitSignature,
+    IsGenericVariable,
+    GenericVariableIndex,
     MethodSlot,
     MethodAtSlot,
     AllocateArray,
     DelegateMethodsEqual,
     BindMethod,
+    SignaturesEqual,
     BindMethodName,
     QCallVirtualCount,
     InterfaceImplementation,
@@ -76,8 +79,8 @@ pub(super) fn member_internal(type_name: &str, name: &str, count: usize) -> Opti
         ("System.RuntimeTypeHandle", "GetNextIntroducedMethod", 1) => Member::NextMethod,
         ("System.RuntimeTypeHandle", "GetFields", 3) => Member::Fields,
         ("System.RuntimeTypeHandle", "GetInterfaces", 1) => Member::Interfaces,
-        ("System.RuntimeTypeHandle", "IsGenericVariable", 1) => Member::False,
-        ("System.RuntimeTypeHandle", "GetGenericVariableIndex", 1) => Member::False,
+        ("System.RuntimeTypeHandle", "IsGenericVariable", 1) => Member::IsGenericVariable,
+        ("System.RuntimeTypeHandle", "GetGenericVariableIndex", 1) => Member::GenericVariableIndex,
         ("System.RuntimeTypeHandle", "IsUnmanagedFunctionPointer", 1) => Member::False,
         ("System.RuntimeTypeHandle", "GetNumVirtuals", 1) => Member::VirtualCount,
         ("System.RuntimeTypeHandle", "GetDeclaringMethod", 1) => Member::Null,
@@ -139,6 +142,7 @@ pub(super) fn member_qcall(entry: &str, count: usize) -> Option<Member> {
         ("Delegate_InternalEqualMethodHandles", 2) => Member::DelegateMethodsEqual,
         ("ExceptionNative_GetFrozenStackTrace", 2) => Member::Ignore,
         ("Delegate_BindToMethodInfo", 5) => Member::BindMethod,
+        ("Signature_AreEqual", 6) => Member::SignaturesEqual,
         ("Delegate_BindToMethodName", 5) => Member::BindMethodName,
         ("AssemblyNative_InitializeAssemblyLoadContext", 3) => Member::Identity,
         ("RuntimeTypeHandle_GetNumVirtualsAndStaticVirtuals", 1) => Member::QCallVirtualCount,
@@ -366,6 +370,30 @@ impl Interpreter<'_> {
             .or_else(|_| self.class_field_offset("System", "Signature", &format!("_{name}")))
     }
 
+    pub(super) fn open_context(&self, declaring: &Gen) -> Ctx {
+        match declaring {
+            Gen::Named(handle, arguments)
+                if arguments.is_empty() && self.types.parameter_count(TableId::TypeDef, handle.row, handle.module) > 0 =>
+            {
+                Ctx { types: self.types.open_arguments(*handle), methods: Rc::from(Vec::new()) }
+            }
+            _ => declaring.context(),
+        }
+    }
+
+    pub(super) fn open_method_context(&self, key: &MethodKey, ctx: Ctx) -> Ctx {
+        let mut ctx = ctx;
+        if ctx.types.is_empty()
+            && let Ok(owner) = self.model.method_owner(key)
+        {
+            ctx.types = self.open_context(&Gen::Named(owner, Rc::from(Vec::new()))).types;
+        }
+        if ctx.methods.is_empty() && self.types.parameter_count(TableId::MethodDef, key.row, key.module) > 0 {
+            ctx.methods = self.types.open_method_arguments(key.module, key.row);
+        }
+        ctx
+    }
+
     fn build_signature(&self, this: u64, field_handle: u64, handle: u64, declaring_object: u64, blob_pointer: u64, blob_length: i64) -> Run<()> {
         let set = self.model.set;
         let set_field = |name: &str, value: u64| -> Run<()> {
@@ -381,6 +409,7 @@ impl Interpreter<'_> {
         set_field("declaringType", declaring_object)?;
         if handle != 0 {
             let (key, ctx, _) = self.method_entry(handle)?;
+            let ctx = self.open_method_context(&key, ctx);
             let sig = map(self.model.method_sig(&key))?;
             let arguments = sig
                 .parameters
@@ -403,7 +432,7 @@ impl Interpreter<'_> {
         } else if field_handle != 0 {
             let (module, row, declaring) = self.field_entry(field_handle)?;
             let sig = map(self.model.field_signature(module, row))?;
-            let exact = map(self.types.resolve(module, &sig, &declaring.context()))?;
+            let exact = map(self.types.resolve(module, &sig, &self.open_context(&declaring)))?;
             let metadata = &set.modules[module].metadata;
             let blob = metadata.cell(TableId::Field, row, 2).and_then(|b| metadata.blob(b)).unwrap_or(&[]);
             set_field("returnTypeORfieldType", self.type_object(&exact)?)?;
@@ -412,7 +441,7 @@ impl Interpreter<'_> {
         } else {
             let declaring = self.type_gen(V::O(declaring_object))?;
             let module = self.gen_module(&declaring)?;
-            let ctx = declaring.context();
+            let ctx = self.open_context(&declaring);
             let blob = unsafe { std::slice::from_raw_parts(blob_pointer as *const u8, blob_length.max(0) as usize) };
             let parsed = crate::signature::Signature::parse(blob).map_err(|e| Fault::Unsupported(e.to_string()))?;
             let (returns, parameters) = match parsed {
@@ -553,6 +582,37 @@ impl Interpreter<'_> {
                 let interfaces = self.types.all_interfaces(&exact);
                 V::O(self.type_array(&interfaces)?)
             }
+            Member::SignaturesEqual => {
+                let left_type = self.qcall_type(a[2])?;
+                let right_type = self.qcall_type(a[5])?;
+                let blob = |pointer: V, length: V| unsafe {
+                    std::slice::from_raw_parts(pointer.address() as *const u8, length.int().max(0) as usize)
+                };
+                let (left, right) = (blob(a[0], a[1]), blob(a[3], a[4]));
+                let (left_module, right_module) = (self.gen_module(&left_type)?, self.gen_module(&right_type)?);
+                let same = if left_module == right_module && left == right {
+                    true
+                } else {
+                    let resolve = |bytes: &[u8], module: usize, owner: &Gen| -> Option<Vec<Gen>> {
+                        let Ok(crate::signature::Signature::Method(sig)) = crate::signature::Signature::parse(bytes) else {
+                            return None;
+                        };
+                        let ctx = owner.context();
+                        std::iter::once(&sig.return_type)
+                            .chain(&sig.parameters)
+                            .map(|part| match part {
+                                TypeSig::Void => self.types.core("Void").ok(),
+                                other => self.types.resolve(module, other, &ctx).ok(),
+                            })
+                            .collect()
+                    };
+                    match (resolve(left, left_module, &left_type), resolve(right, right_module, &right_type)) {
+                        (Some(l), Some(r)) => l == r,
+                        _ => left == right,
+                    }
+                };
+                V::I4(i32::from(same))
+            }
             Member::BindMethod => {
                 let read = |value: V| -> u64 {
                     let slot = unsafe { *(Self::struct_data(value) as *const u64) };
@@ -656,6 +716,11 @@ impl Interpreter<'_> {
                     _ => V::P(metadata.string_cell(TableId::MethodDef, key.row, 3).map_or(0, |s| s.as_ptr() as u64)),
                 }
             }
+            Member::IsGenericVariable => V::I4(i32::from(matches!(self.type_gen(a[0])?, Gen::Var(..) | Gen::MethodVar(..)))),
+            Member::GenericVariableIndex => V::I4(match self.type_gen(a[0])? {
+                Gen::Var(_, index) | Gen::MethodVar(_, _, index) => index as i32,
+                _ => 0,
+            }),
             Member::MethodDeclaringType => {
                 let (_, _, declaring) = self.method_entry(self.method_value(a[0])?)?;
                 V::O(self.type_object(&declaring)?)
@@ -712,7 +777,8 @@ impl Interpreter<'_> {
                 V::P(self.method_handle(&key, &ctx, &declaring))
             }
             Member::MethodInstantiation => {
-                let (_, ctx, _) = self.method_entry(self.method_value(a[0])?)?;
+                let (key, ctx, _) = self.method_entry(self.method_value(a[0])?)?;
+                let ctx = self.open_method_context(&key, ctx);
                 let array = self.runtime_type_array(&ctx.methods)?;
                 self.store_handle(a[1], array);
                 return Ok(None);
@@ -1010,18 +1076,23 @@ impl Interpreter<'_> {
                 V::O(self.box_any(&exact, &ty, value)?)
             }
             Member::InvokeMethod => {
-                let target = a[0].address();
+                let mut target = a[0].address();
                 let arguments = a[1].address();
                 let signature = self.non_null(a[2])?;
                 let is_constructor = a[3].int() != 0;
                 let offset = self.signature_field("pMethod")?;
                 let handle = unsafe { *((signature + u64::from(offset)) as *const u64) };
-                let (key, ctx, _) = self.method_entry(handle)?;
+                let (key, ctx, declaring) = self.method_entry(handle)?;
                 let loaded = self.load_ctx(&key, &ctx)?;
+                let value_type = self.types.is_value_type(&declaring);
+                if is_constructor && target == 0 && !loaded.is_static {
+                    target = self.allocate_box(&declaring)?;
+                }
+                let _created = Pin::new(&[V::O(target)]);
                 let mut values = Vec::with_capacity(loaded.parameters.len());
                 let skip = usize::from(!loaded.is_static);
                 if !loaded.is_static {
-                    values.push(V::O(target));
+                    values.push(if value_type && target != 0 { V::P(target + 8) } else { V::O(target) });
                 }
                 let mut keep = Vec::new();
                 for (index, ty) in loaded.parameters[skip..].iter().enumerate() {

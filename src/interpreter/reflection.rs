@@ -423,14 +423,19 @@ impl Interpreter<'_> {
                     _ => self.assembly_object(module)?,
                 })
             }
-            Reflect::TypeToken => match self.type_gen(a[0])?.handle() {
-                Some(handle) => V::I4((0x0200_0000 | handle.row) as i32),
-                None => V::I4(0x0200_0000),
-            },
+            Reflect::TypeToken => {
+                let exact = self.type_gen(a[0])?;
+                match (exact.handle(), self.types.parameter_row(&exact)) {
+                    (_, Some((_, row))) => V::I4((0x2A00_0000 | row) as i32),
+                    (Some(handle), _) => V::I4((0x0200_0000 | handle.row) as i32),
+                    _ => V::I4(0x0200_0000),
+                }
+            }
             Reflect::TypeAttributes => match self.type_gen(a[0])? {
                 Gen::Named(handle, _) => {
                     V::I4(set.modules[handle.module].metadata.cell(TableId::TypeDef, handle.row, 0).unwrap_or(0) as i32)
                 }
+                Gen::Var(..) | Gen::MethodVar(..) => V::I4(1),
                 _ => V::I4(0x2101),
             },
             Reflect::BaseType => {
@@ -438,6 +443,7 @@ impl Interpreter<'_> {
                 let base = match &exact {
                     Gen::Named(..) => map(self.types.base(&exact))?,
                     Gen::SzArray(_) | Gen::Array(..) => Some(map(self.types.core("Array"))?),
+                    Gen::Var(..) | Gen::MethodVar(..) => Some(map(self.types.core("Object"))?),
                     _ => None,
                 };
                 V::O(match base {
@@ -467,6 +473,12 @@ impl Interpreter<'_> {
                             let count = self.types.parameter_count(TableId::TypeDef, row, handle.module);
                             Gen::Named(outer, Rc::from(arguments.iter().take(count).cloned().collect::<Vec<_>>()))
                         }),
+                    Gen::Var(handle, _) => Some(Gen::Named(handle, Rc::from(Vec::new()))),
+                    Gen::MethodVar(module, row, _) => self
+                        .model
+                        .method_owner(&MethodKey { module, row })
+                        .ok()
+                        .map(|owner| Gen::Named(owner, Rc::from(Vec::new()))),
                     _ => None,
                 };
                 V::O(match declaring {
@@ -487,9 +499,7 @@ impl Interpreter<'_> {
             }),
             Reflect::ContainsGenericVariables => {
                 let exact = self.type_gen(a[0])?;
-                let open = matches!(&exact, Gen::Named(handle, arguments)
-                    if arguments.is_empty() && self.types.parameter_count(TableId::TypeDef, handle.row, handle.module) > 0);
-                V::I4(i32::from(open))
+                V::I4(i32::from(self.contains_variables(&exact)))
             }
             Reflect::SameType => V::I4(i32::from(a[0].address() == a[1].address())),
             Reflect::Utf8Name => match self.type_gen(a[0])? {
@@ -497,6 +507,12 @@ impl Interpreter<'_> {
                     set.modules[handle.module]
                         .metadata
                         .string_cell(TableId::TypeDef, handle.row, 1)
+                        .map_or(0, |name| name.as_ptr() as u64),
+                ),
+                exact @ (Gen::Var(..) | Gen::MethodVar(..)) => V::P(
+                    self.types
+                        .parameter_row(&exact)
+                        .and_then(|(module, row)| set.modules[module].metadata.string_cell(TableId::GenericParam, row, 3).ok())
                         .map_or(0, |name| name.as_ptr() as u64),
                 ),
                 _ => V::P(0),
@@ -554,6 +570,8 @@ impl Interpreter<'_> {
             Gen::Pointer(_) => 0x0F,
             Gen::ByRef(_) => 0x10,
             Gen::FunctionPointer => 0x1B,
+            Gen::Var(..) => 0x13,
+            Gen::MethodVar(..) => 0x1E,
             Gen::Named(handle, _) => match self.type_name(*handle).as_str() {
                 "System.Void" => 0x01,
                 "System.Boolean" => 0x02,
@@ -578,11 +596,25 @@ impl Interpreter<'_> {
         }
     }
 
+    pub(super) fn contains_variables(&self, exact: &Gen) -> bool {
+        match exact {
+            Gen::Var(..) | Gen::MethodVar(..) => true,
+            Gen::Named(handle, arguments) if arguments.is_empty() => {
+                self.types.parameter_count(TableId::TypeDef, handle.row, handle.module) > 0
+            }
+            Gen::Named(_, arguments) => arguments.iter().any(|argument| self.contains_variables(argument)),
+            Gen::SzArray(inner) | Gen::Array(inner, _) | Gen::Pointer(inner) | Gen::ByRef(inner) => self.contains_variables(inner),
+            Gen::FunctionPointer => false,
+        }
+    }
+
     pub(super) fn gen_module(&self, exact: &Gen) -> Run<usize> {
         match exact {
             Gen::Named(handle, _) => Ok(handle.module),
             Gen::SzArray(inner) | Gen::Array(inner, _) | Gen::Pointer(inner) | Gen::ByRef(inner) => self.gen_module(inner),
             Gen::FunctionPointer => self.corelib_type("System", "Object").map(|h| h.module),
+            Gen::Var(handle, _) => Ok(handle.module),
+            Gen::MethodVar(module, _, _) => Ok(*module),
         }
     }
 
@@ -978,7 +1010,7 @@ impl Interpreter<'_> {
                         write_u64(2, 0);
                         write_u64(3, 0);
                         write_i32(4, 0);
-                        write_i32(5, 0);
+                        write_i32(5, 1);
                     }
                 }
                 0
@@ -1221,7 +1253,7 @@ impl Interpreter<'_> {
         let block: &'static mut [u64] = Box::leak(vec![0u64; 10].into_boxed_slice());
         let address = block.as_ptr() as u64;
         let tagged = match exact {
-            Gen::Pointer(_) | Gen::ByRef(_) | Gen::FunctionPointer => address | 2,
+            Gen::Pointer(_) | Gen::ByRef(_) | Gen::FunctionPointer | Gen::Var(..) | Gen::MethodVar(..) => address | 2,
             _ => address,
         };
         self.method_tables.borrow_mut().insert(id, tagged);
@@ -1481,7 +1513,7 @@ impl Interpreter<'_> {
             }
             Reflect::Instantiation => {
                 let exact = self.qcall_type(a[0])?;
-                let arguments = exact.arguments();
+                let arguments = self.open_context(&exact).types;
                 let array = self.type_array(&arguments)?;
                 self.store_handle(a[1], array);
                 return Ok(None);
@@ -1545,6 +1577,7 @@ impl Interpreter<'_> {
             Gen::Pointer(inner) => format!("{}*", self.format_type(inner, flags & !4)?),
             Gen::ByRef(inner) => format!("{}&", self.format_type(inner, flags & !4)?),
             Gen::FunctionPointer => "*()".to_owned(),
+            Gen::Var(..) | Gen::MethodVar(..) => return Ok(self.types.parameter_name(exact)),
             Gen::Named(handle, arguments) => {
                 let metadata = &set.modules[handle.module].metadata;
                 let mut chain = vec![handle.row];
@@ -1552,6 +1585,9 @@ impl Interpreter<'_> {
                     chain.push(outer);
                 }
                 chain.reverse();
+                if flags & 1 == 0 {
+                    chain.drain(..chain.len() - 1);
+                }
                 let mut name = String::new();
                 for (index, row) in chain.iter().enumerate() {
                     if index == 0 && flags & 1 != 0 {

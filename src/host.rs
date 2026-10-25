@@ -108,7 +108,7 @@ pub fn run_main(interpreter: &Interpreter<'_>, entry: &MethodKey, arguments: &[S
     }
     match interpreter.invoke(entry, &values) {
         Ok(Some(value)) => value.int() as i32,
-        Ok(None) => 0,
+        Ok(None) => crate::interpreter::EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst),
         Err(fault) => report(interpreter, fault),
     }
 }

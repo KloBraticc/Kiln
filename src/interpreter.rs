@@ -161,6 +161,8 @@ unsafe fn callback_handler(context: usize, slot: usize, integers: *const u64, fl
 enum Intrinsic {
     False,
     Intern(bool),
+    SetExitCode,
+    ExitCode,
     ArrayRank,
     Thread(threading::ThreadOp),
     LoadLibrary(bool),
@@ -358,6 +360,8 @@ fn type_roots() -> std::sync::MutexGuard<'static, Vec<u64>> {
 }
 
 const EXACT_TAG: u64 = 0x8000_0000_0000_0000;
+
+pub static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 type InstKey = (MethodKey, Vec<u32>, Vec<u32>);
 
@@ -971,7 +975,7 @@ impl<'s> Interpreter<'s> {
                 }
                 Ok(Ty::Struct(self.layout_of(exact)?))
             }
-            Gen::SzArray(_) | Gen::Array(_, _) => Ok(Ty::Prim(VarType::Ref)),
+            Gen::SzArray(_) | Gen::Array(_, _) | Gen::Var(..) | Gen::MethodVar(..) => Ok(Ty::Prim(VarType::Ref)),
             Gen::ByRef(_) => Ok(Ty::Prim(VarType::Pointer)),
             Gen::Pointer(_) | Gen::FunctionPointer => Ok(Ty::Prim(VarType::I64)),
         }
@@ -1487,6 +1491,8 @@ impl<'s> Interpreter<'s> {
             ("System.Buffer", "BlockCopy") if parameters.len() == 5 => Intrinsic::BlockCopy,
             ("Interop+BCrypt", "BCryptGenRandom") if parameters.len() == 4 => Intrinsic::RandomBytes,
             ("System.Environment", "get_CurrentManagedThreadId") => Intrinsic::ThreadId,
+            ("System.Environment", "set_ExitCode") if parameters.len() == 1 => Intrinsic::SetExitCode,
+            ("System.Environment", "get_ExitCode") if parameters.is_empty() => Intrinsic::ExitCode,
             ("System.RuntimeTypeHandle", "InternalAllocNoChecks_FastPath") if parameters.len() == 1 => Intrinsic::AllocateRecord(false),
             ("System.Enum", "GetHashCode") if parameters.len() == 1 => Intrinsic::EnumHash,
             ("System.Enum", "Equals") if parameters.len() == 2 => Intrinsic::EnumEquals,
@@ -2795,6 +2801,11 @@ impl<'s> Interpreter<'s> {
         Ok(Some(match intrinsic {
             Intrinsic::Unsafe(operation) => return self.run_unsafe(operation, a, ctx),
             Intrinsic::ArrayData => V::P(Self::array_data(self.non_null(a[0])?)),
+            Intrinsic::SetExitCode => {
+                EXIT_CODE.store(a[0].int() as i32, std::sync::atomic::Ordering::SeqCst);
+                return Ok(None);
+            }
+            Intrinsic::ExitCode => V::I4(EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst)),
             Intrinsic::ArrayRank => V::I4(Self::array_rank(self.non_null(a[0])?) as i32),
             Intrinsic::ThreadId => V::I4(self.current_managed_id()?),
             Intrinsic::Nothing => return Ok(None),
@@ -4940,7 +4951,11 @@ impl<'s> Interpreter<'s> {
                     };
                     match token.table() {
                         Some(TableId::TypeDef) | Some(TableId::TypeRef) | Some(TableId::TypeSpec) => {
-                            let exact = map(self.types.resolve_token(module, token, &method.ctx))?;
+                            let exact = if token.table() == Some(TableId::TypeDef) {
+                                Gen::Named(TypeHandle { module, row: token.row() }, Rc::from(Vec::new()))
+                            } else {
+                                map(self.types.resolve_token(module, token, &method.ctx))?
+                            };
                             let handle = self.type_handle_value(&exact)?;
                             frame.stack.push(handle);
                         }

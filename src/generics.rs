@@ -16,6 +16,8 @@ pub enum Gen {
     Pointer(Rc<Gen>),
     ByRef(Rc<Gen>),
     FunctionPointer,
+    Var(TypeHandle, u32),
+    MethodVar(usize, u32, u32),
 }
 
 impl Gen {
@@ -173,6 +175,39 @@ impl<'s> Types<'s> {
         counts.get(&(kind, owner)).copied().unwrap_or(0)
     }
 
+    pub fn parameter_row(&self, exact: &Gen) -> Option<(usize, u32)> {
+        let (module, method, owner, index) = match exact {
+            Gen::Var(handle, index) => (handle.module, false, handle.row, *index),
+            Gen::MethodVar(module, row, index) => (*module, true, *row, *index),
+            _ => return None,
+        };
+        let metadata = &self.set.modules[module].metadata;
+        (1..=metadata.rows(TableId::GenericParam)).find_map(|row| {
+            let token = metadata.coded(TableId::GenericParam, row, 2).ok().flatten()?;
+            let matches = (token.table() == Some(TableId::MethodDef)) == method
+                && token.row() == owner
+                && metadata.cell(TableId::GenericParam, row, 0).ok()? == index;
+            matches.then_some((module, row))
+        })
+    }
+
+    pub fn parameter_name(&self, exact: &Gen) -> String {
+        self.parameter_row(exact)
+            .and_then(|(module, row)| self.set.modules[module].metadata.string_cell(TableId::GenericParam, row, 3).ok())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "T".into())
+    }
+
+    pub fn open_arguments(&self, handle: TypeHandle) -> Rc<[Gen]> {
+        let count = self.parameter_count(TableId::TypeDef, handle.row, handle.module);
+        (0..count as u32).map(|index| Gen::Var(handle, index)).collect()
+    }
+
+    pub fn open_method_arguments(&self, module: usize, row: u32) -> Rc<[Gen]> {
+        let count = self.parameter_count(TableId::MethodDef, row, module);
+        (0..count as u32).map(|index| Gen::MethodVar(module, row, index)).collect()
+    }
+
     pub fn resolve(&self, module: usize, sig: &TypeSig, ctx: &Ctx) -> Outcome<Gen> {
         if let Some(name) = primitive_name(sig) {
             return self.core(name);
@@ -266,6 +301,7 @@ impl<'s> Types<'s> {
             Gen::Pointer(inner) => format!("{}*", self.full_name(inner)),
             Gen::ByRef(inner) => format!("{}&", self.full_name(inner)),
             Gen::FunctionPointer => "function pointer".into(),
+            Gen::Var(..) | Gen::MethodVar(..) => self.parameter_name(exact),
         }
     }
 
@@ -433,7 +469,7 @@ impl<'s> Types<'s> {
             }
             Gen::Pointer(_) | Gen::FunctionPointer => Ok(TypeSig::IntPtr),
             Gen::ByRef(_) => Err("byref fields".into()),
-            Gen::SzArray(_) | Gen::Array(_, _) => Ok(TypeSig::Object),
+            Gen::SzArray(_) | Gen::Array(_, _) | Gen::Var(..) | Gen::MethodVar(..) => Ok(TypeSig::Object),
         }
     }
 }
