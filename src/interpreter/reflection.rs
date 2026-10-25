@@ -89,6 +89,8 @@ pub(super) enum Reflect {
     PointerToStructure,
     DestroyStructure,
     Instance,
+    ClassFromClsid,
+    ComObjectGuid,
     ModuleType,
     OsThreadId,
     WaitOne,
@@ -538,6 +540,8 @@ impl Interpreter<'_> {
             | Reflect::PointerToStructure
             | Reflect::DestroyStructure
             | Reflect::Instance
+            | Reflect::ClassFromClsid
+            | Reflect::ComObjectGuid
             | Reflect::ModuleType
             | Reflect::OsThreadId
             | Reflect::WaitOne
@@ -1433,6 +1437,8 @@ pub(super) fn type_qcall(entry: &str, count: usize) -> Option<Reflect> {
     Some(match (entry, count) {
         ("MarshalNative_SizeOfHelper", 2) => Reflect::SizeOf,
         ("MarshalNative_GetHINSTANCE", 1) => Reflect::Instance,
+        ("MarshalNative_GetTypeFromCLSID", 3) => Reflect::ClassFromClsid,
+        ("ReflectionInvocation_GetComObjectGuid", 2) => Reflect::ComObjectGuid,
         ("ModuleHandle_GetModuleType", 2) => Reflect::ModuleType,
         ("CustomAttribute_CreateCustomAttributeInstance", 7) => Reflect::CreateAttribute,
         ("CustomAttribute_CreatePropertyOrFieldData", 7) => Reflect::AttributeNamed,
@@ -1484,6 +1490,20 @@ impl Interpreter<'_> {
                 }
             }
             Reflect::Instance => V::P(crate::pinvoke::process_module()),
+            Reflect::ClassFromClsid => {
+                let clsid = unsafe { *(Self::struct_data(a[0]) as *const [u8; 16]) };
+                let object = self.com_class_type(clsid)?;
+                self.store_handle(a[2], object);
+                return Ok(None);
+            }
+            Reflect::ComObjectGuid => {
+                let offset = self.qcall_field("QCallTypeHandle", "_ptr")?;
+                let slot = unsafe { *((Self::struct_data(a[0]) + u64::from(offset)) as *const u64) };
+                let object = if slot == 0 { 0 } else { unsafe { *(slot as *const u64) } };
+                let clsid = self.com_class_id(object).unwrap_or([0; 16]);
+                unsafe { *(a[1].address() as *mut [u8; 16]) = clsid };
+                return Ok(None);
+            }
             Reflect::StructureToPointer | Reflect::PointerToStructure => {
                 let (object, pointer) = match operation {
                     Reflect::StructureToPointer => (self.non_null(a[0])?, a[1].bits()),

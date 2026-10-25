@@ -115,6 +115,7 @@ struct Platform {
     back: Back,
     last_error: bool,
     hresult: bool,
+    initializes: Option<TypeHandle>,
 }
 
 enum Pass {
@@ -1764,6 +1765,10 @@ impl<'s> Interpreter<'s> {
         let back = self.platform_back(key.module, sig, returns, native_of(0), ctx)?;
         let directory = module.path.parent().unwrap_or(std::path::Path::new("."));
         let function = map(pinvoke::resolve(directory, &import, name))?;
+        let initializes = self.model.method_owner(key).ok().filter(|owner| {
+            let flags = self.model.set.modules[owner.module].metadata.cell(TableId::TypeDef, owner.row, 0).unwrap_or(0);
+            flags & 0x0010_0000 == 0
+        });
         let mut platforms = self.platforms.borrow_mut();
         platforms.push(Rc::new(Platform {
             function,
@@ -1771,6 +1776,7 @@ impl<'s> Interpreter<'s> {
             back,
             last_error: import.flags & pinvoke::SUPPORTS_LAST_ERROR != 0,
             hresult,
+            initializes,
         }));
         Ok(Native::PlatformInvoke(platforms.len() - 1))
     }
@@ -1836,6 +1842,7 @@ impl<'s> Interpreter<'s> {
                 back,
                 last_error: false,
                 hresult: false,
+                initializes: None,
             }));
             platforms.len() - 1
         };
@@ -1870,6 +1877,7 @@ impl<'s> Interpreter<'s> {
                 back,
                 last_error: false,
                 hresult: false,
+                initializes: None,
             }));
             platforms.len() - 1
         };
@@ -2095,6 +2103,9 @@ impl<'s> Interpreter<'s> {
 
     fn platform_call(&self, index: usize, arguments: &[V]) -> Run<Option<V>> {
         let platform = self.platforms.borrow()[index].clone();
+        if let Some(owner) = platform.initializes {
+            self.ensure_initialized(owner)?;
+        }
         let mut buffers: Vec<Vec<u64>> = Vec::new();
         let mut raw = Vec::with_capacity(arguments.len() + 1);
         let buffer = match &platform.back {
@@ -3164,6 +3175,9 @@ impl<'s> Interpreter<'s> {
             }
             Intrinsic::Collections => V::I4(runtime::COLLECTIONS.load(std::sync::atomic::Ordering::Relaxed) as i32),
             Intrinsic::DefaultConstruct => {
+                if let Some(object) = self.com_class_instance(self.non_null(a[0])?)? {
+                    return Ok(Some(V::O(object)));
+                }
                 let exact = self
                     .object_types
                     .borrow()

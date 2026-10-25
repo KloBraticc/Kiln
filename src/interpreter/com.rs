@@ -23,6 +23,12 @@ pub(super) struct Wrappers {
     rcws: HashMap<u64, u64>,
     counts: HashMap<u64, u32>,
     platforms: HashMap<(MethodKey, u64), usize>,
+    classes: HashMap<u64, [u8; 16]>,
+}
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoCreateInstance(clsid: *const u8, outer: u64, context: u32, iid: *const u8, result: *mut u64) -> i32;
 }
 
 unsafe fn com_handler(context: usize, slot: usize, integers: *const u64, floats: *const u64) -> u64 {
@@ -297,6 +303,48 @@ fn release(pointer: u64) {
 }
 
 impl Interpreter<'_> {
+    pub(super) fn com_class_type(&self, clsid: [u8; 16]) -> Run<u64> {
+        let existing = self.wrappers.borrow().classes.iter().find(|(_, found)| **found == clsid).map(|(object, _)| *object);
+        if let Some(object) = existing {
+            return Ok(object);
+        }
+        let handle = self.corelib_type("System", "RuntimeType")?;
+        let object = runtime::allocate_managed(self.record(RuntimeType::Class(handle))?, 0);
+        if object == 0 {
+            return self.throw("OutOfMemoryException");
+        }
+        type_roots().push(object);
+        let com_object = Gen::Named(self.corelib_type("System", "__ComObject")?, Rc::from(Vec::new()));
+        if let Ok(offset) = self.class_field_offset("System", "RuntimeType", "m_handle") {
+            let table = self.method_table(&com_object)?;
+            unsafe { *((object + u64::from(offset)) as *mut u64) = table };
+        }
+        self.object_types.borrow_mut().insert(object, com_object);
+        self.wrappers.borrow_mut().classes.insert(object, clsid);
+        Ok(object)
+    }
+
+    pub(super) fn com_class_id(&self, type_object: u64) -> Option<[u8; 16]> {
+        self.wrappers.borrow().classes.get(&type_object).copied()
+    }
+
+    pub(super) fn com_class_instance(&self, type_object: u64) -> Run<Option<u64>> {
+        let Some(clsid) = self.wrappers.borrow().classes.get(&type_object).copied() else {
+            return Ok(None);
+        };
+        let mut result = 0u64;
+        let code = crate::threads::blocking(|| unsafe { CoCreateInstance(clsid.as_ptr(), 0, 0x17, IUNKNOWN.as_ptr(), &raw mut result) });
+        if code < 0 || result == 0 {
+            crate::diagnostics::write("com", &format!("CoCreateInstance failed with {code:#010x}"));
+            return self.throw("COMException");
+        }
+        let object = self.rcw_for(result)?;
+        if self.wrappers.borrow().objects.get(&result) != Some(&object) {
+            release(result);
+        }
+        Ok(Some(object))
+    }
+
     pub(super) fn rcw_for(&self, pointer: u64) -> Run<u64> {
         if pointer == 0 {
             return Ok(0);
@@ -445,6 +493,7 @@ impl Interpreter<'_> {
                 back,
                 last_error: false,
                 hresult: false,
+                initializes: None,
             }));
             platforms.len() - 1
         };
